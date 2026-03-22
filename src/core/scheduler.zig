@@ -39,22 +39,12 @@ pub const SchedulerConfig = struct {
     shutdown: ShutdownConfig = .{},
 };
 
-const zero_metrics = SchedulerMetrics{
-    .coroutines_spawned = 0,
-    .coroutines_completed = 0,
-    .coroutines_cancelled = 0,
-    .steal_attempts = 0,
-    .steal_successes = 0,
-    .poll_count = 0,
-    .accept_queue_depth = 0,
-    .backpressure_events = 0,
-};
+const zero_metrics = std.mem.zeroes(SchedulerMetrics);
 
 /// Scheduler parameterized on the IO backend type.
 /// In production: Scheduler(IoUring) or Scheduler(Kqueue).
 /// In tests: Scheduler(FakeIO) for deterministic simulation.
-// Inspired by: TigerBeetle (refs/tigerbeetle/INSIGHTS.md) — generic-over-IO pattern
-// Inspired by: TigerBeetle (refs/tigerbeetle/INSIGHTS.md) — three-tier backpressure
+// Inspired by: TigerBeetle — generic-over-IO + three-tier backpressure (refs/tigerbeetle/INSIGHTS.md)
 pub fn Scheduler(comptime IO: type) type {
     return struct {
         const Self = @This();
@@ -62,7 +52,11 @@ pub fn Scheduler(comptime IO: type) type {
         pool: worker.WorkerPool(IO),
         timers: timer.TimerWheel,
         config: SchedulerConfig,
-        running: bool,
+        /// Atomic: set by run(), cleared by shutdown(). Read from the main
+        /// loop and potentially written from a signal handler thread.
+        running: std.atomic.Value(bool),
+        /// Set once by shutdown/gracefulShutdown. After this, spawnCoroutine rejects.
+        shut_down: bool,
         metrics: SchedulerMetrics,
         accept_queue: coroutine.FrameQueue,
         accept_queue_capacity: u32,
@@ -78,7 +72,8 @@ pub fn Scheduler(comptime IO: type) type {
                 .pool = try worker.WorkerPool(IO).init(allocator, num_threads, .{}),
                 .timers = timer.TimerWheel.init(allocator, 1_000_000), // 1ms tick
                 .config = config,
-                .running = false,
+                .running = std.atomic.Value(bool).init(false),
+                .shut_down = false,
                 .metrics = zero_metrics,
                 .accept_queue = coroutine.FrameQueue.init(),
                 .accept_queue_capacity = config.accept_queue_capacity,
@@ -95,18 +90,25 @@ pub fn Scheduler(comptime IO: type) type {
         pub fn tick(self: *Self) void {
             self.timers.tick();
             // Dispatch from accept queue to workers round-robin.
-            // Check deque capacity before pushing — if full, leave the frame
-            // in the accept queue (backpressure propagates per design.md §1.2).
+            // Skip full workers — try all workers before giving up.
+            var dispatched: u32 = 0;
+            const num = self.pool.num_threads;
             while (self.accept_queue.len > 0) {
-                const idx = self.next_worker;
-                // Three-tier backpressure: if worker's deque is full, don't push.
-                // The frame stays in the accept queue. If the accept queue fills,
-                // spawnCoroutine returns BackpressureFull. If TCP backlog fills,
-                // kernel refuses connections.
-                if (self.pool.workers[idx].local_deque.isFull()) break;
-                const frame = self.accept_queue.pop() orelse break;
-                self.next_worker = (idx + 1) % self.pool.num_threads;
-                self.pool.pushAndWake(idx, @intFromPtr(frame));
+                // Find a worker with capacity, trying each one once.
+                var found = false;
+                for (0..num) |_| {
+                    const idx = self.next_worker;
+                    self.next_worker = (idx + 1) % num;
+                    if (!self.pool.workers[idx].local_deque.isFull()) {
+                        const frame = self.accept_queue.pop() orelse break;
+                        self.pool.pushAndWake(idx, @intFromPtr(frame));
+                        dispatched += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                // All workers full — backpressure. Stop dispatching.
+                if (!found) break;
             }
             self.metrics.accept_queue_depth = self.accept_queue.len;
             self.metrics.poll_count += 1;
@@ -117,35 +119,27 @@ pub fn Scheduler(comptime IO: type) type {
         /// (See specs/worker_lifecycle.tla MainStart → MainStop → MainJoin)
         pub fn run(self: *Self) !void {
             try self.pool.start();
-            self.running = true;
-            while (self.running) {
+            self.running.store(true, .release);
+            while (self.running.load(.acquire)) {
                 self.tick();
-                // Avoid busy-looping when idle. In production, IO.poll() blocks
-                // until completions arrive. With FakeIO, we need an explicit yield.
                 if (self.accept_queue.len == 0) {
                     std.Thread.yield() catch {};
                 }
             }
-            // Finding 1 fix: run() must complete the lifecycle.
-            // shutdown() sets running=false, run() exits the loop, then we
-            // stop+join the pool here — matching the spec's full sequence.
             self.pool.stop();
         }
 
-        /// Signal the scheduler to stop. run() will exit its loop and
-        /// complete the shutdown sequence (pool.stop + join).
+        /// Signal the scheduler to stop. Thread-safe (atomic store).
+        /// run() will exit its loop and complete the shutdown sequence.
         pub fn shutdown(self: *Self) void {
-            self.running = false;
+            self.shut_down = true;
+            self.running.store(false, .release);
         }
 
-        /// Graceful shutdown: drain accept queue into workers, then stop.
-        /// Workers finish processing their deque items before exiting
-        /// (the deque is drained by the worker's runLoop naturally).
-        /// Note: does NOT wait for worker deques to empty — workers drain
-        /// their own deques as part of their runLoop before parking/exiting.
+        /// Graceful shutdown: drain accept queue, then stop.
         pub fn gracefulShutdown(self: *Self) void {
-            self.running = false;
-            // Drain accept queue into workers (only if pool is started).
+            self.shut_down = true;
+            self.running.store(false, .release);
             if (self.pool.state == .started) {
                 while (self.accept_queue.len > 0) {
                     self.tick();
@@ -154,11 +148,11 @@ pub fn Scheduler(comptime IO: type) type {
             }
         }
 
-        /// Spawn a coroutine into the accept queue.
-        /// Requires the scheduler to be running (pool started).
-        /// Returns BackpressureFull if the accept queue is at capacity.
+        /// Enqueue a coroutine for dispatch. Works from init until shutdown.
+        /// No need to call run() first — the accept queue is a buffer.
+        /// Returns BackpressureFull if at capacity, NotRunning if shut down.
         pub fn spawnCoroutine(self: *Self, frame: *coroutine.CoroutineFrame) error{ BackpressureFull, NotRunning }!void {
-            if (!self.running) return error.NotRunning;
+            if (self.shut_down) return error.NotRunning;
             if (self.accept_queue.len >= self.accept_queue_capacity) {
                 self.metrics.backpressure_events += 1;
                 return error.BackpressureFull;
@@ -192,14 +186,13 @@ test "scheduler init and deinit" {
     defer s.deinit();
 
     try testing.expectEqual(@as(u32, 2), s.pool.num_threads);
-    try testing.expect(!s.running);
+    try testing.expect(!s.running.load(.acquire));
     try testing.expectEqual(@as(u64, 0), s.metrics.coroutines_spawned);
 }
 
 test "scheduler spawn and dispatch" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
-    s.running = true;
 
     var frame = coroutine.CoroutineFrame.create(1);
     try s.spawnCoroutine(&frame);
@@ -215,7 +208,6 @@ test "scheduler spawn and dispatch" {
 test "scheduler round-robin dispatch" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 4 });
     defer s.deinit();
-    s.running = true;
 
     var frames: [4]coroutine.CoroutineFrame = undefined;
     for (0..4) |i| {
@@ -237,7 +229,6 @@ test "scheduler backpressure" {
         .accept_queue_capacity = 2,
     });
     defer s.deinit();
-    s.running = true;
 
     var f1 = coroutine.CoroutineFrame.create(1);
     var f2 = coroutine.CoroutineFrame.create(2);
@@ -257,9 +248,8 @@ test "scheduler shutdown" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
     defer s.deinit();
 
-    s.running = true;
     s.shutdown();
-    try testing.expect(!s.running);
+    try testing.expect(!s.running.load(.acquire));
 }
 
 test "scheduler metrics" {
@@ -268,7 +258,6 @@ test "scheduler metrics" {
         .accept_queue_capacity = 2,
     });
     defer s.deinit();
-    s.running = true;
 
     var f1 = coroutine.CoroutineFrame.create(1);
     var f2 = coroutine.CoroutineFrame.create(2);
@@ -320,7 +309,6 @@ test "scheduler tick advances timers" {
 test "scheduler dispatch preserves frame pointer" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
     defer s.deinit();
-    s.running = true;
 
     var frame = coroutine.CoroutineFrame.create(42);
     try s.spawnCoroutine(&frame);
@@ -333,13 +321,11 @@ test "scheduler dispatch preserves frame pointer" {
     try testing.expectEqual(&frame, recovered);
 }
 
-test "scheduler graceful shutdown drains accept queue" {
+test "scheduler graceful shutdown drains accept queue when pool started" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
 
-    // Must be running to spawn — start pool first.
     try s.pool.start();
-    s.running = true;
 
     var f1 = coroutine.CoroutineFrame.create(1);
     var f2 = coroutine.CoroutineFrame.create(2);
@@ -350,7 +336,8 @@ test "scheduler graceful shutdown drains accept queue" {
 
     // gracefulShutdown drains accept queue into workers, then stops pool.
     s.gracefulShutdown();
-    try testing.expect(!s.running);
+    try testing.expect(!s.running.load(.acquire));
+    try testing.expect(s.shut_down);
     try testing.expectEqual(@as(usize, 0), s.accept_queue.len);
 }
 
@@ -396,7 +383,6 @@ test "edge: cancel already-cancelled coroutine" {
 test "edge: dispatch more frames than workers" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
-    s.running = true;
 
     var frames: [5]coroutine.CoroutineFrame = undefined;
     for (0..5) |i| {
@@ -409,4 +395,69 @@ test "edge: dispatch more frames than workers" {
     // Round-robin: worker 0 gets 0,2,4 — worker 1 gets 1,3
     try testing.expectEqual(@as(usize, 3), s.pool.workers[0].local_deque.len());
     try testing.expectEqual(@as(usize, 2), s.pool.workers[1].local_deque.len());
+}
+
+// ── Simplify review tests ────────────────────────────────────────────
+// These test the API we WANT (no manual s.running = true hacks).
+
+test "simplify: spawn works without setting running manually" {
+    // The accept queue should accept work anytime between init and shutdown.
+    // Callers should not need to know about internal state.
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
+    defer s.deinit();
+
+    var f = coroutine.CoroutineFrame.create(1);
+    // This should work without s.running = true
+    try s.spawnCoroutine(&f);
+    try testing.expectEqual(@as(u64, 1), s.metrics.coroutines_spawned);
+}
+
+test "simplify: spawn rejected only after explicit shutdown" {
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
+    defer s.deinit();
+
+    var f1 = coroutine.CoroutineFrame.create(1);
+    try s.spawnCoroutine(&f1); // should work
+
+    s.shutdown();
+
+    var f2 = coroutine.CoroutineFrame.create(2);
+    const result = s.spawnCoroutine(&f2);
+    try testing.expectError(error.NotRunning, result);
+}
+
+test "simplify: tick dispatches to workers that have capacity, skipping full ones" {
+    // Use small deque capacity so we can fill it easily
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{
+        .num_threads = 2,
+    });
+    defer s.deinit();
+
+    // Fill worker 0's deque to capacity
+    while (!s.pool.workers[0].local_deque.isFull()) {
+        s.pool.workers[0].local_deque.push(0);
+    }
+    try testing.expect(s.pool.workers[0].local_deque.isFull());
+
+    // Spawn a frame — should go to worker 1, not get stuck
+    var f = coroutine.CoroutineFrame.create(99);
+    try s.spawnCoroutine(&f);
+    s.tick();
+
+    // Worker 1 got the frame, not blocked by worker 0 being full
+    try testing.expectEqual(@as(usize, 1), s.pool.workers[1].local_deque.len());
+}
+
+test "simplify: running is atomic — cross-thread shutdown visibility" {
+    // This test verifies shutdown() is visible to run() across threads.
+    // If running is a plain bool, the compiler might hoist the read out of
+    // the loop, causing run() to never see the write.
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
+    defer s.deinit();
+
+    // We can't easily test atomicity directly, but we can verify the type.
+    // After the fix, running should be std.atomic.Value(bool).
+    const RunningType = @TypeOf(s.running);
+    // This will fail if running is a plain bool — it should be atomic.
+    try testing.expect(RunningType == std.atomic.Value(bool));
 }
