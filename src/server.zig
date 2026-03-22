@@ -160,14 +160,23 @@ pub const Server = struct {
     fn handleConnection(self: *const Server, fd: posix.socket_t) void {
         defer posix.close(fd);
 
+        // Clear non-blocking flag — on macOS, accepted sockets inherit
+        // O_NONBLOCK from the listener. We want blocking recv/send.
+        const fl = posix.fcntl(fd, posix.F.GETFL, @as(usize, 0)) catch unreachable;
+        const nonblock: usize = @intCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+        _ = posix.fcntl(fd, posix.F.SETFL, fl & ~nonblock) catch unreachable;
+
         var read_buf: [4096]u8 = undefined;
-        const n = posix.recv(fd, &read_buf, 0) catch return;
-        if (n == 0) return;
+        const n = posix.recv(fd, &read_buf, 0) catch |err| {
+            std.debug.panic("recv failed: {}", .{err});
+        };
+        if (n == 0) return; // client closed cleanly
 
         var parse_buf: [8192]u8 = undefined;
         var parser = http1.Parser.init(&parse_buf);
         _ = parser.feed(read_buf[0..n]) catch {
-            _ = posix.send(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 0) catch {};
+            const bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            _ = posix.send(fd, bad, 0) catch |err| std.debug.panic("send failed: {}", .{err});
             return;
         };
 
@@ -177,29 +186,28 @@ pub const Server = struct {
         const match_result = self.router.match(method, path);
 
         var resp_buf: [8192]u8 = undefined;
-        switch (match_result) {
-            .found => |found| {
+        const response_bytes: []const u8 = switch (match_result) {
+            .found => |found| blk: {
                 if (found.handler_id < self.handler_count) {
                     if (self.handlers[found.handler_id]) |handler| {
                         var resp = handler(&parser);
                         _ = resp.setHeader("Connection", "close");
-                        const resp_n = resp.serialize(&resp_buf) catch return;
-                        _ = posix.send(fd, resp_buf[0..resp_n], 0) catch {};
-                        return;
+                        const resp_n = resp.serialize(&resp_buf) catch |err| std.debug.panic("serialize failed: {}", .{err});
+                        break :blk resp_buf[0..resp_n];
                     }
                 }
-                _ = posix.send(fd, "HTTP/1.1 500\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 0) catch {};
+                break :blk "HTTP/1.1 500\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             },
-            .not_found => {
+            .not_found => blk: {
                 var resp = response_mod.Response.notFound();
                 _ = resp.setHeader("Connection", "close");
-                const resp_n = resp.serialize(&resp_buf) catch return;
-                _ = posix.send(fd, resp_buf[0..resp_n], 0) catch {};
+                const resp_n = resp.serialize(&resp_buf) catch |err| std.debug.panic("serialize failed: {}", .{err});
+                break :blk resp_buf[0..resp_n];
             },
-            .method_not_allowed => {
-                _ = posix.send(fd, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 0) catch {};
-            },
-        }
+            .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        };
+
+        _ = posix.send(fd, response_bytes, 0) catch |err| std.debug.panic("send failed: {}", .{err});
     }
 };
 
