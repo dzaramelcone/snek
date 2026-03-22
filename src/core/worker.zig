@@ -37,6 +37,8 @@ pub fn WorkerThread(comptime IO: type) type {
         /// Callback for processing work items. If null, items are just consumed.
         work_callback: ?*const fn (u64) void,
         allocator: std.mem.Allocator,
+        /// OS thread handle. Set by WorkerPool.start(), null until then.
+        thread: ?std.Thread,
 
         pub fn init(allocator: std.mem.Allocator, id: u32, cfg: ThreadConfig) !Self {
             var self = Self{
@@ -49,6 +51,7 @@ pub fn WorkerThread(comptime IO: type) type {
                 .connection_arenas = undefined,
                 .work_callback = null,
                 .allocator = allocator,
+                .thread = null,
             };
             self.connection_arenas.initInPlace();
             return self;
@@ -138,7 +141,6 @@ pub fn WorkerPool(comptime IO: type) type {
         pub const State = enum { ready, started, stopping, stopped };
 
         workers: []WorkerThread(IO),
-        threads: []std.Thread,
         num_threads: u32,
         allocator: std.mem.Allocator,
         state: State,
@@ -146,8 +148,6 @@ pub fn WorkerPool(comptime IO: type) type {
         pub fn init(allocator: std.mem.Allocator, num_threads: u32, cfg: ThreadConfig) !Self {
             const workers = try allocator.alloc(WorkerThread(IO), num_threads);
             errdefer allocator.free(workers);
-            const threads = try allocator.alloc(std.Thread, num_threads);
-            errdefer allocator.free(threads);
 
             var initialized: u32 = 0;
             errdefer {
@@ -164,7 +164,6 @@ pub fn WorkerPool(comptime IO: type) type {
 
             return Self{
                 .workers = workers,
-                .threads = threads,
                 .num_threads = num_threads,
                 .allocator = allocator,
                 .state = .ready,
@@ -176,21 +175,17 @@ pub fn WorkerPool(comptime IO: type) type {
                 w.deinit();
             }
             self.allocator.free(self.workers);
-            self.allocator.free(self.threads);
         }
 
         /// Start all worker threads. Must be in .ready state.
         /// Sets running=true BEFORE spawning (TLA+ spec: MainStart).
         pub fn start(self: *Self) !void {
             std.debug.assert(self.state == .ready);
-            // Set running=true on all workers BEFORE spawning threads.
-            // This prevents a race where stop() runs before the thread
-            // enters runLoop() and overrides running=false with true.
             for (self.workers) |*w| {
                 w.running.store(true, .release);
             }
-            for (0..self.num_threads) |i| {
-                self.threads[i] = try std.Thread.spawn(.{}, workerEntry, .{&self.workers[i]});
+            for (self.workers) |*w| {
+                w.thread = try std.Thread.spawn(.{}, workerEntry, .{w});
             }
             self.state = .started;
         }
@@ -203,8 +198,11 @@ pub fn WorkerPool(comptime IO: type) type {
             for (self.workers) |*w| {
                 w.stop();
             }
-            for (self.threads[0..self.num_threads]) |t| {
-                t.join();
+            for (self.workers) |*w| {
+                if (w.thread) |t| {
+                    t.join();
+                    w.thread = null;
+                }
             }
             self.state = .stopped;
         }
