@@ -198,12 +198,8 @@ const LinuxIoUring = struct {
         // Submit pending SQEs and wait for at least 1 completion in a
         // SINGLE io_uring_enter syscall. This replaces the old pattern of
         // submit() + copy_cqes(0) which made 2 syscalls and spun when idle.
-        _ = self.ring.submit_and_wait(1) catch |err| {
-            return err;
-        };
-        const count = self.ring.copy_cqes(cqes, 0) catch |err| {
-            return err;
-        };
+        _ = try self.ring.submit_and_wait(1);
+        const count = try self.ring.copy_cqes(cqes, 0);
 
         // Translate from linux.io_uring_cqe to our CompletionEntry format.
         for (0..count) |i| {
