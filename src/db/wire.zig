@@ -905,3 +905,32 @@ test "wire protocol notice response parsing" {}
 test "wire protocol notification response" {}
 test "wire protocol parameter status tracking" {}
 test "wire protocol close" {}
+
+test "wire protocol RowDescription column name has no null terminator" {
+    // Simulate what Postgres sends for "SELECT 1 AS num":
+    // RowDescription with 1 column named "num"
+    // Format: field_count(u16) + name("num\0") + table_oid(u32) + col_attr(u16) + type_oid(u32) + type_len(u16) + type_mod(u32) + format(u16)
+    var payload: [64]u8 = undefined;
+    var pos: usize = 0;
+    
+    // field_count = 1
+    mem.writeInt(u16, payload[pos..][0..2], 1, .big);
+    pos += 2;
+    
+    // name = "num\0"
+    @memcpy(payload[pos..][0..3], "num");
+    payload[pos + 3] = 0; // null terminator
+    pos += 4;
+    
+    // 18 bytes of fixed fields (zeros for test)
+    @memset(payload[pos..][0..18], 0);
+    pos += 18;
+    
+    var columns: [16]ColumnDesc = undefined;
+    const count = try parseRowDescription(payload[0..pos], &columns);
+    
+    try std.testing.expectEqual(@as(usize, 1), count);
+    // The name MUST NOT include the null terminator
+    try std.testing.expectEqual(@as(usize, 3), columns[0].name.len);
+    try std.testing.expectEqualStrings("num", columns[0].name);
+}

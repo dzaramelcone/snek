@@ -259,6 +259,13 @@ pub const Client = struct {
             switch (msg.tag) {
                 wire.BackendTag.row_description => {
                     col_count = try wire.parseRowDescription(msg.payload, &column_descs);
+                    // Copy column names NOW — msg.buf will be overwritten
+                    // on the next readBackendMessage call.
+                    for (column_descs[0..col_count]) |*desc| {
+                        const name_copy = try allocator.alloc(u8, desc.name.len);
+                        @memcpy(name_copy, desc.name);
+                        desc.name = name_copy;
+                    }
                 },
                 wire.BackendTag.data_row => {
                     var raw_values: [128]?[]const u8 = .{null} ** 128;
@@ -304,10 +311,10 @@ pub const Client = struct {
         const columns = try allocator.alloc(ColumnInfo, col_count);
         errdefer allocator.free(columns);
         for (0..col_count) |i| {
-            const name_copy = try allocator.alloc(u8, column_descs[i].name.len);
-            @memcpy(name_copy, column_descs[i].name);
+            // name was already copied from the wire buffer in the
+            // row_description handler above (msg.buf is ephemeral).
             columns[i] = .{
-                .name = name_copy,
+                .name = column_descs[i].name,
                 .table_oid = column_descs[i].table_oid,
                 .column_index = column_descs[i].column_attr,
                 .type_oid = column_descs[i].type_oid,
