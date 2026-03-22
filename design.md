@@ -1056,7 +1056,50 @@ access_log = true
 
 ---
 
-## 20. Build Order (What We Build First)
+## 20. Durable Execution Runtime (v2)
+
+**[DEFER]** v2 feature. Temporal-inspired durable execution built on snek's runtime.
+
+### 20.1 Vision
+snek becomes a full production application runtime, not just a web framework.
+The web framework is the entry point; underneath, handlers get:
+- **Append-only event log** — source of truth for all state transitions
+- **Exactly-once job queue** — background tasks with delivery guarantees
+- **DAG workflow scheduler** — workflows as directed graphs of steps
+- **Sagas / compensation** — step 3 fails → auto-run compensating actions for steps 1-2
+- **Deterministic replay** — reproduce any execution from the event log
+
+### 20.2 Key Architectural Insight (from Temporal)
+Separate "what happened" (event log) from "what to do next" (scheduler).
+The log is append-only. The scheduler replays it to reconstruct state. If the
+process crashes mid-workflow, restart → replay log → continue from last event.
+
+### 20.3 Why v2
+- Requires the v1 runtime to be solid (scheduler, IO, coroutines, DB, Redis)
+- The Generic-over-IO + VOPR foundation already enables deterministic replay
+- Event sourcing changes the handler model (events first, effects derived)
+- Scope is massive but the v1 infrastructure is the right foundation
+
+### 20.4 Python API (aspirational)
+```python
+@app.workflow("onboard_user")
+async def onboard(user: User):
+    account = await create_account(user)          # step 1
+    await send_welcome_email(account)             # step 2
+    await provision_resources(account)            # step 3
+    # If step 3 fails: compensate step 2 (unsend?), step 1 (delete account)
+
+@app.task(retries=3, timeout=30)
+async def create_account(user: User) -> Account:
+    return await app.db.fetch_one("INSERT INTO accounts ... RETURNING *", user.email)
+```
+
+Each step is logged. On crash, replay the log, skip completed steps, resume.
+Like Temporal workflows but native to the web framework.
+
+---
+
+## 21. Build Order (What We Build First)
 
 ### Phase 1: Foundation
 1. Generic IO interface (`comptime IO: type`) + io_uring backend + kqueue backend
