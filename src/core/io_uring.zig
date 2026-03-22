@@ -195,11 +195,12 @@ const LinuxIoUring = struct {
         var cqe_buf: [256]linux.io_uring_cqe = undefined;
         const cqes = cqe_buf[0..max_cqes];
 
-        // Submit any pending SQEs to the kernel first.
-        _ = self.ring.submit() catch |err| {
+        // Submit pending SQEs and wait for at least 1 completion in a
+        // SINGLE io_uring_enter syscall. This replaces the old pattern of
+        // submit() + copy_cqes(0) which made 2 syscalls and spun when idle.
+        _ = self.ring.submit_and_wait(1) catch |err| {
             return err;
         };
-        // Copy available CQEs without blocking.
         const count = self.ring.copy_cqes(cqes, 0) catch |err| {
             return err;
         };
