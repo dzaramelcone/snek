@@ -1200,3 +1200,5 @@ async def echo(ws):
 [2026-03-22] Phase 5: COMPLETE — runtime foundation done (Phases 0-5). Ready for networking.
 [2026-03-22] Phase 5.2: Comprehensive scheduler TLA+ spec — 668K states, 10 properties (6 safety + 4 liveness), single ownership invariant, per-task starvation freedom, drain-first shutdown
 [2026-03-22] Phase 5.3: Spec-implementation alignment — 6 critical gaps fixed: work stealing, lost wakeup race, drain-first shutdown, atomic shut_down, startup race, start() failure rollback. 9 audit tests added. Verified on macOS + Linux.
+[2026-03-22] Phase 6.1: tcp.zig — Listener (bind, SO_REUSEADDR, SO_REUSEPORT, accept), Connection (send, recv, TCP_NODELAY, SO_KEEPALIVE, two-arena model, two-timeout state machine). 9 tests on real loopback sockets. Passes macOS + Linux.
+[2026-03-22] Phase 6: COMPLETE — first real network I/O.
