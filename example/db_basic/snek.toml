@@ -1,0 +1,9 @@
+[server]
+host = "0.0.0.0"
+port = 8000
+workers = 2
+
+[database]
+url = "postgres://localhost:5432/snek_example"
+pool_min = 1
+pool_max = 5

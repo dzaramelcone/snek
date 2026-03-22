@@ -1,0 +1,72 @@
+[server]
+host = "0.0.0.0"
+port = 8000
+workers = 4
+debug = false
+
+[tls]
+enabled = false
+# cert = "/etc/ssl/certs/todos.pem"
+# key  = "/etc/ssl/private/todos.key"
+
+[database]
+url = "postgres://localhost:5432/todos"
+pool_min = 2
+pool_max = 20
+statement_cache = 100
+connect_timeout = 5
+query_timeout = 30
+
+[redis]
+url = "redis://localhost:6379/0"
+pool_min = 2
+pool_max = 20
+
+[session]
+secret_key = "${SESSION_SECRET}"
+ttl = 3600
+cookie_name = "snek_session"
+cookie_secure = true
+cookie_httponly = true
+cookie_samesite = "lax"
+
+[oauth.github]
+client_id = "${GITHUB_CLIENT_ID}"
+client_secret = "${GITHUB_CLIENT_SECRET}"
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+userinfo_url = "https://api.github.com/user"
+redirect_uri = "${GITHUB_REDIRECT_URI}"
+scope = "read:user user:email"
+
+[oauth.google]
+client_id = "${GOOGLE_CLIENT_ID}"
+client_secret = "${GOOGLE_CLIENT_SECRET}"
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+userinfo_url = "https://www.googleapis.com/oauth2/v3/userinfo"
+redirect_uri = "${GOOGLE_REDIRECT_URI}"
+scope = "openid email profile"
+
+[cors]
+origins = ["http://localhost:3000"]
+methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+headers = ["Authorization", "Content-Type"]
+max_age = 3600
+
+[limits]
+body_size = "1mb"
+header_size = "8kb"
+
+[compression]
+enabled = true
+algorithms = ["br", "gzip"]
+min_size = 256
+
+[auth]
+jwt_secret = "${JWT_SECRET}"
+jwt_algorithms = ["HS256"]
+
+[logging]
+level = "info"
+format = "json"

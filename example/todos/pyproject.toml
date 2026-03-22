@@ -1,0 +1,13 @@
+[project]
+name = "snek-todos-example"
+version = "0.1.0"
+description = "Example todo app built with snek"
+requires-python = ">=3.12"
+dependencies = ["snek"]
+
+[project.scripts]
+todos = "app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

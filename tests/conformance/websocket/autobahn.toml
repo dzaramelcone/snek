@@ -1,0 +1,59 @@
+# Autobahn TestSuite configuration for snek WebSocket conformance.
+# Reference: https://github.com/crossbario/autobahn-testsuite
+# Spec: RFC 6455
+
+[server]
+url = "ws://host.docker.internal:9001"
+
+[options]
+# Run all test case groups.
+cases = ["*"]
+
+# Exclude nothing by default — we want full coverage.
+exclude_cases = []
+
+# Agent identifier reported in results.
+agent = "snek"
+
+# Output directory inside the container (mapped via docker volume).
+output_dir = "/results"
+
+# Test case groups enabled:
+#
+# 1.x   — Framing (opcodes, payload lengths, masking)
+# 2.x   — Ping/Pong
+# 3.x   — Reserved bits
+# 4.x   — Opcodes (reserved, non-control)
+# 5.x   — Fragmentation
+# 6.x   — UTF-8 handling
+# 7.x   — Close handling (status codes, clean close)
+# 9.x   — Limits/performance
+# 12.x  — Compression (permessage-deflate, RFC 7692)
+# 13.x  — Compression edge cases
+
+[cases.framing]
+include = ["1.*"]
+
+[cases.ping_pong]
+include = ["2.*"]
+
+[cases.reserved_bits]
+include = ["3.*"]
+
+[cases.opcodes]
+include = ["4.*"]
+
+[cases.fragmentation]
+include = ["5.*"]
+
+[cases.utf8]
+include = ["6.*"]
+
+[cases.close_handling]
+include = ["7.*"]
+
+[cases.limits]
+include = ["9.*"]
+
+[cases.compression]
+include = ["12.*", "13.*"]

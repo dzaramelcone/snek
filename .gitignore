@@ -1,0 +1,24 @@
+.zig-cache/
+zig-out/
+*.o
+*.so
+*.dylib
+*.pyd
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+
+# Reference repos — track INSIGHTS.md only, not cloned source
+refs/bun/*
+!refs/bun/INSIGHTS.md
+refs/ghostty/*
+!refs/ghostty/INSIGHTS.md
+refs/http.zig/*
+!refs/http.zig/INSIGHTS.md
+refs/tigerbeetle/*
+!refs/tigerbeetle/INSIGHTS.md
+refs/zig/*
+!refs/zig/INSIGHTS.md
