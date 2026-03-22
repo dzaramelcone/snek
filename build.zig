@@ -72,13 +72,6 @@ pub fn build(b: *std.Build) void {
         "src/net/http1.zig",
         "src/net/http2.zig",
         "src/net/websocket.zig",
-        "src/python/ffi.zig",
-        "src/python/gil.zig",
-        "src/python/driver.zig",
-        "src/python/coerce.zig",
-        "src/python/context.zig",
-        "src/python/inject.zig",
-        "src/python/module.zig",
         "src/db/wire.zig",
         "src/db/pool.zig",
         "src/db/query.zig",
@@ -129,6 +122,32 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        const run_t = b.addRunArtifact(t);
+        test_step.dependOn(&run_t.step);
+    }
+
+    // Python FFI modules — need CPython include/lib paths
+    const python_test_sources = [_][]const u8{
+        "src/python/ffi.zig",
+        "src/python/gil.zig",
+        "src/python/driver.zig",
+        "src/python/coerce.zig",
+        "src/python/context.zig",
+        "src/python/inject.zig",
+        "src/python/module.zig",
+    };
+
+    for (python_test_sources) |source| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        t.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14" });
+        t.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib" });
+        t.root_module.linkSystemLibrary("python3.14", .{});
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }

@@ -20,6 +20,7 @@ const http1 = @import("net/http1.zig");
 const response_mod = @import("http/response.zig");
 const io_mod = @import("core/io.zig");
 const fake_io = @import("core/fake_io.zig");
+const py_driver = @import("python/driver.zig");
 
 const IO = io_mod.Backend;
 const CompletionEntry = fake_io.CompletionEntry;
@@ -61,6 +62,10 @@ pub const Server = struct {
     router: router_mod.Router,
     handlers: [64]?HandlerFn,
     handler_count: u32,
+    /// Python handler IDs indexed by router handler_id.
+    /// If py_handler_ids[handler_id] is set, the handler is Python-backed.
+    /// The value is the index into the module's py_handlers table.
+    py_handler_ids: [64]?u32,
     allocator: std.mem.Allocator,
     num_threads: u32,
     bind_addr: []const u8,
@@ -79,6 +84,7 @@ pub const Server = struct {
             .router = router_mod.Router.init(allocator),
             .handlers = .{null} ** 64,
             .handler_count = 0,
+            .py_handler_ids = .{null} ** 64,
             .allocator = allocator,
             .num_threads = num_threads,
             .bind_addr = "127.0.0.1",
@@ -104,6 +110,18 @@ pub const Server = struct {
         const id = self.handler_count;
         if (id >= 64) return error.TooManyHandlers;
         self.handlers[id] = handler;
+        self.handler_count = id + 1;
+        try self.router.addRoute(method, path, id);
+    }
+
+    /// Register a Python handler route. The py_handler_id indexes into the
+    /// module's py_handlers table. The Zig router stores a handler_id that
+    /// maps to the Python handler via py_handler_ids.
+    pub fn addPythonRoute(self: *Server, method: router_mod.Method, path: []const u8, py_handler_id: u32) !void {
+        const id = self.handler_count;
+        if (id >= 64) return error.TooManyHandlers;
+        self.handlers[id] = null; // No native handler
+        self.py_handler_ids[id] = py_handler_id;
         self.handler_count = id + 1;
         try self.router.addRoute(method, path, id);
     }
@@ -306,6 +324,22 @@ pub const Server = struct {
         const response_bytes: []const u8 = switch (match_result) {
             .found => |found| blk: {
                 if (found.handler_id < self.handler_count) {
+                    // Check for Python handler first
+                    if (self.py_handler_ids[found.handler_id]) |py_id| {
+                        var py_body_buf: [4096]u8 = undefined;
+                        var resp = py_driver.invokePythonHandler(
+                            py_id,
+                            &parser,
+                            found.params[0..found.param_count],
+                            &py_body_buf,
+                        );
+                        _ = resp.setHeader("Connection", "close");
+                        const resp_n = resp.serialize(&conn.resp_buf) catch |err|
+                            std.debug.panic("serialize failed: {}", .{err});
+                        conn.resp_len = resp_n;
+                        break :blk conn.resp_buf[0..resp_n];
+                    }
+                    // Native Zig handler
                     if (self.handlers[found.handler_id]) |handler| {
                         var resp = handler(&parser);
                         _ = resp.setHeader("Connection", "close");

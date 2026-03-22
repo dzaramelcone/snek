@@ -1226,3 +1226,10 @@ async def echo(ws):
 [2026-03-22] Phase 11.3: redis/commands.zig — Typed GET/SET/DEL/PING. 28 tests.
 [2026-03-22] Phase 11: COMPLETE — Redis RESP3, commands work against real Redis.
 [2026-03-22] ═══ MILESTONE: Postgres and Redis work standalone ═══
+[2026-03-22] Phase 12.1: ffi.zig — CPython C API bridge via @cImport("Python.h"). Three-layer: raw C → Zig wrappers → comptime method def. 14 tests.
+[2026-03-22] Phase 12.2: gil.zig — GIL acquire/release, RAII guard, per-I/O release, free-threaded detection. 7 tests.
+[2026-03-22] Phase 12: COMPLETE — Zig calls Python, GIL works.
+[2026-03-22] Phase 13.1: module.zig — _snek CPython extension module. add_route stores callables, run starts Zig server. 5 tests.
+[2026-03-22] Phase 13.2: driver.zig — HTTP↔Python bridge. Build request dict, call handler, convert response (dict→JSON, str→text, tuple→status+body). 7 tests.
+[2026-03-22] Phase 13: COMPLETE — Python handlers execute through Zig runtime. 100 tests total.
+[2026-03-22] ═══ MILESTONE: snek runs Python handlers ═══
