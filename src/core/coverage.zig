@@ -82,3 +82,32 @@ test "unmarked path" {
     reset();
     try check("never_hit_path").expectNotHit();
 }
+
+test "reset clears marks" {
+    reset();
+    mark("reset_target");
+    try check("reset_target").expectHit();
+    reset();
+    try check("reset_target").expectNotHit();
+}
+
+test "expectHit fails when not marked" {
+    reset();
+    const result = check("never_marked").expectHit();
+    if (result) |_| {
+        return error.ShouldHaveFailed;
+    } else |err| {
+        if (err != error.CoverageMarkNotHit) return error.WrongError;
+    }
+}
+
+test "expectNotHit fails when marked" {
+    reset();
+    mark("was_marked");
+    const result = check("was_marked").expectNotHit();
+    if (result) |_| {
+        return error.ShouldHaveFailed;
+    } else |err| {
+        if (err != error.CoverageMarkUnexpectedlyHit) return error.WrongError;
+    }
+}

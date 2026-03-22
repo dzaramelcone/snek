@@ -22,7 +22,6 @@ pub const ThreadConfig = struct {
 /// Worker thread parameterized on the IO backend type.
 // See: src/core/REFERENCES.md §5.7 — per-worker IO instance from tardy/zzz
 // Each worker owns its own IO instance, avoiding cross-thread synchronization.
-// Inspired by: Bun (refs/bun/INSIGHTS.md) — HiveArray for connection pool
 // Inspired by: http.zig (refs/http.zig/INSIGHTS.md) — FallbackAllocator, two arenas per connection
 pub fn WorkerThread(comptime IO: type) type {
     return struct {
@@ -33,8 +32,8 @@ pub fn WorkerThread(comptime IO: type) type {
         io: IO,
         is_parked: bool,
         config: ThreadConfig,
-        /// Per-connection arena pairs managed via HiveArray pool.
-        connection_arenas: pool_mod.HiveArray(arena_mod.ConnectionArenas, 4096),
+        /// Per-connection arena pairs managed via free-list pool.
+        connection_arenas: pool_mod.Pool(arena_mod.ConnectionArenas, 4096),
 
         pub fn init(id: u32, cfg: ThreadConfig) Self {
             _ = .{ id, cfg };

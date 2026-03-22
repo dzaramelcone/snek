@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 *.o
+*.s
 *.so
 *.dylib
 *.pyd

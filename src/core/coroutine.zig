@@ -1,7 +1,7 @@
 //! Stackless coroutine state machines and comptime pipeline builder.
 //! Provides the fundamental async execution primitive for snek.
 //!
-//! CoroutinePool uses HiveArray (Bun pattern) for pre-allocated frames.
+//! CoroutinePool uses a free-list pool for pre-allocated frames.
 //! CancellationToken integration for cooperative cancellation on disconnect.
 
 const std = @import("std");
@@ -81,10 +81,11 @@ pub const CancellationToken = struct {
     }
 };
 
-/// CoroutinePool backed by HiveArray — pre-allocated, O(1) acquire/release.
-/// Default capacity: 2048 frames (matches Bun's RequestContextStackAllocator).
-// Inspired by: Bun (refs/bun/INSIGHTS.md) — HiveArray-backed pool for coroutine frames
-pub const CoroutinePool = pool_mod.HiveArray(CoroutineFrame, 2048);
+/// CoroutinePool backed by free-list pool — pre-allocated, O(1) acquire/release.
+/// Default capacity: 2048 frames.
+/// Originally used Bun's HiveArray (bitset) pattern but benchmarked 42x slower
+/// than free list at this capacity due to cache pressure. See bench/pool_comparison.zig.
+pub const CoroutinePool = pool_mod.Pool(CoroutineFrame, 2048);
 
 pub const TimeoutHandle = struct {
     deadline_ns: u64,

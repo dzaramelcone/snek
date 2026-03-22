@@ -1174,3 +1174,10 @@ async def echo(ws):
 ## Implementation Journal
 
 <!-- Format: [DATE] Phase N.M: <one-liner> -->
+
+[2026-03-21] Phase 0.1: assert.zig — inline assert with zero overhead in ReleaseFast (Ghostty pattern), 2 tests passing
+[2026-03-21] Phase 0.2: coverage.zig — mark/check/reset coverage marks with comptime hash (TigerBeetle pattern), 5 tests passing
+[2026-03-21] Phase 0.3: static_alloc.zig — three-phase allocator (init→static→deinit) with vtable dispatch, 83 lines, 3 tests passing
+[2026-03-21] Phase 0.4: pool.zig — HiveArray fixed-capacity bitset pool with O(n) scan + Fallback allocator, 3 tests passing
+[2026-03-21] Phase 0.5: arena.zig — ConnArena + ReqArena pair with retain_with_limit reset, 3 tests passing
+[2026-03-21] Phase 0: COMPLETE — all 5 foundation primitives implemented, 16 tests passing, zero leaks
