@@ -95,17 +95,27 @@ pub fn Scheduler(comptime IO: type) type {
         pub fn tick(self: *Self) void {
             self.timers.tick();
             // Dispatch from accept queue to workers round-robin.
+            // Check deque capacity before pushing — if full, leave the frame
+            // in the accept queue (backpressure propagates per design.md §1.2).
             while (self.accept_queue.len > 0) {
-                const frame = self.accept_queue.pop() orelse break;
                 const idx = self.next_worker;
+                // Three-tier backpressure: if worker's deque is full, don't push.
+                // The frame stays in the accept queue. If the accept queue fills,
+                // spawnCoroutine returns BackpressureFull. If TCP backlog fills,
+                // kernel refuses connections.
+                if (self.pool.workers[idx].local_deque.isFull()) break;
+                const frame = self.accept_queue.pop() orelse break;
                 self.next_worker = (idx + 1) % self.pool.num_threads;
-                self.pool.workers[idx].local_deque.push(@intFromPtr(frame));
-                self.pool.workers[idx].wake();
+                self.pool.pushAndWake(idx, @intFromPtr(frame));
             }
+            self.metrics.accept_queue_depth = self.accept_queue.len;
             self.metrics.poll_count += 1;
         }
 
-        pub fn run(self: *Self) void {
+        /// Run the scheduler. Starts the worker pool, then loops tick().
+        /// Blocks until shutdown() or gracefulShutdown() is called.
+        pub fn run(self: *Self) !void {
+            try self.pool.start();
             self.running = true;
             while (self.running) {
                 self.tick();
@@ -121,11 +131,20 @@ pub fn Scheduler(comptime IO: type) type {
             self.running = false;
         }
 
-        /// Graceful shutdown: stop accepting, drain in-flight, then close.
-        /// MVP: just shutdown + stop pool. Per-phase timeouts deferred.
+        /// Graceful shutdown: drain accept queue and worker deques, then stop.
+        /// Dispatches remaining accept queue items, then waits for workers to
+        /// drain their deques before stopping.
         pub fn gracefulShutdown(self: *Self) void {
             self.running = false;
-            self.pool.stop();
+            // Drain accept queue into workers.
+            while (self.accept_queue.len > 0) {
+                self.tick();
+            }
+            // Workers will finish their current deque items, then park.
+            // stop() sets running=false on all workers and joins threads.
+            if (self.pool.state == .started) {
+                self.pool.stop();
+            }
         }
 
         pub fn spawnCoroutine(self: *Self, frame: *coroutine.CoroutineFrame) error{BackpressureFull}!void {
@@ -139,8 +158,11 @@ pub fn Scheduler(comptime IO: type) type {
         }
 
         pub fn cancelCoroutine(self: *Self, frame: *coroutine.CoroutineFrame) void {
-            frame.cancel();
-            self.metrics.coroutines_cancelled += 1;
+            // Only count as cancelled if not already cancelled.
+            if (frame.state != .cancelled) {
+                frame.cancel();
+                self.metrics.coroutines_cancelled += 1;
+            }
         }
 
         pub fn getMetrics(self: *const Self) SchedulerMetrics {
@@ -295,23 +317,25 @@ test "scheduler dispatch preserves frame pointer" {
     try testing.expectEqual(&frame, recovered);
 }
 
-test "scheduler graceful shutdown drains work" {
+test "scheduler graceful shutdown drains accept queue" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
 
     var f1 = coroutine.CoroutineFrame.create(1);
+    var f2 = coroutine.CoroutineFrame.create(2);
     try s.spawnCoroutine(&f1);
+    try s.spawnCoroutine(&f2);
 
-    // tick dispatches to workers
-    s.tick();
-    try testing.expectEqual(@as(usize, 0), s.accept_queue.len);
+    try testing.expectEqual(@as(usize, 2), s.accept_queue.len);
 
-    // gracefulShutdown sets running=false
-    // Note: we don't start the pool (no threads), so stop is a no-op on unstarted threads.
-    // Just verify the state transition.
-    s.running = true;
-    s.shutdown();
+    // gracefulShutdown drains accept queue into workers, then stops.
+    // Pool not started, so stop() is skipped (state != .started).
+    s.gracefulShutdown();
     try testing.expect(!s.running);
+    try testing.expectEqual(@as(usize, 0), s.accept_queue.len);
+    // Frames were dispatched to workers' deques
+    const total = s.pool.workers[0].local_deque.len() + s.pool.workers[1].local_deque.len();
+    try testing.expectEqual(@as(usize, 2), total);
 }
 
 // ── Edge cases ──────────────────────────────────────────────────────
@@ -346,9 +370,10 @@ test "edge: cancel already-cancelled coroutine" {
 
     var f = coroutine.CoroutineFrame.create(1);
     s.cancelCoroutine(&f);
-    s.cancelCoroutine(&f); // double cancel — should be harmless
+    s.cancelCoroutine(&f); // double cancel — idempotent, only counted once
 
-    try testing.expectEqual(@as(u64, 2), s.metrics.coroutines_cancelled);
+    // Metrics: only 1 cancellation counted (second is a no-op)
+    try testing.expectEqual(@as(u64, 1), s.metrics.coroutines_cancelled);
     try testing.expectEqual(coroutine.CoroutineState.cancelled, f.state);
 }
 

@@ -64,12 +64,18 @@ pub fn WorkerThread(comptime IO: type) type {
             self.wake();
         }
 
-        /// Park the worker thread (idle strategy). Blocks on futex until woken.
-        // Design: park_state 0 = running, 1 = parked.
-        // Futex waits when park_state == 1, wake sets to 0.
-        pub fn park(self: *Self) void {
+        /// Park the worker thread with race-safe running check.
+        /// Matches the TLA+ spec's park_recheck transition:
+        ///   store park_state=1 → recheck running → futex wait only if still running.
+        /// (See specs/worker_lifecycle.tla WorkerParkRecheck)
+        ///
+        /// Returns true if the worker parked and was woken, false if it bailed
+        /// because running became false before entering the wait.
+        pub fn park(self: *Self) bool {
             self.park_state.store(1, .release);
+            if (!self.running.load(.acquire)) return false;
             std.Thread.Futex.wait(&self.park_state, 1);
+            return true;
         }
 
         /// Wake a parked worker thread via futex.
@@ -89,12 +95,9 @@ pub fn WorkerThread(comptime IO: type) type {
                         cb(item);
                     }
                 } else {
-                    // No local work — park until woken.
-                    // Check running again after setting park_state but before
-                    // actually waiting, to avoid sleeping through a stop().
-                    self.park_state.store(1, .release);
-                    if (!self.running.load(.acquire)) break;
-                    std.Thread.Futex.wait(&self.park_state, 1);
+                    // No local work — park with race-safe running check.
+                    // park() implements the spec's park_recheck transition.
+                    if (!self.park()) break; // running became false, exit
                 }
             }
         }
@@ -126,14 +129,19 @@ pub fn WorkerThread(comptime IO: type) type {
 }
 
 /// Worker pool parameterized on the IO backend type.
+/// Lifecycle states match the TLA+ spec (specs/worker_lifecycle.tla):
+///   ready → started → stopping → stopped
 pub fn WorkerPool(comptime IO: type) type {
     return struct {
         const Self = @This();
+
+        pub const State = enum { ready, started, stopping, stopped };
 
         workers: []WorkerThread(IO),
         threads: []std.Thread,
         num_threads: u32,
         allocator: std.mem.Allocator,
+        state: State,
 
         pub fn init(allocator: std.mem.Allocator, num_threads: u32, cfg: ThreadConfig) !Self {
             const workers = try allocator.alloc(WorkerThread(IO), num_threads);
@@ -159,6 +167,7 @@ pub fn WorkerPool(comptime IO: type) type {
                 .threads = threads,
                 .num_threads = num_threads,
                 .allocator = allocator,
+                .state = .ready,
             };
         }
 
@@ -170,7 +179,10 @@ pub fn WorkerPool(comptime IO: type) type {
             self.allocator.free(self.threads);
         }
 
+        /// Start all worker threads. Must be in .ready state.
+        /// Sets running=true BEFORE spawning (TLA+ spec: MainStart).
         pub fn start(self: *Self) !void {
+            std.debug.assert(self.state == .ready);
             // Set running=true on all workers BEFORE spawning threads.
             // This prevents a race where stop() runs before the thread
             // enters runLoop() and overrides running=false with true.
@@ -180,15 +192,30 @@ pub fn WorkerPool(comptime IO: type) type {
             for (0..self.num_threads) |i| {
                 self.threads[i] = try std.Thread.spawn(.{}, workerEntry, .{&self.workers[i]});
             }
+            self.state = .started;
         }
 
+        /// Stop all worker threads and join them. Must be in .started state.
+        /// Implements TLA+ spec: MainStop → MainJoin.
         pub fn stop(self: *Self) void {
+            std.debug.assert(self.state == .started);
+            self.state = .stopping;
             for (self.workers) |*w| {
                 w.stop();
             }
             for (self.threads[0..self.num_threads]) |t| {
                 t.join();
             }
+            self.state = .stopped;
+        }
+
+        /// Push work to a specific worker's deque and wake them.
+        /// This pairs push + wake atomically, matching the TLA+ spec's
+        /// requirement that WorkArrives + WakeWorker are coordinated.
+        /// (See specs/worker_lifecycle.tla:127 — liveness depends on pairing)
+        pub fn pushAndWake(self: *Self, worker_idx: u32, item: u64) void {
+            self.workers[worker_idx].local_deque.push(item);
+            self.workers[worker_idx].wake();
         }
 
         fn workerEntry(worker: *WorkerThread(IO)) void {
