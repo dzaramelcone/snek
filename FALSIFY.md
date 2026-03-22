@@ -11,6 +11,33 @@ Each must be verified before we rely on it.
 
 ---
 
+## Chase-Lev deque vs mutex-protected deque for work-stealing — VERIFIED
+
+- **Claim**: Chase-Lev deque provides optimal work-stealing with LIFO for owner
+  (cache-friendly) and FIFO for thieves (fairness).
+- **Source**: Tokio, Crossbeam, Rayon (src/core/REFERENCES.md §1.2)
+- **Alternatives benchmarked**: Mutex+Deque, SPSC queue
+- **Results** (bench/deque_comparison.zig):
+  - Single-threaded push/pop: Chase-Lev 3.5ns vs Mutex 4.3ns (1.2x)
+  - Producer-consumer (1:1): Chase-Lev 8.1ns vs Mutex 33.2ns (4.1x)
+  - Contended (1 push, 3 steal): Chase-Lev 8.8ns vs Mutex 90.6ns (10.3x)
+  - Mixed (90% local, 10% steal): Chase-Lev 3.3ns vs Mutex 5.0ns (1.5x)
+- **Verdict**: KEEP. 10x faster under contention, competitive single-threaded.
+- **Still pending**: comparison with Zig stdlib's atomic linked list approach
+  (requires scheduler integration at Phase 5 to test realistic dispatch).
+
+---
+
+## Timer: flat list vs timing wheel — PENDING
+
+- **Claim**: Flat ArrayList scan on tick() is simpler and fast enough at <1000 timers.
+- **Alternative**: Timing wheel with N slots for O(1) tick dispatch.
+- **Threshold**: If tick() shows up in profiles or timer count exceeds 1000, switch to wheel.
+- **Benchmark**: Schedule N timers, measure tick() latency at N=100, 1000, 10000.
+- **Context**: snek will have request timeouts + keepalive timers. Hundreds, not millions.
+
+---
+
 ## Phase 0
 
 ### HiveArray bitset pool (Bun pattern) — FALSIFIED
@@ -21,6 +48,20 @@ Each must be verified before we rely on it.
   their IntegerBitSet(2048) uses a u2048 which still scans 32 words.
   The pattern only wins when the entire struct fits in L1 (capacity ≤ 64).
 - **Action**: Replaced with index-based free list. See bench/pool_comparison.zig.
+
+### Pre-allocated BufferPool vs arena allocators — FALSIFIED (conditionally)
+- **Claim**: Pre-allocated buffer pool eliminates allocation in the hot path.
+- **Alternative**: Arena allocators with retention.
+- **Results** (bench/buffer_comparison.zig):
+  - Sequential 4KB: Pool 9.3ns vs Arena 7.4ns (1.26x slower)
+  - 10 outstanding 4KB: Pool 8.6ns vs Arena 4.4ns (1.95x slower)
+  - Burst 100 4KB: Pool 27.1ns vs Arena 7.1ns (3.81x slower)
+  - Sequential 16KB: Pool 4.1ns vs Arena 3.8ns (1.09x slower)
+- **Verdict**: Arena wins in every scenario. Pool's O(n) linear scan for
+  ref_count==0 gets punished under burst load. Arena's bump allocation is O(1).
+- **Action**: Default to arena allocation for general I/O buffers. KEEP BufferPool
+  only if we use io_uring IORING_REGISTER_BUFFERS (requires stable addresses).
+  If registered buffers aren't used, delete BufferPool.
 
 ### Inline assert (Ghostty pattern) — PENDING VERIFICATION
 - **Claim**: std.debug.assert has 15-20% overhead in hot loops in ReleaseFast
@@ -33,6 +74,29 @@ Each must be verified before we rely on it.
 - **TODO**: When HTTP parser is implemented (Phase 7), benchmark a parsing
   loop with assert.check vs std.debug.assert. If difference is < 1%, the
   inline variant is unnecessary complexity.
+
+---
+
+## Phase 1
+
+### Chase-Lev deque vs mutex-protected VecDeque — PENDING
+
+- **Claim**: Lock-free Chase-Lev gives lower latency and higher throughput for
+  work-stealing under contention (1 owner + N thieves) compared to a simple
+  `Mutex(ArrayList(T))`.
+- **Source**: Chase & Lev 2005, "Dynamic Circular Work-Stealing Deque".
+- **Alternative**: `std.Thread.Mutex` + `std.ArrayList(T)` with push_back / pop_back
+  for owner, pop_front for steal. ~20 lines of code vs ~80 for Chase-Lev.
+- **Threshold**: If mutex version is within 2x throughput on the concurrent
+  push+steal benchmark (1 owner, 3 thieves, 100K items), switch to mutex —
+  simpler code wins. Chase-Lev's advantage is sub-microsecond steal under
+  contention; if our workloads have low contention (per-worker queues with
+  infrequent stealing), the lock-free complexity is wasted.
+- **Benchmark**: 100K push + concurrent steal, measure total wall time and
+  per-operation p99 latency. Compare Chase-Lev vs Mutex+ArrayList.
+- **Context**: snek uses per-worker deques with occasional stealing. If stealing
+  is rare (< 1% of operations), mutex contention is negligible and lock-free
+  gains are unmeasurable.
 
 ---
 

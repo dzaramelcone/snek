@@ -136,6 +136,24 @@ This is the "trust but verify" step. For each implementation:
 
 Not every file needs all 4 sub-steps. Use judgment — complex concurrent code (deque, scheduler) gets full treatment. Simple wrappers (arena) get a lighter pass.
 
+## Step 8.5: Edge Case Audit
+
+After UAT, dispatch a dedicated edge case auditor for each file. The auditor's job:
+
+1. **Read the implementation and existing tests**
+2. **Generate edge cases** the implementation agent missed — focus on:
+   - Boundary conditions (zero, one, max, overflow, underflow)
+   - Error paths (what happens on bad input?)
+   - Concurrency hazards (for concurrent code — race conditions, ABA, double-free)
+   - Resource exhaustion (pool full, buffer full, timer list full)
+   - State machine transitions (invalid transitions, re-entrant calls)
+3. **Write FAILING tests first** for each edge case
+4. **Run them — they must fail (red)**
+5. **Only then fix the implementation** to make them pass
+6. **If a test passes when it should fail** — the test is wrong, or the edge case is already handled. Either way, investigate.
+
+**CRITICAL RULE**: Never fix a bug and write the test in the same step. The test must fail first. This is how we prove the test is actually testing what we think it's testing.
+
 ## Step 9: Integration Check
 
 After all files in a phase pass individually:
@@ -178,6 +196,8 @@ Copy this for each file in the phase:
 - [ ] TLA+ model (if concurrent — skip otherwise)
 - [ ] Benchmark vs alternative (if falsifiability criteria defined)
 - [ ] UAT: step-through or binary inspection
+- [ ] Edge case audit: dedicated pass for boundary/error/concurrency cases
+- [ ] Edge case tests written FAILING first, then fixed
 - [ ] Sources cited in comments
 ```
 

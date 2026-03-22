@@ -1181,3 +1181,7 @@ async def echo(ws):
 [2026-03-21] Phase 0.4: pool.zig — HiveArray fixed-capacity bitset pool with O(n) scan + Fallback allocator, 3 tests passing
 [2026-03-21] Phase 0.5: arena.zig — ConnArena + ReqArena pair with retain_with_limit reset, 3 tests passing
 [2026-03-21] Phase 0: COMPLETE — all 5 foundation primitives implemented, 16 tests passing, zero leaks
+[2026-03-21] Phase 1.1: deque.zig — Chase-Lev work-stealing deque, 7 tests + 7 edge cases, benchmarked 10x faster than mutex under contention (VERIFIED)
+[2026-03-21] Phase 1.2: buffer.zig — ref-counted buffer pool, 5 tests + 7 edge cases, benchmarked vs arena (arena wins 1.1-3.8x, keep pool only for io_uring registered buffers)
+[2026-03-21] Phase 1.3: timer.zig — flat-list timer with swap-remove, 4 tests + 6 edge cases, falsifiability deferred to profiling
+[2026-03-21] Phase 1: COMPLETE — 3 data structures, 36 tests passing, 2 benchmarks run, zero leaks
