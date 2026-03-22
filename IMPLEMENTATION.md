@@ -1198,3 +1198,5 @@ async def echo(ws):
 [2026-03-21] Phase 4: COMPLETE — workers + coroutines, TLA+ verified, all tests pass on macOS + Linux
 [2026-03-22] Phase 5.1: scheduler.zig — orchestrates workers, timers, accept queue. Round-robin dispatch, three-tier backpressure, tick()-based main loop. 14 tests including pointer round-trip verification and edge cases.
 [2026-03-22] Phase 5: COMPLETE — runtime foundation done (Phases 0-5). Ready for networking.
+[2026-03-22] Phase 5.2: Comprehensive scheduler TLA+ spec — 668K states, 10 properties (6 safety + 4 liveness), single ownership invariant, per-task starvation freedom, drain-first shutdown
+[2026-03-22] Phase 5.3: Spec-implementation alignment — 6 critical gaps fixed: work stealing, lost wakeup race, drain-first shutdown, atomic shut_down, startup race, start() failure rollback. 9 audit tests added. Verified on macOS + Linux.

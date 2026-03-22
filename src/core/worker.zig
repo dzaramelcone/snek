@@ -67,16 +67,26 @@ pub fn WorkerThread(comptime IO: type) type {
             self.wake();
         }
 
-        /// Park the worker thread with race-safe running check.
-        /// Matches the TLA+ spec's park_recheck transition:
-        ///   store park_state=1 → recheck running → futex wait only if still running.
-        /// (See specs/worker_lifecycle.tla WorkerParkRecheck)
+        /// Park the worker thread with race-safe running AND deque recheck.
+        /// Matches the TLA+ spec's WorkerPark transition (scheduler.tla#L221):
+        ///   store park_state=1 → recheck running AND deque → futex wait only if
+        ///   still running AND deque empty.
         ///
-        /// Returns true if the worker parked and was woken, false if it bailed
-        /// because running became false before entering the wait.
+        /// Fix for audit finding 3: lost wakeup race. A pusher can push work
+        /// between our failed pop() and our park_state.store(1). Without the
+        /// deque recheck, we'd sleep with a non-empty deque.
+        ///
+        /// Returns true if the worker should continue looping (was woken or
+        /// found work), false if running became false.
         pub fn park(self: *Self) bool {
             self.park_state.store(1, .release);
             if (!self.running.load(.acquire)) return false;
+            // Recheck deque after publishing park intent (audit finding 3).
+            // If work arrived between pop() and park_state.store(1), cancel park.
+            if (self.local_deque.len() > 0) {
+                self.park_state.store(0, .release);
+                return true;
+            }
             std.Thread.Futex.wait(&self.park_state, 1);
             return true;
         }
@@ -87,9 +97,31 @@ pub fn WorkerThread(comptime IO: type) type {
             std.Thread.Futex.wake(&self.park_state, 1);
         }
 
-        /// Main worker loop. Pops from local deque; parks if idle.
-        /// Work stealing from other workers is deferred to Phase 5 (scheduler).
-        pub fn runLoop(self: *Self) void {
+        /// Try to steal work from another worker's deque.
+        /// Iterates up to 3 victims starting from a deterministic offset
+        /// (based on own id) to avoid herding. Returns stolen item or null.
+        /// Matches scheduler.tla#L188 WorkerSteal.
+        pub fn trySteal(self: *Self, all_workers: []Self) ?u64 {
+            const n = all_workers.len;
+            if (n <= 1) return null;
+            const max_attempts = @min(n - 1, 3);
+            var offset = self.id +% 1;
+            for (0..max_attempts) |_| {
+                const victim_idx = offset % @as(u32, @intCast(n));
+                offset +%= 1;
+                if (victim_idx == self.id) continue;
+                if (all_workers[victim_idx].local_deque.steal()) |item| {
+                    return item;
+                }
+            }
+            return null;
+        }
+
+        /// Main worker loop. Pops from local deque; tries stealing if empty;
+        /// parks if no work found anywhere.
+        /// After running goes false, drains local deque and helps steal
+        /// remaining work from other workers (audit finding 1, spec WorkerExit).
+        pub fn runLoop(self: *Self, all_workers: []Self) void {
             // NOTE: running must be set to true by the caller (WorkerPool.start)
             // BEFORE spawning the thread, to avoid a race with stop().
             while (self.running.load(.acquire)) {
@@ -97,10 +129,37 @@ pub fn WorkerThread(comptime IO: type) type {
                     if (self.work_callback) |cb| {
                         cb(item);
                     }
+                } else if (self.trySteal(all_workers)) |item| {
+                    // Work stealing (audit finding 2, scheduler.tla#L188).
+                    if (self.work_callback) |cb| {
+                        cb(item);
+                    }
                 } else {
-                    // No local work — park with race-safe running check.
-                    // park() implements the spec's park_recheck transition.
+                    // No local work, no stealable work — park.
+                    // park() rechecks running AND deque (audit finding 3).
                     if (!self.park()) break; // running became false, exit
+                }
+            }
+            // Drain-first shutdown (audit finding 1, spec WorkerExit).
+            // Keep processing local deque and stealing until all work is done.
+            self.drainLoop(all_workers);
+        }
+
+        /// Drain loop for shutdown: process remaining local work, then
+        /// help steal from other workers until no work remains anywhere.
+        /// Matches scheduler.tla#L244 WorkerExit precondition.
+        fn drainLoop(self: *Self, all_workers: []Self) void {
+            while (true) {
+                if (self.local_deque.pop()) |item| {
+                    if (self.work_callback) |cb| {
+                        cb(item);
+                    }
+                } else if (self.trySteal(all_workers)) |item| {
+                    if (self.work_callback) |cb| {
+                        cb(item);
+                    }
+                } else {
+                    break;
                 }
             }
         }
@@ -179,13 +238,33 @@ pub fn WorkerPool(comptime IO: type) type {
 
         /// Start all worker threads. Must be in .ready state.
         /// Sets running=true BEFORE spawning (TLA+ spec: MainStart).
+        /// Failure-atomic: if any spawn fails, already-started threads are
+        /// stopped and joined before returning the error (audit finding 9).
         pub fn start(self: *Self) !void {
             std.debug.assert(self.state == .ready);
             for (self.workers) |*w| {
                 w.running.store(true, .release);
             }
+            var spawned: u32 = 0;
+            errdefer {
+                // Rollback: stop and join already-spawned threads.
+                for (self.workers[0..spawned]) |*w| {
+                    w.stop();
+                }
+                for (self.workers[0..spawned]) |*w| {
+                    if (w.thread) |t| {
+                        t.join();
+                        w.thread = null;
+                    }
+                }
+                // Reset running for all workers.
+                for (self.workers) |*w| {
+                    w.running.store(false, .release);
+                }
+            }
             for (self.workers) |*w| {
-                w.thread = try std.Thread.spawn(.{}, workerEntry, .{w});
+                w.thread = try std.Thread.spawn(.{}, workerEntry, .{ w, self.workers });
+                spawned += 1;
             }
             self.state = .started;
         }
@@ -216,8 +295,8 @@ pub fn WorkerPool(comptime IO: type) type {
             self.workers[worker_idx].wake();
         }
 
-        fn workerEntry(worker: *WorkerThread(IO)) void {
-            worker.runLoop();
+        fn workerEntry(worker: *WorkerThread(IO), all_workers: []WorkerThread(IO)) void {
+            worker.runLoop(all_workers);
         }
     };
 }
@@ -256,12 +335,14 @@ test "worker thread park and wake" {
 
     // Start worker in a thread via runLoop — it will park immediately (empty deque)
     w.running.store(true, .release);
+    // Single-element slice pointing to w itself for runLoop's all_workers param.
+    const all = @as(*[1]WorkerThread(FakeIO), &w);
 
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(worker: *WorkerThread(FakeIO)) void {
-            worker.runLoop();
+        fn run(wkr: *WorkerThread(FakeIO), workers: []WorkerThread(FakeIO)) void {
+            wkr.runLoop(workers);
         }
-    }.run, .{&w});
+    }.run, .{ &w, @as([]WorkerThread(FakeIO), all) });
 
     // Give worker a moment to park
     std.Thread.sleep(5 * std.time.ns_per_ms);
@@ -358,11 +439,12 @@ test "edge: double stop is safe" {
     var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
     defer w.deinit();
 
+    const all = @as(*[1]WorkerThread(FakeIO), &w);
     const t = try std.Thread.spawn(.{}, struct {
-        fn run(worker: *WorkerThread(FakeIO)) void {
-            worker.runLoop();
+        fn run(wkr: *WorkerThread(FakeIO), workers: []WorkerThread(FakeIO)) void {
+            wkr.runLoop(workers);
         }
-    }.run, .{&w});
+    }.run, .{ &w, @as([]WorkerThread(FakeIO), all) });
 
     std.Thread.sleep(5 * std.time.ns_per_ms);
     w.stop();
@@ -439,4 +521,154 @@ test "edge: connection pool exhaustion" {
         w.releaseConnection(acquired[i]);
     }
     try std.testing.expectEqual(@as(usize, 0), w.connection_arenas.count());
+}
+
+// ── Audit fix tests (spec-implementation gap fixes) ─────────────────
+
+test "audit: work stealing moves items between workers" {
+    // Finding 2: workers must steal from other workers' deques.
+    // Push work to worker 0, verify worker 1 can steal it via trySteal.
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 2, .{});
+    defer pool.deinit();
+
+    // Push items into worker 0's deque
+    pool.workers[0].local_deque.push(42);
+    pool.workers[0].local_deque.push(43);
+
+    // Worker 1 steals from worker 0
+    const stolen = pool.workers[1].trySteal(pool.workers);
+    try std.testing.expect(stolen != null);
+    // Steal takes from FIFO end (top), so should get 42 first
+    try std.testing.expectEqual(@as(u64, 42), stolen.?);
+    // Worker 0 should have 1 item left
+    try std.testing.expectEqual(@as(usize, 1), pool.workers[0].local_deque.len());
+}
+
+test "audit: trySteal returns null when no victims have work" {
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 3, .{});
+    defer pool.deinit();
+
+    // All deques empty — steal should fail
+    const stolen = pool.workers[0].trySteal(pool.workers);
+    try std.testing.expect(stolen == null);
+}
+
+test "audit: trySteal skips self" {
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 2, .{});
+    defer pool.deinit();
+
+    // Only worker 0 has work — worker 0 should not steal from itself
+    pool.workers[0].local_deque.push(99);
+    const stolen = pool.workers[0].trySteal(pool.workers);
+    try std.testing.expect(stolen == null);
+    // Item still in worker 0's deque
+    try std.testing.expectEqual(@as(usize, 1), pool.workers[0].local_deque.len());
+}
+
+test "audit: work stealing happens during runLoop" {
+    // Verify that runLoop actually steals work from other workers.
+    // Push all work to worker 0, both workers have callbacks,
+    // after processing worker 1 should have processed some via stealing.
+    var processed_0 = std.atomic.Value(u64).init(0);
+    var processed_1 = std.atomic.Value(u64).init(0);
+
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 2, .{});
+    defer pool.deinit();
+
+    const S0 = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            // Small busywait to give the thief time to steal
+            var v: u64 = 0;
+            for (0..200) |_| v +%= 1;
+            std.mem.doNotOptimizeAway(v);
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    const S1 = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S0.counter = &processed_0;
+    S1.counter = &processed_1;
+    pool.workers[0].work_callback = &S0.callback;
+    pool.workers[1].work_callback = &S1.callback;
+
+    // Push enough work to worker 0 that worker 1 has time to steal some
+    for (0..2000) |i| {
+        pool.workers[0].local_deque.push(@intCast(i));
+    }
+
+    try pool.start();
+    pool.workers[0].wake();
+    pool.workers[1].wake();
+
+    // Give time for both workers to process
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    pool.stop();
+
+    // Total should be 2000
+    const total = processed_0.load(.acquire) + processed_1.load(.acquire);
+    try std.testing.expectEqual(@as(u64, 2000), total);
+    // Worker 1 should have stolen and processed at least 1 item
+    try std.testing.expect(processed_1.load(.acquire) > 0);
+}
+
+test "audit: park rechecks deque (lost wakeup prevention)" {
+    // Finding 3: after storing park_state=1, if deque is non-empty,
+    // park() must cancel the park and return true.
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
+
+    w.running.store(true, .release);
+    // Push an item — simulating work arriving between pop() and park()
+    w.local_deque.push(42);
+
+    // park() should detect the non-empty deque and return true (not block)
+    const result = w.park();
+    try std.testing.expect(result); // should return true, not block
+    // park_state should be reset to 0 (park cancelled)
+    try std.testing.expectEqual(@as(u32, 0), w.park_state.load(.acquire));
+    // Item should still be in deque
+    try std.testing.expectEqual(@as(usize, 1), w.local_deque.len());
+}
+
+test "audit: drain-first shutdown processes all remaining work" {
+    // Finding 1: workers must drain their deques during shutdown.
+    var processed = std.atomic.Value(u64).init(0);
+
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 2, .{});
+    defer pool.deinit();
+
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+    for (pool.workers) |*w| {
+        w.work_callback = &S.callback;
+    }
+
+    // Push work to both workers
+    for (0..50) |i| {
+        pool.workers[0].local_deque.push(@intCast(i));
+    }
+    for (50..100) |i| {
+        pool.workers[1].local_deque.push(@intCast(i));
+    }
+
+    try pool.start();
+    // Wake workers briefly then immediately stop
+    pool.workers[0].wake();
+    pool.workers[1].wake();
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    pool.stop();
+
+    // All 100 items must be processed despite rapid shutdown (drain-first)
+    try std.testing.expectEqual(@as(u64, 100), processed.load(.acquire));
 }
