@@ -15,9 +15,8 @@ pub fn get(client: *Client, key: []const u8) !struct { value: ?[]const u8, respo
     return switch (resp.value) {
         .bulk_string => |s| .{ .value = s, .response = resp },
         .null_value => .{ .value = null, .response = resp },
-        .error_msg => |msg| {
+        .error_msg => {
             resp.deinit();
-            std.debug.print("Redis error: {s}\n", .{msg});
             return error.RedisError;
         },
         else => {
@@ -34,10 +33,7 @@ pub fn set(client: *Client, key: []const u8, value: []const u8) !void {
     defer resp.deinit();
     switch (resp.value) {
         .simple_string => return, // +OK
-        .error_msg => |msg| {
-            std.debug.print("Redis error: {s}\n", .{msg});
-            return error.RedisError;
-        },
+        .error_msg => return error.RedisError,
         else => return error.UnexpectedResponse,
     }
 }
@@ -49,10 +45,7 @@ pub fn del(client: *Client, key: []const u8) !i64 {
     defer resp.deinit();
     switch (resp.value) {
         .integer => |n| return n,
-        .error_msg => |msg| {
-            std.debug.print("Redis error: {s}\n", .{msg});
-            return error.RedisError;
-        },
+        .error_msg => return error.RedisError,
         else => return error.UnexpectedResponse,
     }
 }
@@ -64,9 +57,8 @@ pub fn ping(client: *Client) !struct { value: []const u8, response: connection.R
     var resp = try client.command(&args);
     return switch (resp.value) {
         .simple_string => |s| .{ .value = s, .response = resp },
-        .error_msg => |msg| {
+        .error_msg => {
             resp.deinit();
-            std.debug.print("Redis error: {s}\n", .{msg});
             return error.RedisError;
         },
         else => {

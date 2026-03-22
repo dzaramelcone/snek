@@ -107,23 +107,17 @@ pub const Client = struct {
             break :blk sa;
         };
 
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch {
-            return error.ConnectionRefused;
-        };
+        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer posix.close(fd);
 
-        posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch {
-            return error.ConnectionRefused;
-        };
+        try posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
 
         var client = Client{ .fd = fd, .allocator = allocator };
 
-        // Send StartupMessage
         var startup_buf: [256]u8 = undefined;
         const startup_msg = wire.encodeStartupMessage(&startup_buf, user, database);
         try client.sendAll(startup_msg);
 
-        // Read backend messages until ReadyForQuery
         try client.handleStartupResponse(user, password);
 
         return client;
@@ -146,7 +140,7 @@ pub const Client = struct {
     pub fn close(self: *Client) void {
         var term_buf: [8]u8 = undefined;
         const msg = wire.encodeTerminate(&term_buf);
-        _ = posix.write(self.fd, msg) catch {};
+        _ = posix.write(self.fd, msg) catch unreachable;
         posix.close(self.fd);
     }
 
@@ -155,10 +149,7 @@ pub const Client = struct {
     fn sendAll(self: *Client, data: []const u8) !void {
         var sent: usize = 0;
         while (sent < data.len) {
-            const n = posix.write(self.fd, data[sent..]) catch |e| switch (e) {
-                error.BrokenPipe, error.ConnectionResetByPeer => return error.ConnectionRefused,
-                else => return error.ConnectionRefused,
-            };
+            const n = try posix.write(self.fd, data[sent..]);
             if (n == 0) return error.ConnectionRefused;
             sent += n;
         }
@@ -167,9 +158,7 @@ pub const Client = struct {
     fn readExact(self: *Client, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
-            const n = posix.read(self.fd, buf[total..]) catch {
-                return error.ConnectionRefused;
-            };
+            const n = try posix.read(self.fd, buf[total..]);
             if (n == 0) return error.ConnectionRefused;
             total += n;
         }
@@ -251,6 +240,14 @@ pub const Client = struct {
             }
             rows.deinit(allocator);
         }
+        var column_names_copied = false;
+        errdefer {
+            if (column_names_copied) {
+                for (column_descs[0..col_count]) |desc| {
+                    allocator.free(desc.name);
+                }
+            }
+        }
         var command_tag: []u8 = &.{};
         errdefer if (command_tag.len > 0) allocator.free(command_tag);
 
@@ -266,6 +263,7 @@ pub const Client = struct {
                         @memcpy(name_copy, desc.name);
                         desc.name = name_copy;
                     }
+                    column_names_copied = true;
                 },
                 wire.BackendTag.data_row => {
                     var raw_values: [128]?[]const u8 = .{null} ** 128;

@@ -364,7 +364,6 @@ pub fn parseRowDescription(payload: []const u8, columns_out: []ColumnDesc) WireE
 
     var pos: usize = 2;
     for (0..field_count) |i| {
-        // Find null terminator for column name
         const name_start = pos;
         while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
         if (pos >= payload.len) return WireError.ProtocolViolation;
@@ -417,7 +416,6 @@ pub fn parseDataRow(payload: []const u8, values_out: []?[]const u8) WireError!u1
 
 /// Parse a CommandComplete payload — just a null-terminated string like "SELECT 3" or "INSERT 0 1".
 pub fn parseCommandComplete(payload: []const u8) []const u8 {
-    // Find null terminator
     var end: usize = 0;
     while (end < payload.len and payload[end] != 0) : (end += 1) {}
     return payload[0..end];
@@ -441,7 +439,6 @@ pub fn parseErrorFields(payload: []const u8) ErrorNotice {
         if (field_byte == 0) break;
         pos += 1;
 
-        // Find null-terminated value
         const val_start = pos;
         while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
         const val = payload[val_start..pos];
