@@ -33,20 +33,23 @@ const RESPONSE_CLOSE =
     "\r\n" ++
     RESPONSE_BODY;
 
-const PORT: u16 = 8080;
-
 pub fn main() !void {
-    // Create, bind, listen
+    // Read port from PORT env var, default 8080
+    const port: u16 = blk: {
+        const env = std.posix.getenv("PORT") orelse break :blk 8080;
+        break :blk std.fmt.parseInt(u16, env, 10) catch 8080;
+    };
+
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
 
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
-    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, PORT);
+    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
     try posix.bind(fd, &addr.any, addr.getOsSockLen());
     try posix.listen(fd, 128);
 
-    std.debug.print("snek hello server listening on http://127.0.0.1:{d}/\n", .{PORT});
+    std.debug.print("snek hello server listening on http://127.0.0.1:{d}/\n", .{port});
 
     // Accept loop (single-threaded, blocking)
     while (true) {
