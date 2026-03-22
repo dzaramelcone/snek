@@ -80,8 +80,12 @@ and `pop` clears `head.next`. However:
   (accept queue / worker deque / processing / completed) is not recorded.
 - **Deque stores raw u64**, losing type information entirely.
 
-**Deferred to**: Phase 12-13 (when frames are allocated from CoroutinePool
-and have a proper lifecycle, double-enqueue becomes structurally impossible).
+**Deferred to**: Phase 12-13. **Recommended approach: adopt zap's intrusive
+task model.** Make the queued object itself the authoritative task node —
+the `CoroutineFrame` embeds its queue link and is recovered via
+`@fieldParentPtr`. No raw `u64` tokens, no separate ownership tracking
+needed. See `specs/zap_comparison.md` §3 (Task Model and Ownership) and
+`refs/zap/src/thread_pool.zig` for the reference implementation.
 
 ### 6. High: frame lifetime contract unsafe — ❌ NOT FIXED
 
@@ -92,8 +96,12 @@ dereferences the `u64`, the runtime has a use-after-free.
 No ownership contract is documented or enforced. `CoroutinePool` exists
 but is not used by the scheduler path.
 
-**Deferred to**: Phase 12-13 (scheduler should allocate frames from
-CoroutinePool, giving the pool ownership of lifetime).
+**Deferred to**: Phase 12-13. **Recommended approach**: scheduler allocates
+frames from `CoroutinePool`, giving the pool ownership of lifetime. Combined
+with the intrusive task model (finding 5), the frame IS the queued object —
+allocated from the pool, enqueued by reference, recovered via
+`@fieldParentPtr`, returned to pool on completion. See
+`specs/zap_comparison.md` §3 and `refs/zap/blog.md` §fieldParentPtr.
 
 ### 7. High: cancellation not implemented end-to-end — ❌ NOT FIXED
 
@@ -106,9 +114,10 @@ It does NOT:
 Workers never check `frame.state` or `isCancelled()` before processing.
 The callback receives a raw `u64`, not a `*CoroutineFrame`.
 
-**Deferred to**: Phase 12-13 (when workers invoke `frame.resume()`,
-the resume method checks the cancellation token and returns
-`error.Cancelled`, which the worker can handle).
+**Deferred to**: Phase 12-13. With the intrusive task model (finding 5),
+workers receive `*CoroutineFrame` directly (via `@fieldParentPtr`), not
+`u64`. They can check `frame.isCancelled()` before calling `frame.resume()`.
+Cancelled frames skip execution and return to the pool.
 
 ### 8. High: startup/shutdown race — ✅ FIXED
 
