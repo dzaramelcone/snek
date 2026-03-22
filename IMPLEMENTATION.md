@@ -1196,3 +1196,5 @@ async def echo(ws):
 [2026-03-21] Phase 4.2: worker.zig — WorkerThread(IO) with deque + futex park/wake, WorkerPool with real std.Thread, 13 tests. Found and fixed start/stop race via TLA+.
 [2026-03-21] Phase 4.3: TLA+ model (specs/worker_lifecycle.tla) — verified 441,761 states with 4 workers. Safety: terminated workers never process. Liveness: stop always leads to termination, parked workers always wake.
 [2026-03-21] Phase 4: COMPLETE — workers + coroutines, TLA+ verified, all tests pass on macOS + Linux
+[2026-03-22] Phase 5.1: scheduler.zig — orchestrates workers, timers, accept queue. Round-robin dispatch, three-tier backpressure, tick()-based main loop. 14 tests including pointer round-trip verification and edge cases.
+[2026-03-22] Phase 5: COMPLETE — runtime foundation done (Phases 0-5). Ready for networking.
