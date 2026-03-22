@@ -1,219 +1,111 @@
-//! Two-tier middleware architecture: Zig-side (compiled at startup, zero Python
-//! overhead) and Python-side (hooks + wrapping).
+//! Middleware pipeline: before/after hook model between router and handler.
 //!
-//! Zig-side middleware: CORS, security headers, timing, request ID — resolved at
-//! comptime/startup, never per-request. Python-side middleware: before_request,
-//! after_request, on_error hooks + call_next wrapping.
+//! Before hooks inspect/modify the request and can short-circuit (return a
+//! response without calling the handler). After hooks inspect/modify the
+//! response after the handler runs. This is the "two-pass" model — simpler
+//! than onion/call_next wrapping and sufficient for the minimum viable layer.
 //!
-//! MiddlewarePipeline: ordered chain compiled at startup.
-//! LifecycleHooks: on_startup, on_shutdown, on_error.
-//! BackgroundTaskRunner: fire-and-forget task queue drained on shutdown.
+//! Also includes: TimingMiddleware (self-contained, no external dep),
+//! LifecycleHooks, BackgroundTaskRunner.
 //!
 //! Sources:
-//!   - Two-tier architecture: TurboAPI pattern — 0% overhead for Zig-side middleware
-//!     (src/http/REFERENCES_middleware.md)
-//!   - Compiled pipeline from http.zig comptime middleware
+//!   - Two-tier architecture: TurboAPI pattern (src/http/REFERENCES_middleware.md)
 //!   - BackgroundTaskRunner from Starlette BackgroundTask (docs/GAPS_RESEARCH.md)
 
 const std = @import("std");
-const security_cors = @import("../security/cors.zig");
-const security_headers = @import("../security/headers.zig");
-const observe_trace = @import("../observe/trace.zig");
+const Request = @import("request.zig").Request;
+const Response = @import("response.zig").Response;
 
 // ---------------------------------------------------------------------------
-// Zig-side middleware (zero Python overhead, compiled at startup)
+// Hook function types
 // ---------------------------------------------------------------------------
 
-/// CORS middleware — thin pipeline wrapper around security.cors.PreRenderedCors.
-/// The implementation lives in security/cors.zig; this is the pipeline integration.
-/// Source: TurboAPI delegation pattern — CorsMiddleware delegates to security/cors
-/// for 0% per-request overhead (src/http/REFERENCES_middleware.md).
-pub const CorsMiddleware = struct {
-    /// The pre-rendered CORS implementation (built once at startup).
-    impl: security_cors.PreRenderedCors,
+/// A handler function: takes a request, returns a response.
+pub const HandlerFn = *const fn (*Request) Response;
 
-    pub fn init(allocator: std.mem.Allocator, config: security_cors.CorsConfig) !CorsMiddleware {
-        return .{ .impl = security_cors.PreRenderedCors.fromConfig(allocator, config) catch return error.CorsInitFailed };
-    }
+/// Before-request hook: may inspect/modify request.
+/// Return non-null Response to short-circuit (skip handler + remaining hooks).
+pub const BeforeHook = *const fn (*Request) ?Response;
 
-    /// Inject CORS headers into a response. Delegates to security.cors.
-    pub fn apply(self: *const CorsMiddleware, origin: []const u8, response_headers: *security_cors.ResponseHeaders) void {
-        self.impl.injectHeaders(origin, response_headers);
-    }
+/// After-request hook: may inspect/modify the response after the handler ran.
+pub const AfterHook = *const fn (*const Request, *Response) void;
 
-    /// Handle OPTIONS preflight. Delegates to security.cors.
-    pub fn handlePreflight(self: *const CorsMiddleware, origin: []const u8) ?security_cors.PreflightResponse {
-        return self.impl.handlePreflight(origin);
-    }
-};
+// ---------------------------------------------------------------------------
+// Timing middleware (self-contained — no external dependency)
+// ---------------------------------------------------------------------------
 
-/// Security headers middleware — thin pipeline wrapper around security.headers.PreRenderedSecurityHeaders.
-/// The implementation lives in security/headers.zig; this is the pipeline integration.
-pub const SecurityHeadersMiddleware = struct {
-    /// The pre-rendered security headers implementation.
-    impl: security_headers.PreRenderedSecurityHeaders,
-
-    pub fn init(allocator: std.mem.Allocator, sh: security_headers.SecurityHeaders) !SecurityHeadersMiddleware {
-        return .{ .impl = security_headers.PreRenderedSecurityHeaders.fromHeaders(allocator, sh) catch return error.SecurityHeadersInitFailed };
-    }
-
-    /// Inject all security headers into response. Delegates to security.headers.
-    pub fn apply(self: *const SecurityHeadersMiddleware, response_headers: *security_headers.ResponseHeaders) void {
-        self.impl.inject(response_headers);
-    }
-};
-
-/// Timing middleware: measures request duration in Zig, injects X-Response-Time header.
-/// Self-contained — uses std.time directly; no external dependency needed.
+/// Measures request duration in Zig, formats as X-Response-Time header value.
 pub const TimingMiddleware = struct {
-    /// Timestamp (nanoseconds) captured at request start.
     start_ns: u64,
 
     pub fn start() TimingMiddleware {
         return .{ .start_ns = @intCast(std.time.nanoTimestamp()) };
     }
 
-    /// Returns the elapsed duration in nanoseconds.
     pub fn elapsedNs(self: *const TimingMiddleware) u64 {
         const now: u64 = @intCast(std.time.nanoTimestamp());
         return now - self.start_ns;
     }
 
-    /// Format elapsed time as milliseconds string into buf. Returns the written slice.
+    /// Format elapsed time as "N.NNNms" into buf. Returns the written slice.
     pub fn formatHeader(self: *const TimingMiddleware, buf: []u8) []const u8 {
         const elapsed_us = self.elapsedNs() / 1000;
         const ms = elapsed_us / 1000;
         const frac = elapsed_us % 1000;
-        const len = std.fmt.formatIntBuf(buf, ms, 10, .lower, .{});
-        if (len + 4 <= buf.len) {
-            buf[len] = '.';
-            _ = std.fmt.formatIntBuf(buf[len + 1 ..], frac, 10, .lower, .{ .width = 3, .fill = '0' });
-            @memcpy(buf[len + 4 ..][0..2], "ms");
-            return buf[0 .. len + 6];
-        }
-        return buf[0..len];
+        const result = std.fmt.bufPrint(buf, "{d}.{d:0>3}ms", .{ ms, frac }) catch return buf[0..0];
+        return result;
     }
-};
-
-/// Request ID middleware — thin pipeline wrapper around observe.trace.RequestId.
-/// The implementation lives in observe/trace.zig; this is the pipeline integration.
-/// Generates ULID-based request IDs for each incoming request.
-pub const RequestIdMiddleware = struct {
-    /// Pre-rendered header name (X-Request-ID).
-    header_name: []const u8,
-
-    pub fn init() RequestIdMiddleware {
-        return .{ .header_name = "X-Request-ID" };
-    }
-
-    /// Generate a new ULID request ID. Delegates to observe.trace.RequestId.
-    pub fn generate(self: *const RequestIdMiddleware) observe_trace.RequestId {
-        _ = self;
-        return observe_trace.RequestId.generate();
-    }
-
-    /// Generate and encode a request ID as a 26-char string.
-    pub fn generateEncoded(self: *const RequestIdMiddleware, buf: *[26]u8) void {
-        const rid = self.generate();
-        rid.encode(buf);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Python-side middleware (hooks + wrapping)
-// ---------------------------------------------------------------------------
-
-/// Hook types for Python middleware dispatch.
-pub const Hook = enum {
-    before_request,
-    after_request,
-    on_error,
-};
-
-/// A registered Python middleware function (opaque pointer to Python callable).
-pub const PythonMiddleware = struct {
-    /// Opaque pointer to the Python callable.
-    callable: *anyopaque,
-    /// Which hook this middleware is registered for (null if wrapping style).
-    hook: ?Hook,
-    /// Whether this is a wrapping middleware (receives call_next).
-    is_wrapping: bool,
-    /// Execution order (lower = earlier).
-    order: u32,
 };
 
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 
-/// Compiled middleware pipeline. Zig middleware resolved at startup,
-/// Python middleware ordered by registration. Immutable after compile().
-pub const MiddlewarePipeline = struct {
-    /// Zig-side middleware (always runs first, zero Python overhead).
-    cors: ?CorsMiddleware,
-    security: ?SecurityHeadersMiddleware,
-    timing: bool,
-    request_id: ?RequestIdMiddleware,
-
-    /// Python before_request hooks, ordered.
-    before_hooks: [64]*anyopaque,
+/// Middleware pipeline with before/after hooks around a handler.
+/// Before hooks run in registration order; after hooks run in registration order.
+/// A before hook returning non-null short-circuits the entire chain.
+pub const Pipeline = struct {
+    before: [16]BeforeHook,
     before_count: usize,
-
-    /// Python after_request hooks, ordered.
-    after_hooks: [64]*anyopaque,
+    after: [16]AfterHook,
     after_count: usize,
 
-    /// Python on_error hooks, ordered.
-    error_hooks: [64]*anyopaque,
-    error_count: usize,
-
-    /// Python wrapping middleware, ordered (outermost first).
-    wrappers: [32]PythonMiddleware,
-    wrapper_count: usize,
-
-    pub fn init() MiddlewarePipeline {
-        return undefined;
+    pub fn init() Pipeline {
+        return .{
+            .before = undefined,
+            .before_count = 0,
+            .after = undefined,
+            .after_count = 0,
+        };
     }
 
-    /// Add a Zig-side CORS middleware with the given config.
-    pub fn setCors(self: *MiddlewarePipeline, allocator: std.mem.Allocator, config: security_cors.CorsConfig) !void {
-        self.cors = CorsMiddleware.init(allocator, config) catch return error.CorsInitFailed;
+    /// Register a before-request hook.
+    pub fn addBefore(self: *Pipeline, hook: BeforeHook) void {
+        if (self.before_count < self.before.len) {
+            self.before[self.before_count] = hook;
+            self.before_count += 1;
+        }
     }
 
-    /// Add a Zig-side security headers middleware.
-    pub fn setSecurity(self: *MiddlewarePipeline, allocator: std.mem.Allocator, sh: security_headers.SecurityHeaders) !void {
-        self.security = SecurityHeadersMiddleware.init(allocator, sh) catch return error.SecurityHeadersInitFailed;
+    /// Register an after-request hook.
+    pub fn addAfter(self: *Pipeline, hook: AfterHook) void {
+        if (self.after_count < self.after.len) {
+            self.after[self.after_count] = hook;
+            self.after_count += 1;
+        }
     }
 
-    /// Enable Zig-side timing middleware.
-    pub fn enableTiming(self: *MiddlewarePipeline) void {
-        _ = .{self};
-    }
-
-    /// Enable Zig-side request ID middleware.
-    pub fn enableRequestId(self: *MiddlewarePipeline) void {
-        _ = .{self};
-    }
-
-    /// Register a Python hook (before_request, after_request, on_error).
-    pub fn addHook(self: *MiddlewarePipeline, hook: Hook, callable: *anyopaque) void {
-        _ = .{ self, hook, callable };
-    }
-
-    /// Register a Python wrapping middleware (receives call_next).
-    pub fn addWrapper(self: *MiddlewarePipeline, callable: *anyopaque, order: u32) void {
-        _ = .{ self, callable, order };
-    }
-
-    /// Compile the pipeline: sort by order, freeze.
-    pub fn compile(self: *MiddlewarePipeline) void {
-        _ = .{self};
-    }
-
-    /// Execute the full pipeline for a request. Zig middleware runs inline,
-    /// Python hooks dispatched via FFI.
-    pub fn execute(self: *const MiddlewarePipeline, request: *anyopaque, response: *anyopaque) !void {
-        _ = .{ self, request, response };
+    /// Execute: run before hooks, call handler, run after hooks.
+    /// If any before hook returns a Response, short-circuit immediately.
+    pub fn execute(self: *const Pipeline, request: *Request, handler: HandlerFn) Response {
+        for (self.before[0..self.before_count]) |hook| {
+            if (hook(request)) |response| return response;
+        }
+        var response = handler(request);
+        for (self.after[0..self.after_count]) |hook| {
+            hook(request, &response);
+        }
+        return response;
     }
 };
 
@@ -221,31 +113,45 @@ pub const MiddlewarePipeline = struct {
 // Lifecycle hooks
 // ---------------------------------------------------------------------------
 
-/// Application lifecycle hooks: on_startup, on_shutdown, on_error.
+/// Zig-native lifecycle hook function.
+pub const LifecycleFn = *const fn () void;
+
+/// Application lifecycle hooks: on_startup, on_shutdown.
 pub const LifecycleHooks = struct {
-    startup_hooks: [32]*anyopaque,
+    startup_hooks: [32]LifecycleFn,
     startup_count: usize,
-    shutdown_hooks: [32]*anyopaque,
+    shutdown_hooks: [32]LifecycleFn,
     shutdown_count: usize,
 
     pub fn init() LifecycleHooks {
-        return undefined;
+        return .{
+            .startup_hooks = undefined,
+            .startup_count = 0,
+            .shutdown_hooks = undefined,
+            .shutdown_count = 0,
+        };
     }
 
-    pub fn onStartup(self: *LifecycleHooks, callable: *anyopaque) void {
-        _ = .{ self, callable };
+    pub fn onStartup(self: *LifecycleHooks, hook: LifecycleFn) void {
+        if (self.startup_count < self.startup_hooks.len) {
+            self.startup_hooks[self.startup_count] = hook;
+            self.startup_count += 1;
+        }
     }
 
-    pub fn onShutdown(self: *LifecycleHooks, callable: *anyopaque) void {
-        _ = .{ self, callable };
+    pub fn onShutdown(self: *LifecycleHooks, hook: LifecycleFn) void {
+        if (self.shutdown_count < self.shutdown_hooks.len) {
+            self.shutdown_hooks[self.shutdown_count] = hook;
+            self.shutdown_count += 1;
+        }
     }
 
-    pub fn runStartup(self: *const LifecycleHooks) !void {
-        _ = .{self};
+    pub fn runStartup(self: *const LifecycleHooks) void {
+        for (self.startup_hooks[0..self.startup_count]) |hook| hook();
     }
 
-    pub fn runShutdown(self: *const LifecycleHooks) !void {
-        _ = .{self};
+    pub fn runShutdown(self: *const LifecycleHooks) void {
+        for (self.shutdown_hooks[0..self.shutdown_count]) |hook| hook();
     }
 };
 
@@ -253,49 +159,247 @@ pub const LifecycleHooks = struct {
 // Background tasks
 // ---------------------------------------------------------------------------
 
-/// Fire-and-forget task queue. Tasks enqueued after response is sent.
-/// Queue drained on graceful shutdown.
+/// Zig-native background task function.
+pub const TaskFn = *const fn () void;
+
+/// Fire-and-forget task queue. Tasks enqueued during request handling,
+/// drained after response is sent or on graceful shutdown.
 /// Source: Starlette BackgroundTask pattern (docs/GAPS_RESEARCH.md).
 pub const BackgroundTaskRunner = struct {
-    tasks: [256]*anyopaque,
+    tasks: [256]TaskFn,
     task_count: usize,
-    running: bool,
 
     pub fn init() BackgroundTaskRunner {
-        return undefined;
+        return .{
+            .tasks = undefined,
+            .task_count = 0,
+        };
     }
 
-    /// Enqueue a task to run after the current response is sent.
-    pub fn enqueue(self: *BackgroundTaskRunner, callable: *anyopaque) void {
-        _ = .{ self, callable };
+    pub fn enqueue(self: *BackgroundTaskRunner, task: TaskFn) void {
+        if (self.task_count < self.tasks.len) {
+            self.tasks[self.task_count] = task;
+            self.task_count += 1;
+        }
     }
 
-    /// Drain all pending tasks. Called on graceful shutdown.
-    pub fn drain(self: *BackgroundTaskRunner) !void {
-        _ = .{self};
+    /// Drain all pending tasks (run each, then clear queue).
+    pub fn drain(self: *BackgroundTaskRunner) void {
+        for (self.tasks[0..self.task_count]) |task| task();
+        self.task_count = 0;
     }
 
-    /// Check if there are pending tasks.
     pub fn hasPending(self: *const BackgroundTaskRunner) bool {
-        _ = .{self};
-        return undefined;
+        return self.task_count > 0;
     }
 };
 
-test "zig middleware ordering" {}
+// ============================================================
+// Tests
+// ============================================================
 
-test "python hook dispatch" {}
+// -- Shared test helpers (file-scoped mutable state for test hooks) ---------
 
-test "cors preflight" {}
+var test_counter: u32 = 0;
 
-test "security headers applied" {}
+fn resetTestState() void {
+    test_counter = 0;
+}
 
-test "timing header injected" {}
+fn makeRequest() Request {
+    return Request.fromRaw(.GET, "/test", .http11, &.{}, null);
+}
 
-test "request id generated" {}
+fn echoHandler(req: *Request) Response {
+    _ = req;
+    return Response.text("ok");
+}
 
-test "background task drain" {}
+// -- 1. Empty pipeline calls handler directly ------------------------------
 
-test "lifecycle startup shutdown" {}
+test "empty pipeline calls handler directly" {
+    var p = Pipeline.init();
+    var req = makeRequest();
+    const resp = p.execute(&req, echoHandler);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("ok", resp.body.?);
+}
 
-test "middleware pipeline compile" {}
+// -- 2. Before hook runs before handler ------------------------------------
+
+fn beforeIncrement(_: *Request) ?Response {
+    test_counter += 1;
+    return null; // continue chain
+}
+
+fn handlerChecksCounter(_: *Request) Response {
+    // Counter should already be 1 (before hook ran first).
+    return if (test_counter == 1) Response.text("good") else Response.init(500);
+}
+
+test "before hook runs before handler" {
+    resetTestState();
+    var p = Pipeline.init();
+    p.addBefore(beforeIncrement);
+    var req = makeRequest();
+    const resp = p.execute(&req, handlerChecksCounter);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("good", resp.body.?);
+}
+
+// -- 3. After hook runs after handler (modifies response header) -----------
+
+fn afterAddHeader(_: *const Request, resp: *Response) void {
+    _ = resp.setHeader("X-After", "applied");
+}
+
+test "after hook modifies response" {
+    var p = Pipeline.init();
+    p.addAfter(afterAddHeader);
+    var req = makeRequest();
+    const resp = p.execute(&req, echoHandler);
+    // The after hook should have added X-After header.
+    try std.testing.expectEqual(@as(usize, 2), resp.header_count);
+    // First header is Content-Type from text(), second is X-After.
+    try std.testing.expectEqualStrings("X-After", resp.headers[1].name);
+    try std.testing.expectEqualStrings("applied", resp.headers[1].value);
+}
+
+// -- 4. Before hook short-circuits -----------------------------------------
+
+fn authHookDeny(_: *Request) ?Response {
+    return Response.init(401);
+}
+
+fn unreachableHandler(_: *Request) Response {
+    // Should never be called.
+    return Response.init(500);
+}
+
+test "before hook short-circuits" {
+    var p = Pipeline.init();
+    p.addBefore(authHookDeny);
+    var req = makeRequest();
+    const resp = p.execute(&req, unreachableHandler);
+    try std.testing.expectEqual(@as(u16, 401), resp.status);
+}
+
+// -- 5. Multiple hooks execute in order ------------------------------------
+
+fn beforeFirst(_: *Request) ?Response {
+    test_counter += 1; // 0 -> 1
+    return null;
+}
+
+fn beforeSecond(_: *Request) ?Response {
+    test_counter += 10; // 1 -> 11
+    return null;
+}
+
+fn afterFirst(_: *const Request, _: *Response) void {
+    test_counter += 100; // 11 -> 111
+}
+
+fn afterSecond(_: *const Request, _: *Response) void {
+    test_counter += 1000; // 111 -> 1111
+}
+
+test "multiple hooks execute in order" {
+    resetTestState();
+    var p = Pipeline.init();
+    p.addBefore(beforeFirst);
+    p.addBefore(beforeSecond);
+    p.addAfter(afterFirst);
+    p.addAfter(afterSecond);
+    var req = makeRequest();
+    _ = p.execute(&req, echoHandler);
+    try std.testing.expectEqual(@as(u32, 1111), test_counter);
+}
+
+// -- 6. Timing middleware formats header -----------------------------------
+
+test "timing middleware formats header" {
+    const tm = TimingMiddleware{ .start_ns = 0 };
+    // We can't control nanoTimestamp in test, but we can test formatHeader
+    // with a known elapsed by constructing carefully.
+    // Instead: just verify the format function doesn't crash and returns "ms".
+    _ = tm; // TimingMiddleware tested via formatHeader with real time below.
+
+    // Test format with a synthetic start that guarantees >0 elapsed.
+    const tm2 = TimingMiddleware.start();
+    var buf: [32]u8 = undefined;
+    const hdr = tm2.formatHeader(&buf);
+    // Must end with "ms".
+    try std.testing.expect(hdr.len >= 5); // at minimum "0.000ms"
+    try std.testing.expect(std.mem.endsWith(u8, hdr, "ms"));
+}
+
+// -- 7. Lifecycle hooks ----------------------------------------------------
+
+var lifecycle_trace: u32 = 0;
+
+fn startupHook() void {
+    lifecycle_trace += 1;
+}
+
+fn shutdownHook() void {
+    lifecycle_trace += 10;
+}
+
+test "lifecycle startup and shutdown" {
+    lifecycle_trace = 0;
+    var lc = LifecycleHooks.init();
+    lc.onStartup(startupHook);
+    lc.onShutdown(shutdownHook);
+    lc.runStartup();
+    try std.testing.expectEqual(@as(u32, 1), lifecycle_trace);
+    lc.runShutdown();
+    try std.testing.expectEqual(@as(u32, 11), lifecycle_trace);
+}
+
+// -- 8. Background task runner ---------------------------------------------
+
+var bg_trace: u32 = 0;
+
+fn bgTaskA() void {
+    bg_trace += 1;
+}
+
+fn bgTaskB() void {
+    bg_trace += 10;
+}
+
+test "background task drain" {
+    bg_trace = 0;
+    var runner = BackgroundTaskRunner.init();
+    try std.testing.expect(!runner.hasPending());
+    runner.enqueue(bgTaskA);
+    runner.enqueue(bgTaskB);
+    try std.testing.expect(runner.hasPending());
+    runner.drain();
+    try std.testing.expectEqual(@as(u32, 11), bg_trace);
+    try std.testing.expect(!runner.hasPending());
+}
+
+// -- 9. Short-circuit stops remaining before hooks -------------------------
+
+fn shortCircuitEarly(_: *Request) ?Response {
+    test_counter += 1;
+    return Response.init(403);
+}
+
+fn neverReachedHook(_: *Request) ?Response {
+    test_counter += 1000; // should NOT run
+    return null;
+}
+
+test "short-circuit stops remaining before hooks" {
+    resetTestState();
+    var p = Pipeline.init();
+    p.addBefore(shortCircuitEarly);
+    p.addBefore(neverReachedHook);
+    var req = makeRequest();
+    const resp = p.execute(&req, unreachableHandler);
+    try std.testing.expectEqual(@as(u16, 403), resp.status);
+    try std.testing.expectEqual(@as(u32, 1), test_counter);
+}

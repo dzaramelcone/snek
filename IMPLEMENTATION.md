@@ -1211,3 +1211,8 @@ async def echo(ws):
 [2026-03-22] Phase 8.3: response.zig — fluent builder, json/text/html/redirect/notFound/methodNotAllowed constructors, serialize to wire. 6 tests.
 [2026-03-22] Phase 8.4: cookies.zig — Cookie header parsing, Set-Cookie serialization with attributes, HMAC-SHA256 sign/verify. 5 tests.
 [2026-03-22] Phase 8: COMPLETE — router, request, response, cookies. 26 tests.
+[2026-03-22] Phase 9.1: json/parse.zig — std.json wrapper with typed field accessors. 6 tests.
+[2026-03-22] Phase 9.2: json/serialize.zig — direct-to-buffer serializer, zero allocation, string escaping, 64-bit nesting bitmask. 6 tests.
+[2026-03-22] Phase 9.3: http/middleware.zig — before/after hook pipeline, short-circuit, timing middleware, lifecycle hooks, background tasks. 9 tests.
+[2026-03-22] Phase 9: COMPLETE (essentials) — JSON + middleware. compress.zig and validate.zig deferred.
+[2026-03-22] ═══ MILESTONE: snek serves hello world over HTTP ═══
