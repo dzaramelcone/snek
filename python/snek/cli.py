@@ -59,6 +59,16 @@ def _run_with_reload(args: dict) -> None:
     """Supervisor process: spawn the server, watch .py files, restart on change."""
     cmd = [sys.executable, "-m", "snek.cli", args["app_ref"],
            "--host", args["host"], "--port", str(args["port"])]
+    proc: subprocess.Popen | None = None
+
+    def _cleanup(signum, frame):
+        if proc and proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
 
     while True:
         mtimes = _collect_py_mtimes()
@@ -80,7 +90,7 @@ def _run_with_reload(args: dict) -> None:
                 print(f"\n  [reload] new file detected, restarting...")
                 changed = True
 
-        os.kill(proc.pid, signal.SIGTERM)
+        proc.terminate()
         proc.wait()
 
 

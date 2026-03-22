@@ -426,6 +426,25 @@ pub fn invokePythonHandler(
 // ── Server startup ──────────────────────────────────────────────────
 
 const server_mod = @import("../server.zig");
+const posix = std.posix;
+
+/// Global server pointer for signal handler context.
+/// Signal handlers are C callbacks with no user data parameter.
+var global_server: ?*server_mod.Server = null;
+
+fn shutdownSignalHandler(_: c_int) callconv(.c) void {
+    if (global_server) |srv| srv.shutdown();
+}
+
+fn installShutdownSignals() void {
+    const act = posix.Sigaction{
+        .handler = .{ .handler = shutdownSignalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.INT, &act, null);
+}
 
 /// Start the HTTP server with Python handlers wired in.
 /// Called from _snek.run(host, port).
@@ -447,16 +466,19 @@ pub fn startServer(host: []const u8, port: u16) !void {
 
     try srv.listen(host, port);
 
+    // Install SIGTERM/SIGINT handlers so the server shuts down cleanly
+    global_server = &srv;
+    installShutdownSignals();
+    defer global_server = null;
+
     // Release GIL while server runs — worker threads will acquire per-request
     const saved_state = gil.PyEval_SaveThread();
 
     srv.run() catch |err| {
-        // Re-acquire GIL before returning to Python
         gil.PyEval_RestoreThread(saved_state);
         return err;
     };
 
-    // Re-acquire GIL before returning to Python
     gil.PyEval_RestoreThread(saved_state);
 }
 
