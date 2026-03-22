@@ -150,13 +150,8 @@ pub fn Listener(comptime IO: type) type {
                 try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             }
 
-            // Parse address and bind
-            var bind_addr = posix.sockaddr.in{
-                .family = posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, port),
-                .addr = parseIpv4(addr),
-            };
-            try posix.bind(fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in));
+            const net_addr = try std.net.Address.parseIp4(addr, port);
+            try posix.bind(fd, &net_addr.any, net_addr.getOsSockLen());
 
             // Listen
             try posix.listen(fd, config.backlog);
@@ -198,24 +193,6 @@ pub fn Listener(comptime IO: type) type {
             try posix.setsockopt(self.socket.fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(val));
         }
     };
-}
-
-/// Parse a dotted-quad IPv4 string into a network-order u32.
-fn parseIpv4(addr: []const u8) u32 {
-    var octets: [4]u8 = .{ 0, 0, 0, 0 };
-    var octet_idx: usize = 0;
-    var val: u8 = 0;
-    for (addr) |c| {
-        if (c == '.') {
-            octets[octet_idx] = val;
-            octet_idx += 1;
-            val = 0;
-        } else {
-            val = val * 10 + (c - '0');
-        }
-    }
-    octets[octet_idx] = val;
-    return @bitCast(octets);
 }
 
 // -- Test helpers --

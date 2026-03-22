@@ -382,32 +382,11 @@ fn createListenSocket(addr: []const u8, port: u16) !posix.socket_t {
     const nonblock: usize = @intCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
     _ = try posix.fcntl(fd, posix.F.SETFL, flags | nonblock);
 
-    var bind_addr = posix.sockaddr.in{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = parseIpv4(addr),
-    };
-    try posix.bind(fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in));
+    const net_addr = try std.net.Address.parseIp4(addr, port);
+    try posix.bind(fd, &net_addr.any, net_addr.getOsSockLen());
     try posix.listen(fd, 128);
 
     return fd;
-}
-
-fn parseIpv4(addr: []const u8) u32 {
-    var octets: [4]u8 = .{ 0, 0, 0, 0 };
-    var octet_idx: usize = 0;
-    var val: u8 = 0;
-    for (addr) |c| {
-        if (c == '.') {
-            octets[octet_idx] = val;
-            octet_idx += 1;
-            val = 0;
-        } else {
-            val = val * 10 + (c - '0');
-        }
-    }
-    octets[octet_idx] = val;
-    return @bitCast(octets);
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -454,12 +433,8 @@ test "server handles one request" {
 
     const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(cfd);
-    var addr = posix.sockaddr.in{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = parseIpv4("127.0.0.1"),
-    };
-    try posix.connect(cfd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    const server_addr = try std.net.Address.parseIp4("127.0.0.1", port);
+    try posix.connect(cfd, &server_addr.any, server_addr.getOsSockLen());
     _ = try posix.send(cfd, "GET / HTTP/1.1\r\nHost: h\r\n\r\n", 0);
 
     std.Thread.sleep(100 * std.time.ns_per_ms);
@@ -499,14 +474,14 @@ test "server handles concurrent requests" {
     for (&threads) |*th| {
         th.* = try std.Thread.spawn(.{}, struct {
             fn req(p: u16, cnt: *std.atomic.Value(u32)) void {
-                const cfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+                const cfd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
                 defer posix.close(cfd);
-                var a = posix.sockaddr.in{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, p), .addr = parseIpv4("127.0.0.1") };
-                posix.connect(cfd, @ptrCast(&a), @sizeOf(posix.sockaddr.in)) catch return;
-                _ = posix.send(cfd, "GET /ping HTTP/1.1\r\nHost: h\r\n\r\n", 0) catch return;
+                const sa = std.net.Address.parseIp4("127.0.0.1", p) catch unreachable;
+                posix.connect(cfd, &sa.any, sa.getOsSockLen()) catch unreachable;
+                _ = posix.send(cfd, "GET /ping HTTP/1.1\r\nHost: h\r\n\r\n", 0) catch unreachable;
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 var buf: [4096]u8 = undefined;
-                const n = posix.recv(cfd, &buf, 0) catch return;
+                const n = posix.recv(cfd, &buf, 0) catch unreachable;
                 if (n > 0 and std.mem.indexOf(u8, buf[0..n], "pong") != null)
                     _ = cnt.fetchAdd(1, .monotonic);
             }
@@ -542,7 +517,7 @@ test "server handles 404" {
 
     const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(cfd);
-    var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, port), .addr = parseIpv4("127.0.0.1") };
+    const addr = (try std.net.Address.parseIp4("127.0.0.1", port)).any;
     try posix.connect(cfd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
     _ = try posix.send(cfd, "GET /nope HTTP/1.1\r\nHost: h\r\n\r\n", 0);
 
