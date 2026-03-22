@@ -1,4 +1,4 @@
-"""snek hello world — @app.get style decorators."""
+"""snek application class with FastAPI-style decorators."""
 
 import _snek
 
@@ -12,6 +12,15 @@ class App:
 
     def post(self, path):
         return self._route("POST", path)
+
+    def put(self, path):
+        return self._route("PUT", path)
+
+    def delete(self, path):
+        return self._route("DELETE", path)
+
+    def patch(self, path):
+        return self._route("PATCH", path)
 
     def _route(self, method, path):
         def decorator(func):
@@ -27,19 +36,3 @@ class App:
             print(f"    {method} {path}")
         print()
         _snek.run(host, port)
-
-
-app = App()
-
-
-@app.get("/")
-def hello(request):
-    return {"message": "hello from snek python"}
-
-
-@app.get("/health")
-def health(request):
-    return {"status": "ok"}
-
-
-app.run()
