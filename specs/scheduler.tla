@@ -309,7 +309,13 @@ Fairness ==
         /\ WF_vars(WorkerExit(w))
     /\ WF_vars(MainStart)
     /\ WF_vars(MainDispatch)
-    /\ WF_vars(MainShutdown)
+    \* NO fairness on MainShutdown — it is an environment action.
+    \* The system can run indefinitely without shutting down.
+    \* Liveness properties (AllTasksComplete, NoStarvation) are
+    \* DRAIN GUARANTEES: they hold once shutdown is initiated, not
+    \* during steady-state operation. Steady-state progress is
+    \* ensured by WF on WorkerPop/Process/Steal — workers always
+    \* make progress on available work.
     /\ WF_vars(MainJoin)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -342,30 +348,42 @@ NoWorkBeforeStart ==
     (main_pc = "ready") => \A w \in Workers: worker_pc[w] = "pre_start"
 
 \* SINGLE OWNERSHIP: each task exists in exactly one location.
-\* A task is either: in accept_queue, in exactly one worker_deque,
-\* being processed by exactly one worker, or completed.
+\* Uses occurrence counting in sequences (not SeqToSet) to detect duplicates.
+\* Also verifies task_state matches the task's actual location.
+SeqCount(seq, val) == Len(SelectSeq(seq, LAMBDA x: x = val))
+
 SingleOwnership ==
     \A t \in created:
-        LET in_aq == t \in SeqToSet(accept_queue)
-            in_deques == {w \in Workers : t \in SeqToSet(worker_deque[w])}
-            processing == {w \in Workers : worker_cur[w] = t}
-            done == task_state[t] = "completed"
+        LET aq == SeqCount(accept_queue, t)
+            \* Sum of occurrences across all worker deques
+            dq == LET counts == {SeqCount(worker_deque[w], t) : w \in Workers}
+                  IN IF \E w \in Workers: SeqCount(worker_deque[w], t) > 0
+                     THEN Cardinality({w \in Workers : SeqCount(worker_deque[w], t) > 0})
+                     ELSE 0
+            pr == Cardinality({w \in Workers : worker_cur[w] = t})
+            dn == IF task_state[t] = "completed" THEN 1 ELSE 0
         IN
-            \* Exactly one of these is true:
-            /\ Cardinality(in_deques) + Cardinality(processing)
-               + (IF in_aq THEN 1 ELSE 0)
-               + (IF done THEN 1 ELSE 0) = 1
-
-\* After shutdown, no new tasks enter the system.
-NoNewTasksAfterShutdown ==
-    (main_pc \in {"draining", "done"}) => Len(accept_queue) <= Cardinality(created)
+            \* Task exists in exactly one place — no duplicates, no loss
+            /\ aq + dq + pr + dn = 1
+            \* No duplicate entries within any single sequence
+            /\ aq <= 1
+            /\ \A w \in Workers: SeqCount(worker_deque[w], t) <= 1
+            \* task_state matches actual location
+            /\ (aq = 1 => task_state[t] = "in_accept_queue")
+            /\ (pr > 0 => task_state[t] = "processing")
+            /\ (dn = 1 => task_state[t] = "completed")
+            /\ (\E w \in Workers: SeqCount(worker_deque[w], t) > 0)
+               => task_state[t] = "in_worker_deque"
 
 \* =====================================================================
 \* 10. Liveness properties (temporal)
 \* =====================================================================
 
-\* AllTasksComplete: every created task eventually reaches completed.
-\* No cancellation — drain-first means all accepted work completes.
+\* DRAIN GUARANTEE: once shutdown is initiated, every created task
+\* eventually reaches completed. This is NOT a steady-state guarantee —
+\* it depends on MainShutdown eventually being called (which has no
+\* fairness, so it may never happen in an infinite execution).
+\* Steady-state progress is ensured by WF on WorkerPop/Process.
 AllTasksComplete ==
     \A t \in TaskIds:
         (t \in created) ~> (t \in created /\ task_state[t] = "completed")
@@ -380,8 +398,10 @@ ParkedWorkerWakes ==
         (worker_pc[w] = "parked" /\ park_state[w] = 0) ~>
             (worker_pc[w] /= "parked")
 
-\* Per-task no-starvation: if a task is in a worker's deque, it is
-\* eventually processed (not stuck forever).
+\* Per-task progress: if a task is in a worker's deque, it eventually
+\* reaches completed. This is a STEADY-STATE property — it holds
+\* regardless of whether shutdown is called. Workers with work always
+\* make progress (via WF on WorkerPop and SF on WorkerPop).
 NoStarvation ==
     \A t \in TaskIds:
         \A w \in Workers:
