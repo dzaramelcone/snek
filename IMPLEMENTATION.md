@@ -1202,3 +1202,7 @@ async def echo(ws):
 [2026-03-22] Phase 5.3: Spec-implementation alignment — 6 critical gaps fixed: work stealing, lost wakeup race, drain-first shutdown, atomic shut_down, startup race, start() failure rollback. 9 audit tests added. Verified on macOS + Linux.
 [2026-03-22] Phase 6.1: tcp.zig — Listener (bind, SO_REUSEADDR, SO_REUSEPORT, accept), Connection (send, recv, TCP_NODELAY, SO_KEEPALIVE, two-arena model, two-timeout state machine). 9 tests on real loopback sockets. Passes macOS + Linux.
 [2026-03-22] Phase 6: COMPLETE — first real network I/O.
+[2026-03-22] Phase 7.1: http1.zig — incremental state machine parser, zero-copy header slices, inline lowercasing, pipelined request support, response serializer. 10 tests.
+[2026-03-22] Phase 7.2: smuggling.zig — strict CL/TE validation (Kettle 2025), rejects leading zeros, obs-fold, null bytes, dual framing. 19 security tests.
+[2026-03-22] Phase 7.3: tls.zig — comptime ssl bool specialization (Bun pattern), PlainStream functional, TlsStream stubbed behind TlsNotLinked. 5 tests.
+[2026-03-22] Phase 7: COMPLETE — HTTP/1.1 parsing, smuggling prevention, TLS framework. 34 tests.
