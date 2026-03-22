@@ -1,5 +1,14 @@
 const std = @import("std");
 
+const py_include = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14";
+const py_lib = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib";
+
+fn linkPython(m: *std.Build.Module) void {
+    m.addIncludePath(.{ .cwd_relative = py_include });
+    m.addLibraryPath(.{ .cwd_relative = py_lib });
+    m.linkSystemLibrary("python3.14", .{});
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -31,6 +40,37 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // --- Python extension shared library (_snek.so) ---
+    const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
+    const pyext = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "_snek",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkPython(pyext.root_module);
+    // Ad-hoc codesign after build (macOS requires valid signature for dlopen)
+    const codesign = b.addSystemCommand(&.{ "codesign", "-fs", "-" });
+    codesign.addFileArg(pyext.getEmittedBin());
+    codesign.step.dependOn(&pyext.step);
+    b.installArtifact(pyext);
+    pyext_step.dependOn(&codesign.step);
+
+    // --- Embedded runner (snek_runner) ---
+    const runner = b.addExecutable(.{
+        .name = "snek_runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/snek_runner.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    linkPython(runner.root_module);
+    b.installArtifact(runner);
 
     // --- Tests ---
     const test_step = b.step("test", "Run all unit tests");
@@ -145,9 +185,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        t.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14" });
-        t.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib" });
-        t.root_module.linkSystemLibrary("python3.14", .{});
+        linkPython(t.root_module);
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }

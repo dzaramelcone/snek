@@ -71,9 +71,10 @@ const Node = struct {
     catchall_name: ?[]const u8,
 
     fn create(allocator: std.mem.Allocator, prefix: []const u8) !*Node {
+        const owned_prefix = try allocator.dupe(u8, prefix);
         const node = try allocator.create(Node);
         node.* = .{
-            .prefix = prefix,
+            .prefix = owned_prefix,
             .handler_id = null,
             .children = .{},
             .param_child = null,
@@ -91,6 +92,9 @@ const Node = struct {
         self.children.deinit(allocator);
         if (self.param_child) |pc| pc.destroy(allocator);
         if (self.catchall_child) |cc| cc.destroy(allocator);
+        allocator.free(self.prefix);
+        if (self.param_name) |n| allocator.free(n);
+        if (self.catchall_name) |n| allocator.free(n);
         allocator.destroy(self);
     }
 
@@ -235,7 +239,10 @@ pub const Router = struct {
                         new_child.catchall_child = child.catchall_child;
                         new_child.catchall_name = child.catchall_name;
 
-                        child.prefix = child.prefix[0..common];
+                        // Replace prefix with owned copy of the common part
+                        const old_prefix = child.prefix;
+                        child.prefix = try self.allocator.dupe(u8, old_prefix[0..common]);
+                        self.allocator.free(old_prefix);
                         child.handler_id = null;
                         child.children = .{};
                         child.param_child = null;
@@ -268,7 +275,7 @@ pub const Router = struct {
                 }
                 const child = try Node.create(self.allocator, "");
                 node.param_child = child;
-                node.param_name = seg.text;
+                node.param_name = try self.allocator.dupe(u8, seg.text);
                 return self.insertSegments(child, rest, handler_id);
             },
             .catchall => {
@@ -276,7 +283,7 @@ pub const Router = struct {
                 const child = try Node.create(self.allocator, "");
                 child.handler_id = handler_id;
                 node.catchall_child = child;
-                node.catchall_name = seg.text;
+                node.catchall_name = try self.allocator.dupe(u8, seg.text);
                 // Catch-all must be terminal — ignore rest
                 return;
             },
@@ -588,4 +595,36 @@ test "route conflict detection" {
     // Adding duplicate route should return error
     const result = router.addRoute(.GET, "/users", 2);
     try testing.expectError(error.RouteConflict, result);
+}
+
+test "three routes: /, /health, /greet/{name}" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/", 0);
+    try router.addRoute(.GET, "/health", 1);
+    try router.addRoute(.GET, "/greet/{name}", 2);
+
+    // Match /
+    switch (router.match(.GET, "/")) {
+        .found => |f| try testing.expectEqual(@as(u32, 0), f.handler_id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Match /health
+    switch (router.match(.GET, "/health")) {
+        .found => |f| try testing.expectEqual(@as(u32, 1), f.handler_id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Match /greet/Dzara
+    switch (router.match(.GET, "/greet/Dzara")) {
+        .found => |f| {
+            try testing.expectEqual(@as(u32, 2), f.handler_id);
+            try testing.expectEqual(@as(u8, 1), f.param_count);
+            try testing.expectEqualStrings("name", f.params[0].name);
+            try testing.expectEqualStrings("Dzara", f.params[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

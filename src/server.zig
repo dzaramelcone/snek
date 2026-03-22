@@ -564,3 +564,48 @@ test "server handles 404" {
     srv.shutdown();
     t.join();
 }
+
+test "server handles param routes" {
+    var srv = try Server.init(testing.allocator, .{ .num_threads = 1 });
+    defer srv.deinit();
+
+    try srv.addRoute(.GET, "/", &struct {
+        fn h(_: *const http1.Parser) response_mod.Response {
+            return response_mod.Response.text("root");
+        }
+    }.h);
+    try srv.addRoute(.GET, "/health", &struct {
+        fn h(_: *const http1.Parser) response_mod.Response {
+            return response_mod.Response.text("ok");
+        }
+    }.h);
+    try srv.addPythonRoute(.GET, "/greet/{name}", 0);
+
+    try srv.listen("127.0.0.1", 0);
+    const port = srv.getPort();
+
+    const server_thread = try std.Thread.spawn(.{}, struct {
+        fn entry(s: *Server) void {
+            s.run() catch |err| std.debug.panic("server run failed: {}", .{err});
+        }
+    }.entry, .{&srv});
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // Test /health specifically
+    const cfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(cfd);
+    const server_addr = try std.net.Address.parseIp4("127.0.0.1", port);
+    try posix.connect(cfd, &server_addr.any, server_addr.getOsSockLen());
+    _ = try posix.send(cfd, "GET /health HTTP/1.1\r\nHost: h\r\n\r\n", 0);
+
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    var rbuf: [4096]u8 = undefined;
+    const n = try posix.recv(cfd, &rbuf, 0);
+    const resp = rbuf[0..n];
+
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, resp, "ok") != null);
+
+    srv.shutdown();
+    server_thread.join();
+}

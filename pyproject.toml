@@ -1,0 +1,16 @@
+[project]
+name = "snek"
+version = "0.1.0"
+description = "A fast Python web framework powered by Zig"
+requires-python = ">=3.12"
+license = "MIT"
+
+[project.scripts]
+snek = "snek.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["python"]

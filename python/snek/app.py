@@ -1,6 +1,6 @@
 """snek application class with FastAPI-style decorators."""
 
-import _snek
+from snek import _snek
 
 
 class App:

@@ -11,6 +11,17 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv/
+dump.rdb
+
+# Benchmark binaries
+bench/deque_comparison
+bench/hello_server
+bench/io_backend_comparison
+bench/kqueue_benchmark
+bench/pool_comparison
+pool_comparison
+root
 
 # TLC model checker artifacts
 specs/states/
@@ -28,3 +39,5 @@ refs/tigerbeetle/*
 !refs/tigerbeetle/INSIGHTS.md
 refs/zig/*
 !refs/zig/INSIGHTS.md
+refs/zap/*
+!refs/zap/INSIGHTS.md
