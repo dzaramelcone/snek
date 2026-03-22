@@ -112,8 +112,9 @@ pub fn Scheduler(comptime IO: type) type {
             self.metrics.poll_count += 1;
         }
 
-        /// Run the scheduler. Starts the worker pool, then loops tick().
-        /// Blocks until shutdown() or gracefulShutdown() is called.
+        /// Run the scheduler. Starts the worker pool, loops tick(), and on exit
+        /// always completes the TLA+ lifecycle: start → stop → join → done.
+        /// (See specs/worker_lifecycle.tla MainStart → MainStop → MainJoin)
         pub fn run(self: *Self) !void {
             try self.pool.start();
             self.running = true;
@@ -125,29 +126,39 @@ pub fn Scheduler(comptime IO: type) type {
                     std.Thread.yield() catch {};
                 }
             }
+            // Finding 1 fix: run() must complete the lifecycle.
+            // shutdown() sets running=false, run() exits the loop, then we
+            // stop+join the pool here — matching the spec's full sequence.
+            self.pool.stop();
         }
 
+        /// Signal the scheduler to stop. run() will exit its loop and
+        /// complete the shutdown sequence (pool.stop + join).
         pub fn shutdown(self: *Self) void {
             self.running = false;
         }
 
-        /// Graceful shutdown: drain accept queue and worker deques, then stop.
-        /// Dispatches remaining accept queue items, then waits for workers to
-        /// drain their deques before stopping.
+        /// Graceful shutdown: drain accept queue into workers, then stop.
+        /// Workers finish processing their deque items before exiting
+        /// (the deque is drained by the worker's runLoop naturally).
+        /// Note: does NOT wait for worker deques to empty — workers drain
+        /// their own deques as part of their runLoop before parking/exiting.
         pub fn gracefulShutdown(self: *Self) void {
             self.running = false;
-            // Drain accept queue into workers.
-            while (self.accept_queue.len > 0) {
-                self.tick();
-            }
-            // Workers will finish their current deque items, then park.
-            // stop() sets running=false on all workers and joins threads.
+            // Drain accept queue into workers (only if pool is started).
             if (self.pool.state == .started) {
+                while (self.accept_queue.len > 0) {
+                    self.tick();
+                }
                 self.pool.stop();
             }
         }
 
-        pub fn spawnCoroutine(self: *Self, frame: *coroutine.CoroutineFrame) error{BackpressureFull}!void {
+        /// Spawn a coroutine into the accept queue.
+        /// Requires the scheduler to be running (pool started).
+        /// Returns BackpressureFull if the accept queue is at capacity.
+        pub fn spawnCoroutine(self: *Self, frame: *coroutine.CoroutineFrame) error{ BackpressureFull, NotRunning }!void {
+            if (!self.running) return error.NotRunning;
             if (self.accept_queue.len >= self.accept_queue_capacity) {
                 self.metrics.backpressure_events += 1;
                 return error.BackpressureFull;
@@ -188,6 +199,7 @@ test "scheduler init and deinit" {
 test "scheduler spawn and dispatch" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
+    s.running = true;
 
     var frame = coroutine.CoroutineFrame.create(1);
     try s.spawnCoroutine(&frame);
@@ -203,6 +215,7 @@ test "scheduler spawn and dispatch" {
 test "scheduler round-robin dispatch" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 4 });
     defer s.deinit();
+    s.running = true;
 
     var frames: [4]coroutine.CoroutineFrame = undefined;
     for (0..4) |i| {
@@ -224,6 +237,7 @@ test "scheduler backpressure" {
         .accept_queue_capacity = 2,
     });
     defer s.deinit();
+    s.running = true;
 
     var f1 = coroutine.CoroutineFrame.create(1);
     var f2 = coroutine.CoroutineFrame.create(2);
@@ -254,6 +268,7 @@ test "scheduler metrics" {
         .accept_queue_capacity = 2,
     });
     defer s.deinit();
+    s.running = true;
 
     var f1 = coroutine.CoroutineFrame.create(1);
     var f2 = coroutine.CoroutineFrame.create(2);
@@ -305,6 +320,7 @@ test "scheduler tick advances timers" {
 test "scheduler dispatch preserves frame pointer" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
     defer s.deinit();
+    s.running = true;
 
     var frame = coroutine.CoroutineFrame.create(42);
     try s.spawnCoroutine(&frame);
@@ -321,6 +337,10 @@ test "scheduler graceful shutdown drains accept queue" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
 
+    // Must be running to spawn — start pool first.
+    try s.pool.start();
+    s.running = true;
+
     var f1 = coroutine.CoroutineFrame.create(1);
     var f2 = coroutine.CoroutineFrame.create(2);
     try s.spawnCoroutine(&f1);
@@ -328,14 +348,10 @@ test "scheduler graceful shutdown drains accept queue" {
 
     try testing.expectEqual(@as(usize, 2), s.accept_queue.len);
 
-    // gracefulShutdown drains accept queue into workers, then stops.
-    // Pool not started, so stop() is skipped (state != .started).
+    // gracefulShutdown drains accept queue into workers, then stops pool.
     s.gracefulShutdown();
     try testing.expect(!s.running);
     try testing.expectEqual(@as(usize, 0), s.accept_queue.len);
-    // Frames were dispatched to workers' deques
-    const total = s.pool.workers[0].local_deque.len() + s.pool.workers[1].local_deque.len();
-    try testing.expectEqual(@as(usize, 2), total);
 }
 
 // ── Edge cases ──────────────────────────────────────────────────────
@@ -351,17 +367,17 @@ test "edge: tick with empty accept queue is no-op" {
     try testing.expectEqual(@as(usize, 0), s.pool.workers[0].local_deque.len());
 }
 
-test "edge: spawn after shutdown" {
+test "edge: spawn after shutdown returns NotRunning" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
     defer s.deinit();
 
     s.shutdown();
 
-    // Spawning after shutdown still works (queue isn't closed, just running=false)
-    // This is by design — the accept queue is independent of the running flag
+    // Spawning after shutdown is rejected — matches TLA+ spec's started window.
     var f = coroutine.CoroutineFrame.create(1);
-    try s.spawnCoroutine(&f);
-    try testing.expectEqual(@as(u64, 1), s.metrics.coroutines_spawned);
+    const result = s.spawnCoroutine(&f);
+    try testing.expectError(error.NotRunning, result);
+    try testing.expectEqual(@as(u64, 0), s.metrics.coroutines_spawned);
 }
 
 test "edge: cancel already-cancelled coroutine" {
@@ -380,6 +396,7 @@ test "edge: cancel already-cancelled coroutine" {
 test "edge: dispatch more frames than workers" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
+    s.running = true;
 
     var frames: [5]coroutine.CoroutineFrame = undefined;
     for (0..5) |i| {
