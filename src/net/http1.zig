@@ -230,17 +230,34 @@ pub const Parser = struct {
                     self.headers[self.header_count] = .{ .name = name, .value = value };
                     self.header_count += 1;
 
-                    // Detect Content-Length
+                    // Smuggling prevention: reject null bytes and obs-fold in values
+                    // (Kettle 2025 — header injection vectors)
+                    for (trimmed) |vc| {
+                        if (vc == 0) { self.state = .err; return error.MalformedRequest; }
+                    }
+                    if (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) {
+                        self.state = .err;
+                        return error.MalformedRequest;
+                    }
+
+                    // Detect Content-Length (strict: no leading zeros per Kettle 2025)
                     if (std.mem.eql(u8, name, "content-length")) {
+                        if (trimmed.len > 1 and trimmed[0] == '0') {
+                            self.state = .err;
+                            return error.MalformedRequest; // leading zeros
+                        }
                         self.content_length = std.fmt.parseInt(usize, trimmed, 10) catch {
                             self.state = .err;
                             return error.MalformedRequest;
                         };
                     }
-                    // Detect Transfer-Encoding: chunked
+                    // Detect Transfer-Encoding (strict: only bare "chunked")
                     if (std.mem.eql(u8, name, "transfer-encoding")) {
                         if (std.mem.eql(u8, trimmed, "chunked")) {
                             self.chunked = true;
+                        } else {
+                            self.state = .err;
+                            return error.MalformedRequest; // non-chunked TE
                         }
                     }
                     // Detect Connection: keep-alive / close
@@ -264,6 +281,11 @@ pub const Parser = struct {
                     // Stay in header_name state for next header
                 },
                 .headers_done => {
+                    // Smuggling prevention: reject CL + TE together (Kettle 2025)
+                    if (self.content_length != null and self.chunked) {
+                        self.state = .err;
+                        return error.MalformedRequest;
+                    }
                     self.body_start = self.scan_pos;
                     if (self.content_length) |cl| {
                         if (cl == 0) {

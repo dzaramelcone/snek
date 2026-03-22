@@ -72,7 +72,6 @@ pub fn build(b: *std.Build) void {
         "src/net/http1.zig",
         "src/net/http2.zig",
         "src/net/websocket.zig",
-        "src/net/smuggling.zig",
         "src/python/ffi.zig",
         "src/python/gil.zig",
         "src/python/driver.zig",

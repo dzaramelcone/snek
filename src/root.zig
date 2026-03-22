@@ -26,7 +26,6 @@ pub const net = struct {
     pub const http1 = @import("net/http1.zig");
     pub const http2 = @import("net/http2.zig");
     pub const websocket = @import("net/websocket.zig");
-    pub const smuggling = @import("net/smuggling.zig");
 };
 
 pub const python = struct {
