@@ -1206,3 +1206,8 @@ async def echo(ws):
 [2026-03-22] Phase 7.2: smuggling.zig — strict CL/TE validation (Kettle 2025), rejects leading zeros, obs-fold, null bytes, dual framing. 19 security tests.
 [2026-03-22] Phase 7.3: tls.zig — comptime ssl bool specialization (Bun pattern), PlainStream functional, TlsStream stubbed behind TlsNotLinked. 5 tests.
 [2026-03-22] Phase 7: COMPLETE — HTTP/1.1 parsing, smuggling prevention, TLS framework. 34 tests.
+[2026-03-22] Phase 8.1: router.zig — compiled radix trie, per-method trees, static priority, param/catch-all extraction, HEAD auto-gen, 405 with allowed methods, conflict detection. 10 tests.
+[2026-03-22] Phase 8.2: request.zig — higher-level request with lazy query parsing, case-insensitive header lookup, param access. 5 tests.
+[2026-03-22] Phase 8.3: response.zig — fluent builder, json/text/html/redirect/notFound/methodNotAllowed constructors, serialize to wire. 6 tests.
+[2026-03-22] Phase 8.4: cookies.zig — Cookie header parsing, Set-Cookie serialization with attributes, HMAC-SHA256 sign/verify. 5 tests.
+[2026-03-22] Phase 8: COMPLETE — router, request, response, cookies. 26 tests.

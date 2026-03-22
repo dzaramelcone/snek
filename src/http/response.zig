@@ -1,196 +1,205 @@
-//! HTTP response serialization, streaming, SSE, and file serving.
+//! Higher-level HTTP response builder with fluent API.
 //!
-//! ResponseBuilder with fluent API. SSE streaming. File response with
-//! ETag/Last-Modified. Chunked response streaming. Generic over IO backend
-//! for streaming responses.
+//! SEPARATE from net/http1.zig's Response — that one is a low-level serializer,
+//! this one is the user-facing API with convenience constructors.
+//! Self-contained: inlines serialization so it can be tested standalone.
 
 const std = @import("std");
 
-/// Fluent response builder. Chainable API: .status().header().json().
-pub const ResponseBuilder = struct {
-    _status: u16,
-    _headers: [64][2][]const u8,
-    _header_count: usize,
-    _body: ?[]const u8,
-    _content_type: ?[]const u8,
-
-    pub fn init() ResponseBuilder {
-        return undefined;
-    }
-
-    pub fn status(self: *ResponseBuilder, code: u16) *ResponseBuilder {
-        _ = .{ self, code };
-        return self;
-    }
-
-    pub fn header(self: *ResponseBuilder, name: []const u8, value: []const u8) *ResponseBuilder {
-        _ = .{ self, name, value };
-        return self;
-    }
-
-    pub fn contentType(self: *ResponseBuilder, ct: []const u8) *ResponseBuilder {
-        _ = .{ self, ct };
-        return self;
-    }
-
-    pub fn json(self: *ResponseBuilder, data: []const u8) *ResponseBuilder {
-        _ = .{ self, data };
-        return self;
-    }
-
-    pub fn html(self: *ResponseBuilder, content: []const u8) *ResponseBuilder {
-        _ = .{ self, content };
-        return self;
-    }
-
-    pub fn text(self: *ResponseBuilder, content: []const u8) *ResponseBuilder {
-        _ = .{ self, content };
-        return self;
-    }
-
-    pub fn build(self: *const ResponseBuilder) Response {
-        _ = .{self};
-        return undefined;
-    }
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
-/// Static response — fully buffered, ready to serialize.
+const MAX_HEADERS: usize = 32;
+
 pub const Response = struct {
     status: u16,
-    headers: [][2][]const u8,
+    headers: [MAX_HEADERS]Header,
+    header_count: usize,
     body: ?[]const u8,
 
-    pub fn json(data: []const u8) Response {
-        _ = .{data};
-        return undefined;
+    pub fn init(status: u16) Response {
+        return .{
+            .status = status,
+            .headers = undefined,
+            .header_count = 0,
+            .body = null,
+        };
     }
 
-    pub fn html(content: []const u8) Response {
-        _ = .{content};
-        return undefined;
+    /// Set a header (fluent).
+    pub fn setHeader(self: *Response, name: []const u8, value: []const u8) *Response {
+        if (self.header_count < MAX_HEADERS) {
+            self.headers[self.header_count] = .{ .name = name, .value = value };
+            self.header_count += 1;
+        }
+        return self;
     }
 
-    pub fn text(content: []const u8) Response {
-        _ = .{content};
-        return undefined;
+    /// Set the response body (fluent).
+    pub fn setBody(self: *Response, b: []const u8) *Response {
+        self.body = b;
+        return self;
     }
 
-    pub fn redirect(location: []const u8, code: u16) Response {
-        _ = .{ location, code };
-        return undefined;
+    /// Set Content-Type header (fluent).
+    pub fn setContentType(self: *Response, ct: []const u8) *Response {
+        return self.setHeader("Content-Type", ct);
     }
 
-    pub fn methodNotAllowed(allow_header: []const u8) Response {
-        _ = .{allow_header};
-        return undefined;
+    /// 200 + application/json
+    pub fn json(b: []const u8) Response {
+        var r = init(200);
+        _ = r.setContentType("application/json");
+        r.body = b;
+        return r;
     }
 
+    /// 200 + text/plain
+    pub fn text(b: []const u8) Response {
+        var r = init(200);
+        _ = r.setContentType("text/plain");
+        r.body = b;
+        return r;
+    }
+
+    /// 200 + text/html
+    pub fn html(b: []const u8) Response {
+        var r = init(200);
+        _ = r.setContentType("text/html");
+        r.body = b;
+        return r;
+    }
+
+    /// 302 + Location header
+    pub fn redirect(location: []const u8) Response {
+        var r = init(302);
+        _ = r.setHeader("Location", location);
+        return r;
+    }
+
+    /// 404 Not Found
     pub fn notFound() Response {
-        return undefined;
+        var r = init(404);
+        r.body = "Not Found";
+        return r;
+    }
+
+    /// 405 + Allow header
+    pub fn methodNotAllowed(allowed: []const u8) Response {
+        var r = init(405);
+        _ = r.setHeader("Allow", allowed);
+        r.body = "Method Not Allowed";
+        return r;
+    }
+
+    /// Serialize to HTTP/1.1 response bytes.
+    pub fn serialize(self: *const Response, buf: []u8) error{BufferTooSmall}!usize {
+        var pos: usize = 0;
+
+        // Status line
+        const sl = statusLine(self.status);
+        if (pos + sl.len > buf.len) return error.BufferTooSmall;
+        @memcpy(buf[pos..][0..sl.len], sl);
+        pos += sl.len;
+
+        // Headers
+        for (self.headers[0..self.header_count]) |h| {
+            const needed = h.name.len + 2 + h.value.len + 2;
+            if (pos + needed > buf.len) return error.BufferTooSmall;
+            @memcpy(buf[pos..][0..h.name.len], h.name);
+            pos += h.name.len;
+            buf[pos] = ':';
+            buf[pos + 1] = ' ';
+            pos += 2;
+            @memcpy(buf[pos..][0..h.value.len], h.value);
+            pos += h.value.len;
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
+        }
+
+        // End of headers
+        if (pos + 2 > buf.len) return error.BufferTooSmall;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+
+        // Body
+        if (self.body) |b| {
+            if (pos + b.len > buf.len) return error.BufferTooSmall;
+            @memcpy(buf[pos..][0..b.len], b);
+            pos += b.len;
+        }
+        return pos;
     }
 };
 
-/// File response with ETag and Last-Modified support.
-pub const FileResponse = struct {
-    path: []const u8,
-    content_type: []const u8,
-    /// Pre-computed ETag (weak, based on mtime + size).
-    etag: ?[]const u8,
-    /// Last-Modified header value (HTTP-date format).
-    last_modified: ?[]const u8,
-    /// File size in bytes (for Content-Length).
-    size: usize,
-
-    pub fn init(path: []const u8, content_type: []const u8) !FileResponse {
-        _ = .{ path, content_type };
-        return undefined;
-    }
-
-    /// Check If-None-Match / If-Modified-Since and return 304 if appropriate.
-    pub fn checkConditional(self: *const FileResponse, if_none_match: ?[]const u8, if_modified_since: ?[]const u8) bool {
-        _ = .{ self, if_none_match, if_modified_since };
-        return undefined;
-    }
-};
-
-/// Server-Sent Events stream. Generic over IO for writing to the connection.
-pub fn SseStream(comptime IO: type) type {
-    return struct {
-        const Self = @This();
-
-        io: *IO,
-        /// Whether the SSE headers have been sent.
-        headers_sent: bool,
-
-        pub fn init(io: *IO) Self {
-            _ = .{io};
-            return undefined;
-        }
-
-        /// Send an SSE event with optional event type and id.
-        pub fn event(self: *Self, payload: []const u8, event_type: ?[]const u8, id: ?[]const u8) !void {
-            _ = .{ self, payload, event_type, id };
-        }
-
-        /// Send a data-only SSE message.
-        pub fn sendData(self: *Self, payload: []const u8) !void {
-            _ = .{ self, payload };
-        }
-
-        /// Send a retry directive (milliseconds).
-        pub fn retry(self: *Self, ms: u32) !void {
-            _ = .{ self, ms };
-        }
-
-        /// Send an SSE comment (for keepalive).
-        pub fn comment(self: *Self, text_content: []const u8) !void {
-            _ = .{ self, text_content };
-        }
-
-        /// Close the SSE stream.
-        pub fn close(self: *Self) !void {
-            _ = .{self};
-        }
+fn statusLine(code: u16) []const u8 {
+    return switch (code) {
+        200 => "HTTP/1.1 200 OK\r\n",
+        201 => "HTTP/1.1 201 Created\r\n",
+        204 => "HTTP/1.1 204 No Content\r\n",
+        301 => "HTTP/1.1 301 Moved Permanently\r\n",
+        302 => "HTTP/1.1 302 Found\r\n",
+        304 => "HTTP/1.1 304 Not Modified\r\n",
+        400 => "HTTP/1.1 400 Bad Request\r\n",
+        404 => "HTTP/1.1 404 Not Found\r\n",
+        405 => "HTTP/1.1 405 Method Not Allowed\r\n",
+        500 => "HTTP/1.1 500 Internal Server Error\r\n",
+        else => "HTTP/1.1 200 OK\r\n",
     };
 }
 
-/// Chunked response stream. Generic over IO.
-pub fn ChunkedStream(comptime IO: type) type {
-    return struct {
-        const Self = @This();
+// ============================================================
+// Tests
+// ============================================================
 
-        io: *IO,
-        headers_sent: bool,
-
-        pub fn init(io: *IO) Self {
-            _ = .{io};
-            return undefined;
-        }
-
-        /// Write a chunk to the response.
-        pub fn writeChunk(self: *Self, chunk: []const u8) !void {
-            _ = .{ self, chunk };
-        }
-
-        /// Send the terminal zero-length chunk and optional trailers.
-        pub fn finish(self: *Self) !void {
-            _ = .{self};
-        }
-    };
+test "json response" {
+    const r = Response.json("{\"ok\":true}");
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("application/json", r.headers[0].value);
+    try std.testing.expectEqualStrings("{\"ok\":true}", r.body.?);
 }
 
-test "build json response" {}
+test "text response" {
+    const r = Response.text("hello");
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("text/plain", r.headers[0].value);
+    try std.testing.expectEqualStrings("hello", r.body.?);
+}
 
-test "fluent response builder" {}
+test "redirect response" {
+    const r = Response.redirect("/login");
+    try std.testing.expectEqual(@as(u16, 302), r.status);
+    try std.testing.expectEqualStrings("Location", r.headers[0].name);
+    try std.testing.expectEqualStrings("/login", r.headers[0].value);
+    try std.testing.expect(r.body == null);
+}
 
-test "sse stream" {}
+test "not found response" {
+    const r = Response.notFound();
+    try std.testing.expectEqual(@as(u16, 404), r.status);
+    try std.testing.expectEqualStrings("Not Found", r.body.?);
+}
 
-test "file response with etag" {}
+test "fluent API chaining" {
+    var r = Response.init(201);
+    _ = r.setContentType("text/plain").setHeader("X-Custom", "val").setBody("created");
+    try std.testing.expectEqual(@as(u16, 201), r.status);
+    try std.testing.expectEqualStrings("created", r.body.?);
+    try std.testing.expectEqual(@as(usize, 2), r.header_count);
+    try std.testing.expectEqualStrings("text/plain", r.headers[0].value);
+    try std.testing.expectEqualStrings("val", r.headers[1].value);
+}
 
-test "conditional 304 response" {}
-
-test "chunked stream" {}
-
-test "redirect response" {}
-
-test "method not allowed response" {}
+test "serialize to bytes" {
+    const r = Response.text("hi");
+    var buf: [4096]u8 = undefined;
+    const n = r.serialize(&buf) catch unreachable;
+    const out = buf[0..n];
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "hi"));
+}

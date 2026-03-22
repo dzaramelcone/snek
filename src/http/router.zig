@@ -2,205 +2,590 @@
 //!
 //! Design: matchit-inspired compressed radix trie. Separate tree per HTTP method
 //! for reduced search space. Static segments take priority over parameters.
-//! Route conflict detection at startup. Zero-copy path param extraction via
+//! Route conflict detection at addRoute time. Zero-copy path param extraction via
 //! slices into the original URL. Immutable after compilation.
 //!
-//! HEAD auto-generated from GET. OPTIONS auto-generated for CORS.
-//! 405 MethodNotAllowed with Allow header when path matches but method doesn't.
+//! HEAD auto-generated from GET. 405 MethodNotAllowed with allowed methods
+//! when path matches but method doesn't.
 //!
 //! Sources:
 //!   - matchit/axum compiled radix trie (src/http/REFERENCES_router.md)
-//!     Target: 2.45us/130 routes benchmark
-//!   - Per-method trees and static-over-param priority from matchit
 
 const std = @import("std");
+const testing = std.testing;
 
-/// HTTP methods with separate dispatch trees.
-pub const Method = enum {
-    GET,
-    POST,
-    PUT,
-    DELETE,
-    PATCH,
-    HEAD,
-    OPTIONS,
+pub const Method = enum(u4) {
+    GET = 0,
+    POST = 1,
+    PUT = 2,
+    DELETE = 3,
+    PATCH = 4,
+    HEAD = 5,
+    OPTIONS = 6,
+    CONNECT = 7,
+    TRACE = 8,
 
     pub fn fromString(s: []const u8) ?Method {
-        _ = .{s};
-        return undefined;
+        const map = .{
+            .{ "GET", Method.GET },
+            .{ "POST", Method.POST },
+            .{ "PUT", Method.PUT },
+            .{ "DELETE", Method.DELETE },
+            .{ "PATCH", Method.PATCH },
+            .{ "HEAD", Method.HEAD },
+            .{ "OPTIONS", Method.OPTIONS },
+            .{ "CONNECT", Method.CONNECT },
+            .{ "TRACE", Method.TRACE },
+        };
+        inline for (map) |entry| {
+            if (std.mem.eql(u8, s, entry[0])) return entry[1];
+        }
+        return null;
     }
 };
 
-/// Zero-copy path parameter: name + value are slices into the original URL.
 pub const PathParam = struct {
     name: []const u8,
     value: []const u8,
 };
 
-/// Result of matching a URL against the router.
-pub const RouteMatch = struct {
-    handler: ?*anyopaque,
-    params: [16]PathParam,
-    param_count: usize,
-    /// Which method actually matched (HEAD may resolve to GET handler).
-    matched_method: Method,
-};
-
-/// Route metadata for introspection and CLI `snek routes`.
-pub const Route = struct {
-    method: Method,
-    path: []const u8,
-    handler: ?*anyopaque,
-    name: ?[]const u8,
-};
-
-/// Describes a conflict between two registered routes.
-pub const RouteConflict = struct {
-    path_a: []const u8,
-    path_b: []const u8,
-    method: Method,
-};
-
-/// Segment type within a route pattern.
-const SegmentKind = enum {
-    /// Literal path segment, e.g. "users".
-    static,
-    /// Named parameter, e.g. "{id}" — matches one segment.
-    param,
-    /// Catch-all, e.g. "{rest:path}" — matches remaining path, must be terminal.
-    catch_all,
-};
-
-/// A compressed radix trie node.
-///
-/// Path segments are stored compressed (e.g. "/api/v1" as a single segment
-/// when no branching occurs). Children ordered by priority: static > param > catch_all,
-/// then by handler count in subtree (descending) for cache-friendly first-match.
-/// Source: matchit crate's compressed radix trie node layout (src/http/REFERENCES_router.md).
-pub const RadixNode = struct {
-    /// Compressed path segment stored at this node.
-    segment: []const u8,
-    /// Segment kind determines matching behavior.
-    kind: SegmentKind,
-    /// Parameter name if kind is param or catch_all.
-    param_name: ?[]const u8,
-    /// Children ordered by priority (static first, then param, then catch_all).
-    children: [64]*RadixNode,
-    child_count: usize,
-    /// Handler if this node terminates a registered route.
-    handler: ?*anyopaque,
-    /// Number of handlers in this subtree (for priority ordering).
-    priority: u32,
-};
-
-/// Per-method radix tree. One tree per HTTP method.
-/// Source: matchit/axum per-method dispatch — separate tree per HTTP method
-/// reduces search space vs single-tree routers (src/http/REFERENCES_router.md).
-const MethodTree = struct {
-    root: RadixNode,
-    route_count: usize,
-};
-
-/// Compiled radix trie router with per-method dispatch.
-pub const Router = struct {
-    /// One radix tree per HTTP method.
-    trees: [7]MethodTree,
-    /// All registered routes for introspection.
-    routes: [512]Route,
-    route_count: usize,
-    /// Whether the router has been compiled (frozen).
-    compiled: bool,
-
-    pub fn init() Router {
-        return undefined;
-    }
-
-    /// Register a route. Must be called before compile().
-    pub fn addRoute(self: *Router, method: Method, path: []const u8, handler: *anyopaque) !void {
-        _ = .{ self, method, path, handler };
-    }
-
-    /// Register a named route.
-    pub fn addNamedRoute(self: *Router, method: Method, path: []const u8, handler: *anyopaque, name: []const u8) !void {
-        _ = .{ self, method, path, handler, name };
-    }
-
-    /// Compile and freeze the router. Detects conflicts, computes priorities,
-    /// orders children, generates HEAD from GET, OPTIONS from all methods.
-    /// After this call the router is immutable.
-    pub fn compile(self: *Router) !void {
-        _ = .{self};
-    }
-
-    /// Match a URL path against the compiled router.
-    /// Returns null if no route matches. Tries HEAD → GET fallback.
-    /// If path matches but method doesn't, returns MethodNotAllowed (see matchOrError).
-    pub fn match(self: *const Router, method: Method, path: []const u8) ?RouteMatch {
-        _ = .{ self, method, path };
-        return undefined;
-    }
-
-    /// Match with full error reporting: returns the match, or a 405 with allowed methods.
-    pub fn matchOrError(self: *const Router, method: Method, path: []const u8) MatchResult {
-        _ = .{ self, method, path };
-        return undefined;
-    }
-
-    /// List all registered routes. Used by `snek routes` CLI command.
-    pub fn listRoutes(self: *const Router) []const Route {
-        _ = .{self};
-        return undefined;
-    }
-
-    /// Detect route conflicts (e.g. "/users/{id}" vs "/users/{name}").
-    /// Called during compile(). Returns conflicts if any.
-    pub fn detectConflicts(self: *const Router) ![]const RouteConflict {
-        _ = .{self};
-        return undefined;
-    }
-
-    /// Generate Allow header value for a given path (for 405 responses).
-    pub fn allowedMethods(self: *const Router, path: []const u8) []const u8 {
-        _ = .{ self, path };
-        return undefined;
-    }
-};
-
-/// Result of matchOrError: either a match, a 405 with Allow header, or 404.
 pub const MatchResult = union(enum) {
-    found: RouteMatch,
-    method_not_allowed: struct {
-        allow_header: []const u8,
+    found: struct {
+        handler_id: u32,
+        params: [8]PathParam,
+        param_count: u8,
     },
     not_found: void,
+    method_not_allowed: struct {
+        allowed: [9]bool,
+    },
 };
 
-/// Comptime route compilation: if routes are known at comptime, build the
-/// radix trie at compile time for zero startup cost.
-pub fn ComptimeRouter(comptime routes: []const struct { method: Method, path: []const u8 }) type {
-    _ = .{routes};
-    return struct {
-        pub fn match(method: Method, path: []const u8) ?RouteMatch {
-            _ = .{ method, path };
-            return undefined;
+const Node = struct {
+    prefix: []const u8,
+    handler_id: ?u32,
+    children: std.ArrayListUnmanaged(*Node),
+    param_child: ?*Node,
+    param_name: ?[]const u8,
+    catchall_child: ?*Node,
+    catchall_name: ?[]const u8,
+
+    fn create(allocator: std.mem.Allocator, prefix: []const u8) !*Node {
+        const node = try allocator.create(Node);
+        node.* = .{
+            .prefix = prefix,
+            .handler_id = null,
+            .children = .{},
+            .param_child = null,
+            .param_name = null,
+            .catchall_child = null,
+            .catchall_name = null,
+        };
+        return node;
+    }
+
+    fn destroy(self: *Node, allocator: std.mem.Allocator) void {
+        for (self.children.items) |child| {
+            child.destroy(allocator);
         }
-    };
+        self.children.deinit(allocator);
+        if (self.param_child) |pc| pc.destroy(allocator);
+        if (self.catchall_child) |cc| cc.destroy(allocator);
+        allocator.destroy(self);
+    }
+
+};
+
+/// Segment from parsing a route pattern.
+const Segment = struct {
+    kind: enum { static, param, catchall },
+    text: []const u8, // static text, or param name
+};
+
+/// Split a route pattern like "/users/{id}/posts/{rest:path}" into segments.
+/// Returns segments on the stack (max 16).
+fn parseSegments(path: []const u8) ![16]Segment {
+    var segs: [16]Segment = undefined;
+    var count: usize = 0;
+    var i: usize = 0;
+
+    if (path.len == 0 or path[0] != '/') return error.InvalidPath;
+
+    while (i < path.len) {
+        if (path[i] == '{') {
+            // Find closing brace
+            const start = i + 1;
+            const end = std.mem.indexOfScalarPos(u8, path, start, '}') orelse return error.InvalidPath;
+            const inside = path[start..end];
+
+            // Check for catch-all ":path" suffix
+            if (std.mem.indexOfScalar(u8, inside, ':')) |colon| {
+                if (count >= 16) return error.TooManySegments;
+                segs[count] = .{ .kind = .catchall, .text = inside[0..colon] };
+                count += 1;
+            } else {
+                if (count >= 16) return error.TooManySegments;
+                segs[count] = .{ .kind = .param, .text = inside };
+                count += 1;
+            }
+            i = end + 1;
+        } else {
+            // Static segment: consume up to next '{' or end
+            const start = i;
+            while (i < path.len and path[i] != '{') : (i += 1) {}
+            if (count >= 16) return error.TooManySegments;
+            segs[count] = .{ .kind = .static, .text = path[start..i] };
+            count += 1;
+        }
+    }
+
+    // Fill rest with empty static segments as sentinel
+    for (count..16) |j| {
+        segs[j] = .{ .kind = .static, .text = "" };
+    }
+
+    return segs;
 }
 
-test "static priority over param" {}
+/// Count non-empty segments.
+fn segmentCount(segs: [16]Segment) usize {
+    for (segs, 0..) |s, i| {
+        if (s.text.len == 0 and s.kind == .static) return i;
+    }
+    return 16;
+}
 
-test "conflict detection" {}
+pub const Router = struct {
+    allocator: std.mem.Allocator,
+    trees: [9]?*Node,
+    route_count: usize,
 
-test "param extraction" {}
+    pub fn init(allocator: std.mem.Allocator) Router {
+        return .{
+            .allocator = allocator,
+            .trees = .{null} ** 9,
+            .route_count = 0,
+        };
+    }
 
-test "method not allowed with allow header" {}
+    pub fn deinit(self: *Router) void {
+        for (&self.trees) |*tree| {
+            if (tree.*) |root| {
+                root.destroy(self.allocator);
+                tree.* = null;
+            }
+        }
+    }
 
-test "head auto-generated from get" {}
+    pub fn addRoute(self: *Router, method: Method, path: []const u8, handler_id: u32) !void {
+        const idx = @intFromEnum(method);
+        if (self.trees[idx] == null) {
+            self.trees[idx] = try Node.create(self.allocator, "");
+        }
+        const root = self.trees[idx].?;
+        const segs = try parseSegments(path);
+        const count = segmentCount(segs);
+        try self.insertSegments(root, segs[0..count], handler_id);
+        self.route_count += 1;
+    }
 
-test "options auto-generated" {}
+    fn insertSegments(self: *Router, node: *Node, segments: []const Segment, handler_id: u32) !void {
+        if (segments.len == 0) {
+            if (node.handler_id != null) return error.RouteConflict;
+            node.handler_id = handler_id;
+            return;
+        }
 
-test "catch-all matching" {}
+        const seg = segments[0];
+        const rest = segments[1..];
 
-test "list routes for cli" {}
+        switch (seg.kind) {
+            .static => {
+                // Try to find an existing child with matching prefix
+                const text = seg.text;
+                for (node.children.items) |child| {
+                    const common = commonPrefixLen(child.prefix, text);
+                    if (common == 0) continue;
 
-test "comptime route compilation" {}
+                    if (common == child.prefix.len and common == text.len) {
+                        // Exact match — descend
+                        return self.insertSegments(child, rest, handler_id);
+                    }
+
+                    if (common == child.prefix.len) {
+                        // child.prefix is a prefix of text — create continuation
+                        const suffix = text[common..];
+                        // Insert remaining text as a segment
+                        var new_segs: [16]Segment = undefined;
+                        new_segs[0] = .{ .kind = .static, .text = suffix };
+                        const rest_len = rest.len;
+                        for (rest, 0..) |r, i| {
+                            new_segs[1 + i] = r;
+                        }
+                        return self.insertSegments(child, new_segs[0 .. 1 + rest_len], handler_id);
+                    }
+
+                    if (common < child.prefix.len) {
+                        // Split the existing node
+                        const new_child = try Node.create(self.allocator, child.prefix[common..]);
+                        new_child.handler_id = child.handler_id;
+                        new_child.children = child.children;
+                        new_child.param_child = child.param_child;
+                        new_child.param_name = child.param_name;
+                        new_child.catchall_child = child.catchall_child;
+                        new_child.catchall_name = child.catchall_name;
+
+                        child.prefix = child.prefix[0..common];
+                        child.handler_id = null;
+                        child.children = .{};
+                        child.param_child = null;
+                        child.param_name = null;
+                        child.catchall_child = null;
+                        child.catchall_name = null;
+                        try child.children.append(self.allocator, new_child);
+
+                        if (common == text.len) {
+                            return self.insertSegments(child, rest, handler_id);
+                        } else {
+                            const leaf = try Node.create(self.allocator, text[common..]);
+                            try child.children.append(self.allocator, leaf);
+                            return self.insertSegments(leaf, rest, handler_id);
+                        }
+                    }
+                }
+                // No matching child — create new
+                const child = try Node.create(self.allocator, text);
+                try node.children.append(self.allocator, child);
+                return self.insertSegments(child, rest, handler_id);
+            },
+            .param => {
+                if (node.param_child) |pc| {
+                    // Check for name conflict
+                    if (node.param_name) |existing| {
+                        if (!std.mem.eql(u8, existing, seg.text)) return error.RouteConflict;
+                    }
+                    return self.insertSegments(pc, rest, handler_id);
+                }
+                const child = try Node.create(self.allocator, "");
+                node.param_child = child;
+                node.param_name = seg.text;
+                return self.insertSegments(child, rest, handler_id);
+            },
+            .catchall => {
+                if (node.catchall_child != null) return error.RouteConflict;
+                const child = try Node.create(self.allocator, "");
+                child.handler_id = handler_id;
+                node.catchall_child = child;
+                node.catchall_name = seg.text;
+                // Catch-all must be terminal — ignore rest
+                return;
+            },
+        }
+    }
+
+    pub fn match(self: *const Router, method: Method, path: []const u8) MatchResult {
+        const idx = @intFromEnum(method);
+
+        // Try exact method tree
+        if (self.trees[idx]) |root| {
+            var params: [8]PathParam = undefined;
+            var param_count: u8 = 0;
+            if (self.matchNode(root, path, &params, &param_count)) |hid| {
+                return .{ .found = .{
+                    .handler_id = hid,
+                    .params = params,
+                    .param_count = param_count,
+                } };
+            }
+        }
+
+        // HEAD falls back to GET
+        if (method == .HEAD) {
+            if (self.trees[@intFromEnum(Method.GET)]) |root| {
+                var params: [8]PathParam = undefined;
+                var param_count: u8 = 0;
+                if (self.matchNode(root, path, &params, &param_count)) |hid| {
+                    return .{ .found = .{
+                        .handler_id = hid,
+                        .params = params,
+                        .param_count = param_count,
+                    } };
+                }
+            }
+        }
+
+        // Check if any other method matches this path (405 vs 404)
+        var allowed: [9]bool = .{false} ** 9;
+        var any_match = false;
+        for (0..9) |mi| {
+            if (self.trees[mi]) |root| {
+                var dummy_params: [8]PathParam = undefined;
+                var dummy_count: u8 = 0;
+                if (self.matchNode(root, path, &dummy_params, &dummy_count) != null) {
+                    allowed[mi] = true;
+                    any_match = true;
+                }
+            }
+            // HEAD inherits GET
+            if (mi == @intFromEnum(Method.HEAD)) {
+                if (self.trees[@intFromEnum(Method.GET)]) |root| {
+                    var dummy_params: [8]PathParam = undefined;
+                    var dummy_count: u8 = 0;
+                    if (self.matchNode(root, path, &dummy_params, &dummy_count) != null) {
+                        allowed[mi] = true;
+                        any_match = true;
+                    }
+                }
+            }
+        }
+
+        if (any_match) {
+            return .{ .method_not_allowed = .{ .allowed = allowed } };
+        }
+
+        return .not_found;
+    }
+
+    fn matchNode(_: *const Router, node: *const Node, path: []const u8, params: *[8]PathParam, param_count: *u8) ?u32 {
+        return doMatchNode(node, path, params, param_count);
+    }
+};
+
+fn doMatchNode(node: *const Node, path: []const u8, params: *[8]PathParam, param_count: *u8) ?u32 {
+    var current = path;
+
+    // Match this node's prefix
+    if (node.prefix.len > 0) {
+        if (current.len < node.prefix.len) return null;
+        if (!std.mem.eql(u8, current[0..node.prefix.len], node.prefix)) return null;
+        current = current[node.prefix.len..];
+    }
+
+    // If we've consumed the entire path, check for handler
+    if (current.len == 0) {
+        return node.handler_id;
+    }
+
+    // 1. Try static children first (priority over params)
+    for (node.children.items) |child| {
+        if (child.prefix.len > 0 and current[0] == child.prefix[0]) {
+            if (doMatchNode(child, current, params, param_count)) |hid| {
+                return hid;
+            }
+        }
+    }
+
+    // 2. Try param child — captures one segment (up to next '/')
+    if (node.param_child) |pc| {
+        const seg_end = std.mem.indexOfScalar(u8, current, '/') orelse current.len;
+        if (seg_end > 0) {
+            const value = current[0..seg_end];
+            const remaining = current[seg_end..];
+            if (param_count.* < 8) {
+                params[param_count.*] = .{
+                    .name = node.param_name.?,
+                    .value = value,
+                };
+                param_count.* += 1;
+                if (doMatchNode(pc, remaining, params, param_count)) |hid| {
+                    return hid;
+                }
+                param_count.* -= 1; // backtrack
+            }
+        }
+    }
+
+    // 3. Try catch-all — captures everything remaining
+    if (node.catchall_child) |cc| {
+        if (current.len > 0) {
+            if (param_count.* < 8) {
+                params[param_count.*] = .{
+                    .name = node.catchall_name.?,
+                    .value = current,
+                };
+                param_count.* += 1;
+                return cc.handler_id;
+            }
+        }
+    }
+
+    return null;
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const limit = @min(a.len, b.len);
+    for (0..limit) |i| {
+        if (a[i] != b[i]) return i;
+    }
+    return limit;
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+test "static route match" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users", 1);
+
+    const result = router.match(.GET, "/users");
+    switch (result) {
+        .found => |f| {
+            try testing.expectEqual(@as(u32, 1), f.handler_id);
+            try testing.expectEqual(@as(u8, 0), f.param_count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "param route match" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users/{id}", 2);
+
+    const result = router.match(.GET, "/users/42");
+    switch (result) {
+        .found => |f| {
+            try testing.expectEqual(@as(u32, 2), f.handler_id);
+            try testing.expectEqual(@as(u8, 1), f.param_count);
+            try testing.expectEqualStrings("id", f.params[0].name);
+            try testing.expectEqualStrings("42", f.params[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "catch-all route" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/files/{rest:path}", 3);
+
+    const result = router.match(.GET, "/files/a/b/c");
+    switch (result) {
+        .found => |f| {
+            try testing.expectEqual(@as(u32, 3), f.handler_id);
+            try testing.expectEqual(@as(u8, 1), f.param_count);
+            try testing.expectEqualStrings("rest", f.params[0].name);
+            try testing.expectEqualStrings("a/b/c", f.params[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "static priority over param" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users/{id}", 10);
+    try router.addRoute(.GET, "/users/me", 11);
+
+    // Static "/users/me" must win over param "/users/{id}"
+    const result = router.match(.GET, "/users/me");
+    switch (result) {
+        .found => |f| try testing.expectEqual(@as(u32, 11), f.handler_id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Param still works for other values
+    const result2 = router.match(.GET, "/users/42");
+    switch (result2) {
+        .found => |f| {
+            try testing.expectEqual(@as(u32, 10), f.handler_id);
+            try testing.expectEqualStrings("42", f.params[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "not found" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users", 1);
+
+    const result = router.match(.GET, "/nope");
+    switch (result) {
+        .not_found => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "method not allowed" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users", 1);
+
+    const result = router.match(.POST, "/users");
+    switch (result) {
+        .method_not_allowed => |m| {
+            try testing.expect(m.allowed[@intFromEnum(Method.GET)]);
+            try testing.expect(!m.allowed[@intFromEnum(Method.POST)]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "HEAD auto-generated from GET" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users", 1);
+
+    const result = router.match(.HEAD, "/users");
+    switch (result) {
+        .found => |f| try testing.expectEqual(@as(u32, 1), f.handler_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "multiple methods same path" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users", 1);
+    try router.addRoute(.POST, "/users", 2);
+
+    const get_result = router.match(.GET, "/users");
+    switch (get_result) {
+        .found => |f| try testing.expectEqual(@as(u32, 1), f.handler_id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const post_result = router.match(.POST, "/users");
+    switch (post_result) {
+        .found => |f| try testing.expectEqual(@as(u32, 2), f.handler_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "param extraction is zero-copy" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users/{id}", 2);
+
+    const url = "/users/42";
+    const result = router.match(.GET, url);
+    switch (result) {
+        .found => |f| {
+            // Value must point into the original url slice — zero copy
+            try testing.expect(f.params[0].value.ptr == url.ptr + 7);
+            try testing.expectEqual(@as(usize, 2), f.params[0].value.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "route conflict detection" {
+    var router = Router.init(testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.GET, "/users", 1);
+
+    // Adding duplicate route should return error
+    const result = router.addRoute(.GET, "/users", 2);
+    try testing.expectError(error.RouteConflict, result);
+}

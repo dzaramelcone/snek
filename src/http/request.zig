@@ -1,247 +1,207 @@
-//! HTTP request parsing: JSON body, form data, multipart, streaming.
+//! Higher-level HTTP request object built from parsed HTTP/1.1 data.
 //!
-//! Design: Two-arena memory model (conn_arena, req_arena from http.zig pattern).
-//! Lazy query param and form body parsing. Streaming multipart parser:
-//! callback-driven, 60-byte buffer (multipart-parser-c inspired), configurable
-//! memory threshold for file uploads. Request state dict for middleware → handler
-//! propagation. Generic over IO backend.
+//! Wraps the low-level net/http1.Parser result into a user-friendly API
+//! with lazy query string parsing, case-insensitive header lookup, and
+//! route parameter access.
 //!
-//! Sources:
-//!   - StreamingMultipart 60-byte buffer from multipart-parser-c
-//!     (src/serve/REFERENCES.md)
+//! NOTE: Defines its own types to stay self-contained. The fromRaw()
+//! constructor accepts raw parsed fields (method, uri, headers, body)
+//! so any parser can feed it.
 
 const std = @import("std");
-const context = @import("../python/context.zig");
 
-/// Configuration for request parsing limits.
-pub const RequestConfig = struct {
-    /// Maximum body size in bytes (default 10MB).
-    max_body_size: usize = 10 * 1024 * 1024,
-    /// Maximum file upload size per field (default 50MB).
-    max_file_size: usize = 50 * 1024 * 1024,
-    /// Maximum total upload size across all fields (default 100MB).
-    max_total_upload_size: usize = 100 * 1024 * 1024,
-    /// Maximum number of multipart fields.
-    max_fields: u32 = 100,
-    /// Memory threshold: files smaller than this are kept in memory,
-    /// larger files streamed to temp directory (default 1MB).
-    memory_threshold: usize = 1024 * 1024,
-    /// Temp directory for large file uploads.
-    temp_dir: []const u8 = "/tmp",
-    /// Maximum query string length.
-    max_query_length: usize = 8192,
+pub const Method = enum {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    PATCH,
+    HEAD,
+    OPTIONS,
+    CONNECT,
+    TRACE,
 };
 
-/// A parsed query parameter.
+pub const Version = enum { http11, http10 };
+
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const PathParam = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const QueryParam = struct {
     name: []const u8,
     value: []const u8,
 };
 
-/// An uploaded file, either in-memory or stored in a temp file.
-pub const UploadedFile = struct {
-    filename: []const u8,
-    content_type: []const u8,
-    /// In-memory data (null if file was streamed to disk).
-    data: ?[]const u8,
-    /// Temp file path (null if file is in memory).
-    temp_path: ?[]const u8,
-    size: usize,
+const MAX_QUERY_PARAMS: usize = 32;
 
-    /// Whether this file is stored in memory or on disk.
-    pub fn isInMemory(self: *const UploadedFile) bool {
-        _ = .{self};
-        return undefined;
-    }
-};
+pub const Request = struct {
+    method: Method,
+    path: []const u8,
+    version: Version,
+    headers: []const Header,
+    body: ?[]const u8,
 
-/// A single multipart field (form value or uploaded file).
-pub const MultipartField = struct {
-    name: []const u8,
-    value: ?[]const u8,
-    file: ?UploadedFile,
-};
+    // Lazy-parsed query cache
+    _query: ?[MAX_QUERY_PARAMS]QueryParam = null,
+    _query_count: usize = 0,
+    _query_raw: ?[]const u8 = null,
 
-/// Parsed form data (application/x-www-form-urlencoded).
-pub const FormData = struct {
-    fields: []const [2][]const u8,
-};
+    // Route params (set by router after match)
+    params: [8]PathParam = undefined,
+    param_count: u8 = 0,
 
-/// Request body variants.
-pub const Body = union(enum) {
-    json: []const u8,
-    form: FormData,
-    multipart: []MultipartField,
-    raw: []const u8,
-    stream: *anyopaque,
-};
-
-/// Streaming multipart parser callbacks.
-/// Callback-driven, 60-byte internal buffer. Configurable memory threshold
-/// determines whether file content is buffered in memory or streamed to disk.
-/// Source: multipart-parser-c 60-byte buffer design (src/serve/REFERENCES.md).
-pub const MultipartCallbacks = struct {
-    on_part_begin: ?*const fn (*anyopaque) void = null,
-    on_header_field: ?*const fn (*anyopaque, []const u8) void = null,
-    on_header_value: ?*const fn (*anyopaque, []const u8) void = null,
-    on_headers_complete: ?*const fn (*anyopaque) void = null,
-    on_data: ?*const fn (*anyopaque, []const u8) void = null,
-    on_part_end: ?*const fn (*anyopaque) void = null,
-    on_complete: ?*const fn (*anyopaque) void = null,
-    user_data: ?*anyopaque = null,
-};
-
-/// Streaming multipart parser state machine.
-pub const StreamingMultipart = struct {
-    boundary: []const u8,
-    callbacks: MultipartCallbacks,
-    config: RequestConfig,
-    /// Internal 60-byte lookahead buffer.
-    buf: [60]u8,
-    buf_len: usize,
-    state: enum {
-        preamble,
-        header_field,
-        header_value,
-        data,
-        boundary_check,
-        epilogue,
-        done,
-    },
-
-    pub fn init(boundary: []const u8, callbacks: MultipartCallbacks, config: RequestConfig) StreamingMultipart {
-        _ = .{ boundary, callbacks, config };
-        return undefined;
+    /// Build from raw parsed fields (method string, full URI, header pairs, body).
+    pub fn fromRaw(
+        method: Method,
+        uri: []const u8,
+        version: Version,
+        headers: []const Header,
+        body_slice: ?[]const u8,
+    ) Request {
+        const qmark = std.mem.indexOfScalar(u8, uri, '?');
+        return .{
+            .method = method,
+            .path = if (qmark) |q| uri[0..q] else uri,
+            .version = version,
+            .headers = headers,
+            .body = body_slice,
+            ._query_raw = if (qmark) |q| uri[q + 1 ..] else null,
+        };
     }
 
-    /// Feed data to the parser. Invokes callbacks as parts are parsed.
-    pub fn feed(self: *StreamingMultipart, data: []const u8) !void {
-        _ = .{ self, data };
+    /// Get a route parameter by name.
+    pub fn param(self: *const Request, name: []const u8) ?[]const u8 {
+        for (self.params[0..self.param_count]) |p| {
+            if (std.mem.eql(u8, p.name, name)) return p.value;
+        }
+        return null;
     }
 
-    /// Signal end of input.
-    pub fn finish(self: *StreamingMultipart) !void {
-        _ = .{self};
+    /// Get a header value by name (case-insensitive).
+    pub fn header(self: *const Request, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| {
+            if (eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
     }
-};
 
-/// HTTP request with two-arena memory model. Generic over IO backend.
-pub fn Request(comptime IO: type) type {
-    return struct {
-        const Self = @This();
+    /// Get the raw query string (everything after ?).
+    pub fn queryString(self: *const Request) ?[]const u8 {
+        return self._query_raw;
+    }
 
-        method: []const u8,
-        path: []const u8,
-        query_raw: ?[]const u8,
-        headers: [][2][]const u8,
-        body: ?Body,
-        remote_addr: []const u8,
-        io: *IO,
-
-        /// Connection-scoped arena (lives for entire connection).
-        conn_arena: *std.heap.ArenaAllocator,
-        /// Request-scoped arena (reset between keepalive requests).
-        req_arena: *std.heap.ArenaAllocator,
-
-        // -- Built-in context fields --
-        // Request (Zig) ←→ RequestContext (Python) ←→ DI resolution reads from Request
-
-        /// Unique request ID (ULID, generated by snek).
-        id: []const u8,
-        /// Authenticated user ID (set by auth middleware, null if unauthenticated).
-        user_id: ?[]const u8,
-        /// W3C traceparent value for distributed tracing.
-        trace_context: ?[]const u8,
-
-        /// Pointer to the Python-side RequestContext that wraps this Request.
-        /// Set once per request; allows middleware and DI to access either side.
-        py_context: ?*context.RequestContext,
-
-        // -- Lazy-parsed caches --
-
-        /// Lazily parsed query parameters. Null until first access.
-        _query_params: ?[]QueryParam,
-        /// Lazily parsed form body. Null until first access.
-        _form_data: ?FormData,
-        /// Middleware → handler state propagation. Holds a pointer to the
-        /// Python-side RequestContext state; use py_context.setState/getState.
-        _state: ?*anyopaque,
-
-        /// Lazily parse and return query parameters. Cached after first call.
-        pub fn queryParams(self: *Self) ![]QueryParam {
-            _ = .{self};
-            return undefined;
-        }
-
-        /// Get a single query parameter by name.
-        pub fn queryParam(self: *Self, name: []const u8) !?[]const u8 {
-            _ = .{ self, name };
-            return undefined;
-        }
-
-        /// Parse body as JSON bytes (raw JSON for the validator to consume).
-        pub fn parseJson(self: *Self) ![]const u8 {
-            _ = .{self};
-            return undefined;
-        }
-
-        /// Lazily parse body as form data. Cached after first call.
-        pub fn parseForm(self: *Self) !FormData {
-            _ = .{self};
-            return undefined;
-        }
-
-        /// Parse body as multipart using the streaming parser.
-        pub fn parseMultipart(self: *Self, config: RequestConfig) ![]MultipartField {
-            _ = .{ self, config };
-            return undefined;
-        }
-
-        /// Get a streaming reader for the request body.
-        pub fn bodyStream(self: *Self) !*anyopaque {
-            _ = .{self};
-            return undefined;
-        }
-
-        /// Get a header value by name (case-insensitive).
-        pub fn header(self: *const Self, name: []const u8) ?[]const u8 {
-            _ = .{ self, name };
-            return undefined;
-        }
-
-        // -- Request state (middleware → handler propagation) --
-        // Delegates to the Python-side RequestContext for state storage.
-
-        /// Set a state value (used by middleware to pass data to handlers).
-        /// Delegates to py_context if available, otherwise no-op.
-        pub fn setState(self: *Self, key: [*:0]const u8, value: *anyopaque) void {
-            if (self.py_context) |ctx| {
-                const ffi_obj: *context.ffi.PyObject = @ptrCast(value);
-                ctx.setState(key, ffi_obj) catch {};
+    /// Get a query parameter by name (lazy-parsed on first access).
+    pub fn query(self: *Request, name: []const u8) ?[]const u8 {
+        if (self._query == null) self.parseQuery();
+        if (self._query) |q| {
+            for (q[0..self._query_count]) |p| {
+                if (std.mem.eql(u8, p.name, name)) return p.value;
             }
         }
+        return null;
+    }
 
-        /// Get a state value by key.
-        /// Delegates to py_context if available, otherwise returns null.
-        pub fn getState(self: *const Self, key: [*:0]const u8) ?*anyopaque {
-            if (self.py_context) |ctx| {
-                if (ctx.getState(key)) |obj| return @ptrCast(obj);
+    /// Content-Type header value.
+    pub fn contentType(self: *const Request) ?[]const u8 {
+        return self.header("content-type");
+    }
+
+    /// Content-Length as integer.
+    pub fn contentLength(self: *const Request) ?usize {
+        const val = self.header("content-length") orelse return null;
+        return std.fmt.parseInt(usize, val, 10) catch null;
+    }
+
+    fn parseQuery(self: *Request) void {
+        const raw = self._query_raw orelse return;
+        var q: [MAX_QUERY_PARAMS]QueryParam = undefined;
+        var count: usize = 0;
+        var iter = std.mem.splitScalar(u8, raw, '&');
+        while (iter.next()) |pair| {
+            if (count >= MAX_QUERY_PARAMS) break;
+            if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+                q[count] = .{ .name = pair[0..eq], .value = pair[eq + 1 ..] };
+            } else {
+                q[count] = .{ .name = pair, .value = "" };
             }
-            return null;
+            count += 1;
         }
-    };
+        self._query = q;
+        self._query_count = count;
+    }
+};
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ac, bc| {
+        const al: u8 = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
+        const bl: u8 = if (bc >= 'A' and bc <= 'Z') bc + 32 else bc;
+        if (al != bl) return false;
+    }
+    return true;
 }
 
-test "parse query params" {}
+// ============================================================
+// Tests
+// ============================================================
 
-test "lazy query param caching" {}
+test "fromRaw extracts method, path, headers" {
+    const hdrs = [_]Header{
+        .{ .name = "host", .value = "example.com" },
+        .{ .name = "accept", .value = "text/html" },
+    };
+    const req = Request.fromRaw(.GET, "/hello", .http11, &hdrs, null);
+    try std.testing.expectEqual(Method.GET, req.method);
+    try std.testing.expectEqualStrings("/hello", req.path);
+    try std.testing.expectEqual(Version.http11, req.version);
+    try std.testing.expectEqual(@as(usize, 2), req.headers.len);
+    try std.testing.expectEqualStrings("example.com", req.headers[0].value);
+}
 
-test "streaming multipart" {}
+test "param lookup by name" {
+    var req = Request.fromRaw(.GET, "/users/42", .http11, &.{}, null);
+    req.params[0] = .{ .name = "id", .value = "42" };
+    req.params[1] = .{ .name = "action", .value = "edit" };
+    req.param_count = 2;
+    try std.testing.expectEqualStrings("42", req.param("id").?);
+    try std.testing.expectEqualStrings("edit", req.param("action").?);
+    try std.testing.expect(req.param("missing") == null);
+}
 
-test "file upload threshold" {}
+test "header lookup case-insensitive" {
+    const hdrs = [_]Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "x-request-id", .value = "abc123" },
+    };
+    const req = Request.fromRaw(.GET, "/", .http11, &hdrs, null);
+    try std.testing.expectEqualStrings("application/json", req.header("Content-Type").?);
+    try std.testing.expectEqualStrings("abc123", req.header("x-request-id").?);
+    try std.testing.expect(req.header("nonexistent") == null);
+}
 
-test "request state propagation" {}
+test "query string parsing" {
+    var req = Request.fromRaw(.GET, "/search?q=zig&page=2&sort=", .http11, &.{}, null);
+    try std.testing.expectEqualStrings("/search", req.path);
+    try std.testing.expectEqualStrings("q=zig&page=2&sort=", req.queryString().?);
+    try std.testing.expectEqualStrings("zig", req.query("q").?);
+    try std.testing.expectEqualStrings("2", req.query("page").?);
+    try std.testing.expectEqualStrings("", req.query("sort").?);
+    try std.testing.expect(req.query("missing") == null);
+}
 
-test "header lookup case insensitive" {}
-
-test "two arena memory model" {}
+test "content-type and content-length helpers" {
+    const hdrs = [_]Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "content-length", .value = "42" },
+    };
+    const req = Request.fromRaw(.POST, "/data", .http11, &hdrs, null);
+    try std.testing.expectEqualStrings("application/json", req.contentType().?);
+    try std.testing.expectEqual(@as(?usize, 42), req.contentLength());
+}
