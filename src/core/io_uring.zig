@@ -195,7 +195,11 @@ const LinuxIoUring = struct {
         var cqe_buf: [256]linux.io_uring_cqe = undefined;
         const cqes = cqe_buf[0..max_cqes];
 
-        // Submit pending SQEs and copy available CQEs without blocking.
+        // Submit any pending SQEs to the kernel first.
+        _ = self.ring.submit() catch |err| {
+            return err;
+        };
+        // Copy available CQEs without blocking.
         const count = self.ring.copy_cqes(cqes, 0) catch |err| {
             return err;
         };
@@ -403,7 +407,7 @@ test "submit and poll" {
     while (total == 0 and attempts < 1000) : (attempts += 1) {
         total = try ring.pollCompletions(&events);
         if (total == 0) {
-            std.time.sleep(1_000_000); // 1ms
+            std.Thread.sleep(1_000_000); // 1ms
         }
     }
     try std.testing.expect(total > 0);
@@ -439,7 +443,7 @@ test "linked operations" {
     while (total < 2 and attempts < 100) : (attempts += 1) {
         total += try ring.pollCompletions(events[total..]);
         if (total < 2) {
-            std.time.sleep(1_000_000);
+            std.Thread.sleep(1_000_000);
         }
     }
     try std.testing.expectEqual(@as(u32, 2), total);
