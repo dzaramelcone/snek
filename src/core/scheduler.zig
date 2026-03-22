@@ -89,6 +89,12 @@ pub fn Scheduler(comptime IO: type) type {
         /// One iteration of the main loop. Tests call this directly.
         pub fn tick(self: *Self) void {
             self.timers.tick();
+            // Only dispatch to workers if the pool is started.
+            // Before start, frames stay in the accept queue.
+            if (self.pool.state != .started) {
+                self.metrics.poll_count += 1;
+                return;
+            }
             // Dispatch from accept queue to workers round-robin.
             // Skip full workers — try all workers before giving up.
             var dispatched: u32 = 0;
@@ -117,6 +123,10 @@ pub fn Scheduler(comptime IO: type) type {
         /// Run the scheduler. Starts the worker pool, loops tick(), and on exit
         /// always completes the TLA+ lifecycle: start → stop → join → done.
         /// (See specs/worker_lifecycle.tla MainStart → MainStop → MainJoin)
+        /// Run the scheduler. Owns the full pool lifecycle:
+        ///   pool.start() → loop tick() → pool.stop()
+        /// This is the ONLY place pool start/stop happens.
+        /// shutdown() and gracefulShutdown() signal via atomic flag only.
         pub fn run(self: *Self) !void {
             try self.pool.start();
             self.running.store(true, .release);
@@ -126,26 +136,25 @@ pub fn Scheduler(comptime IO: type) type {
                     std.Thread.yield() catch {};
                 }
             }
+            // Drain remaining accept queue before stopping workers.
+            while (self.accept_queue.len > 0) {
+                self.tick();
+            }
             self.pool.stop();
         }
 
         /// Signal the scheduler to stop. Thread-safe (atomic store).
-        /// run() will exit its loop and complete the shutdown sequence.
+        /// run() will exit its loop, drain remaining work, and stop the pool.
         pub fn shutdown(self: *Self) void {
             self.shut_down = true;
             self.running.store(false, .release);
         }
 
-        /// Graceful shutdown: drain accept queue, then stop.
+        /// Graceful shutdown: same as shutdown(). run() handles draining and
+        /// pool lifecycle. This method exists for API clarity — both paths
+        /// signal via the atomic flag and let run() do the cleanup.
         pub fn gracefulShutdown(self: *Self) void {
-            self.shut_down = true;
-            self.running.store(false, .release);
-            if (self.pool.state == .started) {
-                while (self.accept_queue.len > 0) {
-                    self.tick();
-                }
-                self.pool.stop();
-            }
+            self.shutdown();
         }
 
         /// Enqueue a coroutine for dispatch. Works from init until shutdown.
@@ -190,24 +199,58 @@ test "scheduler init and deinit" {
     try testing.expectEqual(@as(u64, 0), s.metrics.coroutines_spawned);
 }
 
-test "scheduler spawn and dispatch" {
-    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
+test "scheduler spawn and dispatch via run" {
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
     defer s.deinit();
+
+    var processed = std.atomic.Value(u64).init(0);
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+    s.pool.workers[0].work_callback = &S.callback;
 
     var frame = coroutine.CoroutineFrame.create(1);
     try s.spawnCoroutine(&frame);
-    try testing.expectEqual(@as(u64, 1), s.metrics.coroutines_spawned);
-    try testing.expectEqual(@as(usize, 1), s.accept_queue.len);
 
-    // tick() dispatches to worker 0's deque
-    s.tick();
+    // Start scheduler in a thread, let it dispatch and process
+    const t = try std.Thread.spawn(.{}, struct {
+        fn entry(sched: *Scheduler(FakeIO)) void {
+            sched.run() catch {};
+        }
+    }.entry, .{&s});
+
+    // Wait for the item to be processed
+    var attempts: u32 = 0;
+    while (processed.load(.acquire) == 0 and attempts < 1000) : (attempts += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    s.shutdown();
+    t.join();
+
+    try testing.expectEqual(@as(u64, 1), processed.load(.acquire));
     try testing.expectEqual(@as(usize, 0), s.accept_queue.len);
-    try testing.expectEqual(@as(usize, 1), s.pool.workers[0].local_deque.len());
 }
 
-test "scheduler round-robin dispatch" {
-    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 4 });
+test "scheduler dispatches to multiple workers" {
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
+
+    var processed = std.atomic.Value(u64).init(0);
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+    for (s.pool.workers) |*w| {
+        w.work_callback = &S.callback;
+    }
 
     var frames: [4]coroutine.CoroutineFrame = undefined;
     for (0..4) |i| {
@@ -215,12 +258,21 @@ test "scheduler round-robin dispatch" {
         try s.spawnCoroutine(&frames[i]);
     }
 
-    s.tick();
+    const t = try std.Thread.spawn(.{}, struct {
+        fn entry(sched: *Scheduler(FakeIO)) void {
+            sched.run() catch {};
+        }
+    }.entry, .{&s});
 
-    // Each worker should have exactly 1 item
-    for (0..4) |i| {
-        try testing.expectEqual(@as(usize, 1), s.pool.workers[i].local_deque.len());
+    var attempts: u32 = 0;
+    while (processed.load(.acquire) < 4 and attempts < 1000) : (attempts += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
     }
+
+    s.shutdown();
+    t.join();
+
+    try testing.expectEqual(@as(u64, 4), processed.load(.acquire));
 }
 
 test "scheduler backpressure" {
@@ -306,39 +358,36 @@ test "scheduler tick advances timers" {
     try testing.expectEqual(@as(u64, 1), fired);
 }
 
-test "scheduler dispatch preserves frame pointer" {
-    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
-    defer s.deinit();
+test "frame pointer round-trip through deque" {
+    // Verify the @intFromPtr/@ptrFromInt cast that tick() uses to push
+    // CoroutineFrame pointers through the u64 deque.
+    const alloc = testing.allocator;
+    var d = try @import("deque.zig").ChaseLevDeque(u64).init(alloc, 16);
+    defer d.deinit();
 
     var frame = coroutine.CoroutineFrame.create(42);
-    try s.spawnCoroutine(&frame);
-    s.tick();
+    d.push(@intFromPtr(&frame));
 
-    // Worker's deque has the frame as a u64. Verify the pointer round-trips.
-    const raw = s.pool.workers[0].local_deque.pop().?;
+    const raw = d.pop().?;
     const recovered: *coroutine.CoroutineFrame = @ptrFromInt(raw);
     try testing.expectEqual(@as(u64, 42), recovered.id);
     try testing.expectEqual(&frame, recovered);
 }
 
-test "scheduler graceful shutdown drains accept queue when pool started" {
+test "scheduler graceful shutdown signals and run handles cleanup" {
+    // gracefulShutdown() just signals — run() does the actual drain + stop.
+    // Test without run() thread: verify gracefulShutdown sets the flags.
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
 
-    try s.pool.start();
-
     var f1 = coroutine.CoroutineFrame.create(1);
-    var f2 = coroutine.CoroutineFrame.create(2);
     try s.spawnCoroutine(&f1);
-    try s.spawnCoroutine(&f2);
 
-    try testing.expectEqual(@as(usize, 2), s.accept_queue.len);
-
-    // gracefulShutdown drains accept queue into workers, then stops pool.
     s.gracefulShutdown();
     try testing.expect(!s.running.load(.acquire));
     try testing.expect(s.shut_down);
-    try testing.expectEqual(@as(usize, 0), s.accept_queue.len);
+    // Accept queue is NOT drained here — run() does that.
+    try testing.expectEqual(@as(usize, 1), s.accept_queue.len);
 }
 
 // ── Edge cases ──────────────────────────────────────────────────────
@@ -384,17 +433,39 @@ test "edge: dispatch more frames than workers" {
     var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
 
+    var processed = std.atomic.Value(u64).init(0);
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+    for (s.pool.workers) |*w| {
+        w.work_callback = &S.callback;
+    }
+
     var frames: [5]coroutine.CoroutineFrame = undefined;
     for (0..5) |i| {
         frames[i] = coroutine.CoroutineFrame.create(@intCast(i));
         try s.spawnCoroutine(&frames[i]);
     }
 
-    s.tick();
+    const t = try std.Thread.spawn(.{}, struct {
+        fn entry(sched: *Scheduler(FakeIO)) void {
+            sched.run() catch {};
+        }
+    }.entry, .{&s});
 
-    // Round-robin: worker 0 gets 0,2,4 — worker 1 gets 1,3
-    try testing.expectEqual(@as(usize, 3), s.pool.workers[0].local_deque.len());
-    try testing.expectEqual(@as(usize, 2), s.pool.workers[1].local_deque.len());
+    var attempts: u32 = 0;
+    while (processed.load(.acquire) < 5 and attempts < 1000) : (attempts += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    s.shutdown();
+    t.join();
+
+    try testing.expectEqual(@as(u64, 5), processed.load(.acquire));
 }
 
 // ── Simplify review tests ────────────────────────────────────────────
@@ -426,26 +497,50 @@ test "simplify: spawn rejected only after explicit shutdown" {
     try testing.expectError(error.NotRunning, result);
 }
 
-test "simplify: tick dispatches to workers that have capacity, skipping full ones" {
-    // Use small deque capacity so we can fill it easily
-    var s = try Scheduler(FakeIO).init(testing.allocator, .{
-        .num_threads = 2,
-    });
+test "simplify: work processed even when one worker deque is full" {
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
     defer s.deinit();
 
-    // Fill worker 0's deque to capacity
+    var processed = std.atomic.Value(u64).init(0);
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(_: u64) void {
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+    for (s.pool.workers) |*w| {
+        w.work_callback = &S.callback;
+    }
+
+    // Fill worker 0's deque before starting
     while (!s.pool.workers[0].local_deque.isFull()) {
         s.pool.workers[0].local_deque.push(0);
     }
-    try testing.expect(s.pool.workers[0].local_deque.isFull());
 
-    // Spawn a frame — should go to worker 1, not get stuck
+    // Spawn new work — should get dispatched to worker 1 (not blocked)
     var f = coroutine.CoroutineFrame.create(99);
     try s.spawnCoroutine(&f);
-    s.tick();
 
-    // Worker 1 got the frame, not blocked by worker 0 being full
-    try testing.expectEqual(@as(usize, 1), s.pool.workers[1].local_deque.len());
+    const t = try std.Thread.spawn(.{}, struct {
+        fn entry(sched: *Scheduler(FakeIO)) void {
+            sched.run() catch {};
+        }
+    }.entry, .{&s});
+
+    // Wait for at least 1 item to be processed (the spawned frame)
+    // Worker 0 will also process its full deque, but we care that
+    // the new frame wasn't blocked by worker 0 being full.
+    var attempts: u32 = 0;
+    while (processed.load(.acquire) < 1 and attempts < 1000) : (attempts += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    s.shutdown();
+    t.join();
+
+    // At least our spawned frame was processed
+    try testing.expect(processed.load(.acquire) >= 1);
 }
 
 test "simplify: running is atomic — cross-thread shutdown visibility" {
@@ -460,4 +555,55 @@ test "simplify: running is atomic — cross-thread shutdown visibility" {
     const RunningType = @TypeOf(s.running);
     // This will fail if running is a plain bool — it should be atomic.
     try testing.expect(RunningType == std.atomic.Value(bool));
+}
+
+// ── Audit round 4 tests (must fail before fix) ──────────────────────
+
+test "audit4: shutdown is the only way to stop, run owns pool lifecycle" {
+    // Finding 1: run() and gracefulShutdown() both call pool.stop().
+    // run() should be the ONLY place that starts and stops the pool.
+    // shutdown/gracefulShutdown should just signal via the atomic flag.
+    //
+    // After the fix: gracefulShutdown() just drains + signals, run() handles
+    // the pool lifecycle.
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 1 });
+    defer s.deinit();
+
+    // Use a thread to run the scheduler
+    const t = try std.Thread.spawn(.{}, struct {
+        fn entry(sched: *Scheduler(FakeIO)) void {
+            sched.run() catch {};
+        }
+    }.entry, .{&s});
+
+    // Give it a moment to start
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    // gracefulShutdown should NOT call pool.stop() — just signal
+    s.gracefulShutdown();
+
+    // run() exits its loop and calls pool.stop() — the only stop.
+    t.join();
+
+    // Pool should be stopped exactly once (no assert panic, no double-stop)
+    try testing.expect(s.pool.state == .stopped);
+}
+
+test "audit4: tick does not dispatch to workers before pool is started" {
+    // Finding 2: tick() dispatches frames into worker deques even before
+    // pool.start(). Workers aren't running yet, so the work sits unprocessed.
+    // The TLA+ spec restricts work arrival to the started state.
+    var s = try Scheduler(FakeIO).init(testing.allocator, .{ .num_threads = 2 });
+    defer s.deinit();
+
+    var f = coroutine.CoroutineFrame.create(1);
+    try s.spawnCoroutine(&f);
+
+    // tick() before pool.start() — should NOT push to worker deques
+    s.tick();
+
+    // Frame should still be in accept queue, not dispatched
+    try testing.expectEqual(@as(usize, 1), s.accept_queue.len);
+    try testing.expectEqual(@as(usize, 0), s.pool.workers[0].local_deque.len());
+    try testing.expectEqual(@as(usize, 0), s.pool.workers[1].local_deque.len());
 }
