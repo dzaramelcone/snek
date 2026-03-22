@@ -142,7 +142,10 @@ pub fn Scheduler(comptime IO: type) type {
             while (self.running.load(.acquire)) {
                 self.tick();
                 if (self.accept_queue.len == 0) {
-                    std.Thread.yield() catch {};
+                    // No work to dispatch — sleep briefly to avoid burning CPU.
+                    // In production with full IO integration, this would be
+                    // replaced by blocking on io_uring_enter / kevent.
+                    std.Thread.sleep(100 * std.time.ns_per_us); // 100μs
                 }
             }
             // Drain remaining accept queue before stopping workers.

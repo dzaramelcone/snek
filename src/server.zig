@@ -100,6 +100,11 @@ pub fn Server(comptime IO: type) type {
             };
             posix.bind(fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) catch |err| return err;
             posix.listen(fd, 128) catch |err| return err;
+            // Set non-blocking so the accept loop can drain all pending
+            // connections in one burst, then yield to tick.
+            const flags = posix.fcntl(fd, posix.F.GETFL, @as(usize, 0)) catch |err| return err;
+            const nonblock: usize = @intCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+            _ = posix.fcntl(fd, posix.F.SETFL, flags | nonblock) catch |err| return err;
             self.listen_fd = fd;
         }
 
@@ -145,36 +150,45 @@ pub fn Server(comptime IO: type) type {
                 std.Thread.yield() catch {};
             }
 
-            // Accept loop on the main thread
+            // Accept loop using poll() to avoid busy-spinning.
+            // poll() blocks until the listen fd has a pending connection,
+            // then we accept all pending connections in a burst.
+            var poll_fds = [_]posix.pollfd{.{
+                .fd = fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+
             while (!self.scheduler.shut_down.load(.acquire)) {
-                var client_addr: posix.sockaddr = undefined;
-                var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-                const client_fd = posix.accept(fd, &client_addr, &client_addr_len, 0) catch |err| {
-                    // EAGAIN/EINTR/ECONNABORTED are transient; on shutdown the fd is closed
-                    if (self.scheduler.shut_down.load(.acquire)) break;
-                    // For EMFILE/ENFILE, brief backoff
-                    if (err == error.ProcessFdQuotaExceeded or err == error.SystemFdQuotaExceeded) {
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
-                    }
-                    continue;
-                };
+                // Block until a connection is ready (10ms timeout to check shutdown)
+                const ready = posix.poll(&poll_fds, 10) catch continue;
+                if (ready == 0) continue; // timeout, check shutdown flag
 
-                // Wrap fd into a CoroutineFrame. The frame's id carries the fd value.
-                // Allocated on the heap so it outlives this loop iteration.
-                const frame = self.allocator.create(coroutine.CoroutineFrame) catch {
-                    posix.close(client_fd);
-                    continue;
-                };
-                frame.* = coroutine.CoroutineFrame.create(@intCast(client_fd));
+                // Drain all pending connections
+                while (true) {
+                    var client_addr: posix.sockaddr = undefined;
+                    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+                    const client_fd = posix.accept(fd, &client_addr, &client_addr_len, 0) catch |err| {
+                        if (err == error.WouldBlock) break;
+                        if (self.scheduler.shut_down.load(.acquire)) break;
+                        if (err == error.ProcessFdQuotaExceeded or err == error.SystemFdQuotaExceeded) {
+                            std.Thread.sleep(1 * std.time.ns_per_ms);
+                        }
+                        continue;
+                    };
 
-                self.scheduler.spawnCoroutine(frame) catch {
-                    // Backpressure or shutdown — close the connection
-                    posix.close(client_fd);
-                    self.allocator.destroy(frame);
-                    continue;
-                };
-                // The scheduler's run loop ticks continuously and will
-                // dispatch from the accept queue to workers.
+                    const frame = self.allocator.create(coroutine.CoroutineFrame) catch {
+                        posix.close(client_fd);
+                        continue;
+                    };
+                    frame.* = coroutine.CoroutineFrame.create(@intCast(client_fd));
+
+                    self.scheduler.spawnCoroutine(frame) catch {
+                        posix.close(client_fd);
+                        self.allocator.destroy(frame);
+                        continue;
+                    };
+                }
             }
 
             // Wait for scheduler thread (which drains + stops pool)
