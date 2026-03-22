@@ -430,7 +430,7 @@ const server_mod = @import("../server.zig");
 /// Start the HTTP server with Python handlers wired in.
 /// Called from _snek.run(host, port).
 pub fn startServer(host: []const u8, port: u16) !void {
-    var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 1 });
+    var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 4 });
     defer srv.deinit();
 
     // Register all Python routes with the Zig router
