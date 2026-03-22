@@ -63,6 +63,9 @@ pub fn Scheduler(comptime IO: type) type {
         accept_queue: coroutine.FrameQueue,
         accept_queue_capacity: u32,
         next_worker: u32,
+        /// Futex for waking the scheduler when new work arrives.
+        /// 0 = sleeping, 1 = work available.
+        wake_state: std.atomic.Value(u32),
 
         pub fn init(allocator: std.mem.Allocator, config: SchedulerConfig) !Self {
             const num_threads = if (config.num_threads == 0)
@@ -80,6 +83,7 @@ pub fn Scheduler(comptime IO: type) type {
                 .accept_queue = coroutine.FrameQueue.init(),
                 .accept_queue_capacity = config.accept_queue_capacity,
                 .next_worker = 0,
+                .wake_state = std.atomic.Value(u32).init(0),
             };
         }
 
@@ -120,6 +124,8 @@ pub fn Scheduler(comptime IO: type) type {
             }
             self.metrics.accept_queue_depth = self.accept_queue.len;
             self.metrics.poll_count += 1;
+            // Reset wake state after dispatching — will sleep if queue is empty.
+            self.wake_state.store(0, .release);
         }
 
         /// Run the scheduler. Owns the full pool lifecycle:
@@ -142,10 +148,9 @@ pub fn Scheduler(comptime IO: type) type {
             while (self.running.load(.acquire)) {
                 self.tick();
                 if (self.accept_queue.len == 0) {
-                    // No work to dispatch — sleep briefly to avoid burning CPU.
-                    // In production with full IO integration, this would be
-                    // replaced by blocking on io_uring_enter / kevent.
-                    std.Thread.sleep(100 * std.time.ns_per_us); // 100μs
+                    // No work to dispatch. Use futex to block until
+                    // spawnCoroutine signals new work is available.
+                    std.Thread.Futex.wait(&self.wake_state, 0);
                 }
             }
             // Drain remaining accept queue before stopping workers.
@@ -160,6 +165,9 @@ pub fn Scheduler(comptime IO: type) type {
         pub fn shutdown(self: *Self) void {
             self.shut_down.store(true, .release);
             self.running.store(false, .release);
+            // Wake the scheduler thread if it's sleeping on the futex.
+            self.wake_state.store(1, .release);
+            std.Thread.Futex.wake(&self.wake_state, 1);
         }
 
         /// Graceful shutdown: same as shutdown(). run() handles draining and
@@ -181,6 +189,9 @@ pub fn Scheduler(comptime IO: type) type {
             self.accept_queue.push(frame);
             self.metrics.coroutines_spawned += 1;
             self.metrics.accept_queue_depth = self.accept_queue.len;
+            // Wake the scheduler thread if it's sleeping on the futex.
+            self.wake_state.store(1, .release);
+            std.Thread.Futex.wake(&self.wake_state, 1);
         }
 
         pub fn cancelCoroutine(self: *Self, frame: *coroutine.CoroutineFrame) void {
