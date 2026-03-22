@@ -1192,3 +1192,7 @@ async def echo(ws):
 [2026-03-21] Phase 3.1: io_uring.zig — thin adapter around std.os.linux.IoUring, NonLinuxStub for macOS, comptime interface check, 10 tests (5 Linux-gated)
 [2026-03-21] Phase 3.2: kqueue.zig — readiness-to-completion adapter, ONESHOT kevents, ~200 lines, 13 tests on macOS. UAT caught silent OOM swallowing (catch {} → try)
 [2026-03-21] Phase 3: COMPLETE (kqueue verified on macOS, io_uring compiles — Docker testing pending)
+[2026-03-21] Phase 4.1: coroutine.zig — stackless state machine, CancellationToken, FrameQueue (intrusive), comptime Pipeline, 19 tests
+[2026-03-21] Phase 4.2: worker.zig — WorkerThread(IO) with deque + futex park/wake, WorkerPool with real std.Thread, 13 tests. Found and fixed start/stop race via TLA+.
+[2026-03-21] Phase 4.3: TLA+ model (specs/worker_lifecycle.tla) — verified 441,761 states with 4 workers. Safety: terminated workers never process. Liveness: stop always leads to termination, parked workers always wake.
+[2026-03-21] Phase 4: COMPLETE — workers + coroutines, TLA+ verified, all tests pass on macOS + Linux

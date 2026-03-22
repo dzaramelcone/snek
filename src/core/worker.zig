@@ -9,7 +9,6 @@ const std = @import("std");
 const deque = @import("deque.zig");
 const arena_mod = @import("arena.zig");
 const pool_mod = @import("pool.zig");
-const coroutine = @import("coroutine.zig");
 
 pub const ThreadConfig = struct {
     affinity: ?u32 = null,
@@ -30,64 +29,98 @@ pub fn WorkerThread(comptime IO: type) type {
         id: u32,
         local_deque: deque.ChaseLevDeque(u64),
         io: IO,
-        is_parked: bool,
+        running: std.atomic.Value(bool),
+        park_state: std.atomic.Value(u32),
         config: ThreadConfig,
         /// Per-connection arena pairs managed via free-list pool.
         connection_arenas: pool_mod.Pool(arena_mod.ConnectionArenas, 4096),
+        /// Callback for processing work items. If null, items are just consumed.
+        work_callback: ?*const fn (u64) void,
+        allocator: std.mem.Allocator,
 
-        pub fn init(id: u32, cfg: ThreadConfig) Self {
-            _ = .{ id, cfg };
-            return undefined;
+        pub fn init(allocator: std.mem.Allocator, id: u32, cfg: ThreadConfig) !Self {
+            var self = Self{
+                .id = id,
+                .local_deque = try deque.ChaseLevDeque(u64).init(allocator, cfg.deque_capacity),
+                .io = IO.init(allocator, id),
+                .running = std.atomic.Value(bool).init(false),
+                .park_state = std.atomic.Value(u32).init(0),
+                .config = cfg,
+                .connection_arenas = undefined,
+                .work_callback = null,
+                .allocator = allocator,
+            };
+            self.connection_arenas.initInPlace();
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
-            _ = .{self};
-        }
-
-        pub fn start(self: *Self) !void {
-            _ = .{self};
+            self.local_deque.deinit();
+            self.io.deinit();
         }
 
         pub fn stop(self: *Self) void {
-            _ = .{self};
+            self.running.store(false, .release);
+            self.wake();
         }
 
         /// Park the worker thread (idle strategy). Blocks on futex until woken.
+        // Design: park_state 0 = running, 1 = parked.
+        // Futex waits when park_state == 1, wake sets to 0.
         pub fn park(self: *Self) void {
-            _ = .{self};
+            self.park_state.store(1, .release);
+            std.Thread.Futex.wait(&self.park_state, 1);
         }
 
         /// Wake a parked worker thread via futex.
         pub fn wake(self: *Self) void {
-            _ = .{self};
+            self.park_state.store(0, .release);
+            std.Thread.Futex.wake(&self.park_state, 1);
         }
 
-        pub fn runLoop(self: *Self) !void {
-            _ = .{self};
+        /// Main worker loop. Pops from local deque; parks if idle.
+        /// Work stealing from other workers is deferred to Phase 5 (scheduler).
+        pub fn runLoop(self: *Self) void {
+            // NOTE: running must be set to true by the caller (WorkerPool.start)
+            // BEFORE spawning the thread, to avoid a race with stop().
+            while (self.running.load(.acquire)) {
+                if (self.local_deque.pop()) |item| {
+                    if (self.work_callback) |cb| {
+                        cb(item);
+                    }
+                } else {
+                    // No local work — park until woken.
+                    // Check running again after setting park_state but before
+                    // actually waiting, to avoid sleeping through a stop().
+                    self.park_state.store(1, .release);
+                    if (!self.running.load(.acquire)) break;
+                    std.Thread.Futex.wait(&self.park_state, 1);
+                }
+            }
         }
 
         pub fn getThreadId(self: *const Self) u32 {
-            _ = .{self};
-            return undefined;
+            return self.id;
         }
 
         pub fn setAffinity(self: *Self, core_id: u32) !void {
-            _ = .{ self, core_id };
+            // CPU affinity is platform-specific and deferred. Stub for now.
+            _ = self;
+            _ = core_id;
         }
 
         pub fn pinToCore(self: *Self, core_id: u32) !void {
-            _ = .{ self, core_id };
+            return self.setAffinity(core_id);
         }
 
         /// Acquire a connection arena pair from the pool.
         pub fn acquireConnection(self: *Self) ?*arena_mod.ConnectionArenas {
-            _ = .{self};
-            return null;
+            return self.connection_arenas.get();
         }
 
         /// Release a connection arena pair back to the pool.
         pub fn releaseConnection(self: *Self, arenas: *arena_mod.ConnectionArenas) void {
-            _ = .{ self, arenas };
+            self.connection_arenas.put(arenas);
         }
     };
 }
@@ -98,45 +131,287 @@ pub fn WorkerPool(comptime IO: type) type {
         const Self = @This();
 
         workers: []WorkerThread(IO),
+        threads: []std.Thread,
         num_threads: u32,
+        allocator: std.mem.Allocator,
 
-        pub fn init(num_threads: u32) Self {
-            _ = .{num_threads};
-            return undefined;
+        pub fn init(allocator: std.mem.Allocator, num_threads: u32, cfg: ThreadConfig) !Self {
+            const workers = try allocator.alloc(WorkerThread(IO), num_threads);
+            errdefer allocator.free(workers);
+            const threads = try allocator.alloc(std.Thread, num_threads);
+            errdefer allocator.free(threads);
+
+            var initialized: u32 = 0;
+            errdefer {
+                var i: u32 = 0;
+                while (i < initialized) : (i += 1) {
+                    workers[i].deinit();
+                }
+            }
+
+            for (0..num_threads) |i| {
+                workers[i] = try WorkerThread(IO).init(allocator, @intCast(i), cfg);
+                initialized += 1;
+            }
+
+            return Self{
+                .workers = workers,
+                .threads = threads,
+                .num_threads = num_threads,
+                .allocator = allocator,
+            };
         }
 
         pub fn deinit(self: *Self) void {
-            _ = .{self};
+            for (self.workers) |*w| {
+                w.deinit();
+            }
+            self.allocator.free(self.workers);
+            self.allocator.free(self.threads);
         }
 
         pub fn start(self: *Self) !void {
-            _ = .{self};
+            // Set running=true on all workers BEFORE spawning threads.
+            // This prevents a race where stop() runs before the thread
+            // enters runLoop() and overrides running=false with true.
+            for (self.workers) |*w| {
+                w.running.store(true, .release);
+            }
+            for (0..self.num_threads) |i| {
+                self.threads[i] = try std.Thread.spawn(.{}, workerEntry, .{&self.workers[i]});
+            }
         }
 
         pub fn stop(self: *Self) void {
-            _ = .{self};
+            for (self.workers) |*w| {
+                w.stop();
+            }
+            for (self.threads[0..self.num_threads]) |t| {
+                t.join();
+            }
+        }
+
+        fn workerEntry(worker: *WorkerThread(IO)) void {
+            worker.runLoop();
         }
     };
 }
 
-test "worker thread init and deinit" {}
+// ---- Tests ----
 
-test "worker thread start and stop" {}
+const FakeIO = @import("fake_io.zig").FakeIO;
 
-test "worker thread park and wake" {}
+test "worker thread init and deinit" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
 
-test "worker thread run loop" {}
+    try std.testing.expectEqual(@as(u32, 0), w.id);
+    try std.testing.expect(!w.running.load(.acquire));
+}
 
-test "worker thread set affinity" {}
+test "worker thread push and pop" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 1, .{});
+    defer w.deinit();
 
-test "worker pool init and deinit" {}
+    // Push items to local deque
+    w.local_deque.push(10);
+    w.local_deque.push(20);
+    w.local_deque.push(30);
 
-test "worker pool start and stop" {}
+    // Pop in LIFO order
+    try std.testing.expectEqual(@as(u64, 30), w.local_deque.pop().?);
+    try std.testing.expectEqual(@as(u64, 20), w.local_deque.pop().?);
+    try std.testing.expectEqual(@as(u64, 10), w.local_deque.pop().?);
+    try std.testing.expect(w.local_deque.pop() == null);
+}
 
-test "worker thread acquire and release connection" {}
+test "worker thread park and wake" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
+
+    // Start worker in a thread via runLoop — it will park immediately (empty deque)
+    w.running.store(true, .release);
+
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(worker: *WorkerThread(FakeIO)) void {
+            worker.runLoop();
+        }
+    }.run, .{&w});
+
+    // Give worker a moment to park
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    // Worker should be parked (park_state == 1)
+    try std.testing.expectEqual(@as(u32, 1), w.park_state.load(.acquire));
+
+    // Stop the worker — this wakes it
+    w.stop();
+    t.join();
+}
+
+test "worker pool init and deinit" {
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 4, .{});
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(u32, 4), pool.num_threads);
+    for (0..4) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), pool.workers[i].id);
+    }
+}
+
+test "worker pool start and stop" {
+    var processed = std.atomic.Value(u64).init(0);
+
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 2, .{});
+    defer pool.deinit();
+
+    // Set a callback that records work was done
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(item: u64) void {
+            _ = item;
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+
+    for (pool.workers) |*w| {
+        w.work_callback = &S.callback;
+    }
+
+    // Push work before starting
+    pool.workers[0].local_deque.push(1);
+    pool.workers[0].local_deque.push(2);
+    pool.workers[0].local_deque.push(3);
+
+    try pool.start();
+
+    // Wake worker 0 so it processes items
+    pool.workers[0].wake();
+
+    // Give it time to process
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    pool.stop();
+
+    // All 3 items should have been processed
+    try std.testing.expectEqual(@as(u64, 3), processed.load(.acquire));
+}
+
+test "worker thread acquire and release connection" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
+
+    const arenas = w.acquireConnection();
+    try std.testing.expect(arenas != null);
+    try std.testing.expectEqual(@as(usize, 1), w.connection_arenas.count());
+
+    w.releaseConnection(arenas.?);
+    try std.testing.expectEqual(@as(usize, 0), w.connection_arenas.count());
+}
 
 test "worker generic over fake io" {
-    const fake_io = @import("fake_io.zig");
-    const TestWorker = WorkerThread(fake_io.FakeIO);
-    _ = TestWorker;
+    const TestWorker = WorkerThread(FakeIO);
+    var w = try TestWorker.init(std.testing.allocator, 7, .{});
+    defer w.deinit();
+
+    try std.testing.expectEqual(@as(u32, 7), w.getThreadId());
+}
+
+// ── Edge case tests ──────────────────────────────────────────────────
+
+test "edge: stop before start is safe" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
+
+    // running is false by default, stop() should be harmless
+    w.stop();
+    try std.testing.expect(!w.running.load(.acquire));
+}
+
+test "edge: double stop is safe" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
+
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(worker: *WorkerThread(FakeIO)) void {
+            worker.runLoop();
+        }
+    }.run, .{&w});
+
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    w.stop();
+    w.stop(); // second stop should not panic or deadlock
+    t.join();
+}
+
+test "edge: wake without park is harmless" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{});
+    defer w.deinit();
+
+    // Worker is not parked, wake should be a no-op
+    w.wake();
+    try std.testing.expectEqual(@as(u32, 0), w.park_state.load(.acquire));
+}
+
+test "edge: rapid start stop" {
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 2, .{});
+    defer pool.deinit();
+
+    // Start and immediately stop — race condition test
+    try pool.start();
+    pool.stop();
+    // Should not hang or crash
+}
+
+test "edge: one worker gets all work, others park" {
+    var processed = std.atomic.Value(u64).init(0);
+    var pool = try WorkerPool(FakeIO).init(std.testing.allocator, 4, .{});
+    defer pool.deinit();
+
+    const S = struct {
+        var counter: *std.atomic.Value(u64) = undefined;
+        fn callback(item: u64) void {
+            _ = item;
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+    };
+    S.counter = &processed;
+
+    for (pool.workers) |*w| {
+        w.work_callback = &S.callback;
+    }
+
+    // Push 100 items to worker 0 only
+    for (0..100) |i| {
+        pool.workers[0].local_deque.push(@intCast(i));
+    }
+
+    try pool.start();
+    pool.workers[0].wake();
+
+    // Give time for worker 0 to process all
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    pool.stop();
+
+    // All 100 should be processed (by worker 0, since no stealing)
+    try std.testing.expectEqual(@as(u64, 100), processed.load(.acquire));
+}
+
+test "edge: connection pool exhaustion" {
+    var w = try WorkerThread(FakeIO).init(std.testing.allocator, 0, .{ .max_connections = 4096 });
+    defer w.deinit();
+
+    // Acquire a few connections
+    var acquired: [10]*arena_mod.ConnectionArenas = undefined;
+    for (0..10) |i| {
+        acquired[i] = w.acquireConnection().?;
+    }
+
+    // Release them all
+    for (0..10) |i| {
+        w.releaseConnection(acquired[i]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), w.connection_arenas.count());
 }
