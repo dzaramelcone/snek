@@ -105,7 +105,7 @@ pub const Server = struct {
         if (id >= 64) return error.TooManyHandlers;
         self.handlers[id] = handler;
         self.handler_count = id + 1;
-        self.router.addRoute(method, path, id) catch |err| return err;
+        try self.router.addRoute(method, path, id);
     }
 
     pub fn listen(self: *Server, addr: []const u8, port: u16) !void {
@@ -172,13 +172,16 @@ pub const Server = struct {
     }
 
     fn workerAcceptLoop(self: *Server, listen_fd: posix.socket_t) void {
-        // Initialize the IO backend for this worker
         var backend = initBackend(self.allocator);
         defer backend.deinit();
 
-        // Connection pool — fixed array, no heap allocation
-        var conns: [MAX_CONNS]Connection = undefined;
-        for (&conns) |*c| c.reset();
+        // Connection pool — heap-allocated. Each Connection is ~12KB
+        // (4096 read_buf + 8192 resp_buf), so 256 = ~3MB. macOS worker
+        // threads have 512KB stacks — this MUST be on the heap.
+        const conns = self.allocator.create([MAX_CONNS]Connection) catch |err|
+            std.debug.panic("connection pool alloc failed: {}", .{err});
+        defer self.allocator.destroy(conns);
+        for (conns) |*c| c.reset();
 
         // Submit initial accept
         backend.submitAccept(listen_fd, ACCEPT_USER_DATA) catch |err|
@@ -199,20 +202,20 @@ pub const Server = struct {
             for (events[0..count]) |ev| {
                 if (ev.user_data == ACCEPT_USER_DATA) {
                     // Accept completion
-                    self.handleAcceptCompletion(&backend, &conns, listen_fd, ev);
+                    self.handleAcceptCompletion(&backend, conns, listen_fd, ev);
                 } else {
                     // Connection completion (recv or send)
                     const idx = @as(usize, @intCast(ev.user_data));
                     if (idx >= MAX_CONNS) {
                         std.debug.panic("completion user_data out of range: {}", .{idx});
                     }
-                    self.handleConnectionCompletion(&backend, &conns[idx], ev);
+                    self.handleConnectionCompletion(&backend, &conns.*[idx], ev);
                 }
             }
         }
 
         // Cleanup: close any open connections
-        for (&conns) |*c| {
+        for (conns) |*c| {
             if (c.state != .free) {
                 posix.close(c.fd);
                 c.reset();
@@ -233,7 +236,6 @@ pub const Server = struct {
                 std.debug.panic("re-submitAccept failed: {}", .{err});
         }
 
-        // Check if accept succeeded
         if (ev.result < 0) return; // accept error, skip
         const client_fd: posix.socket_t = @intCast(ev.result);
 
@@ -244,8 +246,7 @@ pub const Server = struct {
             return;
         };
 
-        // Initialize the connection and submit recv
-        const conn = &conns[slot_idx];
+        const conn = &conns.*[slot_idx];
         conn.fd = client_fd;
         conn.state = .reading;
         conn.resp_len = 0;
@@ -282,7 +283,6 @@ pub const Server = struct {
 
         const n: usize = @intCast(ev.result);
 
-        // Parse HTTP request and generate response
         var parse_buf: [8192]u8 = undefined;
         var parser = http1.Parser.init(&parse_buf);
         _ = parser.feed(conn.read_buf[0..n]) catch {

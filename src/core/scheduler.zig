@@ -242,7 +242,7 @@ test "scheduler spawn and dispatch via run" {
     // Start scheduler in a thread, let it dispatch and process
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 
@@ -283,7 +283,7 @@ test "scheduler dispatches to multiple workers" {
 
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 
@@ -340,7 +340,7 @@ test "scheduler metrics" {
 
     try s.spawnCoroutine(&f1);
     try s.spawnCoroutine(&f2);
-    _ = s.spawnCoroutine(&f3) catch {}; // backpressure
+    try testing.expectError(error.BackpressureFull, s.spawnCoroutine(&f3));
 
     s.cancelCoroutine(&f1);
 
@@ -476,7 +476,7 @@ test "edge: dispatch more frames than workers" {
 
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 
@@ -547,7 +547,7 @@ test "simplify: work processed even when one worker deque is full" {
 
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 
@@ -595,7 +595,7 @@ test "audit4: shutdown is the only way to stop, run owns pool lifecycle" {
     // Use a thread to run the scheduler
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 
@@ -659,7 +659,7 @@ test "audit: startup race — running stored before pool.start" {
     // The actual test: start run() in a thread, immediately shutdown.
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 
@@ -696,7 +696,7 @@ test "audit: dispatch more frames than workers drains all" {
 
     const t = try std.Thread.spawn(.{}, struct {
         fn entry(sched: *Scheduler(FakeIO)) void {
-            sched.run() catch {};
+            sched.run() catch unreachable;
         }
     }.entry, .{&s});
 

@@ -330,7 +330,7 @@ pub const FakeIO = struct {
 
     /// Inject a specific fault on the next operation matching the given fd.
     pub fn injectFault(self: *FakeIO, fd: i32, fault: Fault) void {
-        self.injected_faults.put(fd, fault) catch {};
+        self.injected_faults.put(fd, fault) catch unreachable;
     }
 
     /// Get count of pending operations (for testing).

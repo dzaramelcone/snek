@@ -93,12 +93,12 @@ pub fn Connection(comptime IO: type) type {
 
         pub fn setNodelay(self: *Self, enable: bool) !void {
             const val: c_int = if (enable) 1 else 0;
-            posix.setsockopt(self.socket.fd, posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(val)) catch |err| return err;
+            try posix.setsockopt(self.socket.fd, posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(val));
         }
 
         pub fn setKeepalive(self: *Self, enable: bool) !void {
             const val: c_int = if (enable) 1 else 0;
-            posix.setsockopt(self.socket.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(val)) catch |err| return err;
+            try posix.setsockopt(self.socket.fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(val));
         }
 
         /// Reset the per-request arena for the next request on a keepalive connection.
@@ -139,15 +139,15 @@ pub fn Listener(comptime IO: type) type {
         bound_addr: posix.sockaddr.in,
 
         pub fn listen(io: *IO, addr: []const u8, port: u16, config: TcpConfig) !Self {
-            const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |err| return err;
+            const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
             errdefer posix.close(fd);
 
             // SO_REUSEADDR — allow rapid rebind after restart
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch |err| return err;
+            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
             // SO_REUSEPORT if configured
             if (config.reuseport) {
-                posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1))) catch |err| return err;
+                try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             }
 
             // Parse address and bind
@@ -156,15 +156,15 @@ pub fn Listener(comptime IO: type) type {
                 .port = std.mem.nativeToBig(u16, port),
                 .addr = parseIpv4(addr),
             };
-            posix.bind(fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in)) catch |err| return err;
+            try posix.bind(fd, @ptrCast(&bind_addr), @sizeOf(posix.sockaddr.in));
 
             // Listen
-            posix.listen(fd, config.backlog) catch |err| return err;
+            try posix.listen(fd, config.backlog);
 
             // Retrieve actual bound address (needed when port=0)
             var bound: posix.sockaddr.in = undefined;
             var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            posix.getsockname(fd, @ptrCast(&bound), &len) catch |err| return err;
+            try posix.getsockname(fd, @ptrCast(&bound), &len);
 
             return .{
                 .socket = .{ .fd = fd },
@@ -177,7 +177,7 @@ pub fn Listener(comptime IO: type) type {
         pub fn accept(self: *Self, allocator: std.mem.Allocator) !Connection(IO) {
             var remote: posix.sockaddr.in = undefined;
             var remote_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            const accepted_fd = posix.accept(self.socket.fd, @ptrCast(&remote), &remote_len, 0) catch |err| return err;
+            const accepted_fd = try posix.accept(self.socket.fd, @ptrCast(&remote), &remote_len, 0);
 
             return Connection(IO).init(allocator, .{ .fd = accepted_fd }, self.io);
         }
@@ -195,7 +195,7 @@ pub fn Listener(comptime IO: type) type {
         /// On macOS/BSD, uses SO_REUSEPORT.
         pub fn setReuseport(self: *Self, enable: bool) !void {
             const val: c_int = if (enable) 1 else 0;
-            posix.setsockopt(self.socket.fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(val)) catch |err| return err;
+            try posix.setsockopt(self.socket.fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(val));
         }
     };
 }
