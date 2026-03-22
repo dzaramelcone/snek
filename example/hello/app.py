@@ -42,4 +42,5 @@ def health(request):
     return {"status": "ok"}
 
 
-app.run()
+if __name__ == "__main__":
+    app.run()
