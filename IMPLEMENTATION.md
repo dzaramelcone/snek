@@ -1217,3 +1217,12 @@ async def echo(ws):
 [2026-03-22] Phase 9: COMPLETE (essentials) — JSON + middleware. compress.zig and validate.zig deferred.
 [2026-03-22] Phase 9.4: server.zig — integrated multi-threaded HTTP server. Scheduler dispatches accepted connections to workers via deque/steal. Workers parse HTTP, route, respond. 5 integration tests with real TCP loopback. 7.9K req/sec at 5c (bottleneck: single-threaded accept loop).
 [2026-03-22] ═══ MILESTONE: snek serves hello world over HTTP (multi-threaded, work-stealing) ═══
+[2026-03-22] Phase 10.1: db/wire.zig — Postgres v3 wire protocol (startup, auth, query, row parsing, error fields). 32 tests.
+[2026-03-22] Phase 10.2: db/auth.zig — MD5 auth (md5(md5(pass+user)+salt)). 18 tests.
+[2026-03-22] Phase 10.3: db/query.zig — Client connect/query/close, simple query protocol. 96 tests (5 skipped without PG).
+[2026-03-22] Phase 10: COMPLETE — Postgres wire protocol, simple queries work against real PG.
+[2026-03-22] Phase 11.1: redis/protocol.zig — RESP3 encode/decode (all types + nested arrays). 16 tests.
+[2026-03-22] Phase 11.2: redis/connection.zig — Client with connect/command/close. 20 tests.
+[2026-03-22] Phase 11.3: redis/commands.zig — Typed GET/SET/DEL/PING. 28 tests.
+[2026-03-22] Phase 11: COMPLETE — Redis RESP3, commands work against real Redis.
+[2026-03-22] ═══ MILESTONE: Postgres and Redis work standalone ═══

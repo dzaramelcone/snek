@@ -1,91 +1,160 @@
-//! Single Redis connection: connect, authenticate, command, pipeline.
-//! Generic-over-IO for simulation testing.
+//! Single Redis connection: connect over TCP, send RESP3 commands, read responses.
+//! Uses std.posix for blocking TCP (no io_uring dependency for now).
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
-pub const ConnectionConfig = struct {
-    host: []const u8,
-    port: u16 = 6379,
-    password: ?[]const u8 = null,
-    username: ?[]const u8 = null,
-    db: u8 = 0,
-    timeout_ms: u32 = 5_000,
+/// Owns both the decoded value and the backing buffer that string slices point into.
+/// String slices in the RespValue point into raw_buf, so raw_buf must outlive
+/// any use of the value's string fields.
+pub const Response = struct {
+    value: protocol.RespValue,
+    /// The raw response bytes. String slices in .value point into this buffer.
+    raw_buf: []u8,
+    /// How many bytes of raw_buf are response data (rest is unused capacity).
+    raw_len: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Response) void {
+        protocol.freeValue(self.allocator, self.value);
+        self.allocator.free(self.raw_buf);
+    }
 };
 
-pub fn RedisConnection(comptime IO: type) type {
-    return struct {
-        const Self = @This();
+pub const Client = struct {
+    stream: std.net.Stream,
+    allocator: std.mem.Allocator,
+    read_buf: [4096]u8 = undefined,
 
-        io: *IO,
-        config: ConnectionConfig,
-        fd: i32,
-        connected: bool,
-        resp_version: u8,
+    /// Connect to a Redis server at host:port.
+    pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !Client {
+        const address = try std.net.Address.parseIp4(host, port);
+        const stream = try std.net.tcpConnectToAddress(address);
 
-        /// Connect to a Redis server.
-        pub fn connect(io: *IO, config: ConnectionConfig) !Self {
-            _ = .{ io, config };
-            return undefined;
+        return Client{
+            .stream = stream,
+            .allocator = allocator,
+        };
+    }
+
+    /// Send a command and read the response.
+    /// Caller must call .deinit() on the returned Response when done.
+    pub fn command(self: *Client, args: []const []const u8) !Response {
+        // Encode the command.
+        const encoded = try protocol.encode(self.allocator, args);
+        defer self.allocator.free(encoded);
+
+        // Write the command to the socket.
+        var written: usize = 0;
+        while (written < encoded.len) {
+            written += try self.stream.write(encoded[written..]);
         }
 
-        /// Disconnect and close the socket.
-        pub fn disconnect(self: *Self) void {
-            _ = .{self};
-        }
+        // Read the response. Accumulate data until we have a complete frame.
+        var response_buf: std.ArrayList(u8) = .{};
+        errdefer response_buf.deinit(self.allocator);
 
-        /// Authenticate with AUTH command (RESP3: supports username+password).
-        pub fn authenticate(self: *Self) !void {
-            _ = .{self};
-        }
+        while (true) {
+            const n = try self.stream.read(&self.read_buf);
+            if (n == 0) return error.ConnectionClosed;
+            try response_buf.appendSlice(self.allocator, self.read_buf[0..n]);
 
-        /// Switch to RESP3 protocol via HELLO 3.
-        pub fn hello(self: *Self) !void {
-            _ = .{self};
-        }
+            // Try to decode. If incomplete, read more.
+            const result = protocol.decode(self.allocator, response_buf.items) catch |err| {
+                if (err == error.Incomplete) continue;
+                return err;
+            };
 
-        /// Select a database.
-        pub fn selectDb(self: *Self, db: u8) !void {
-            _ = .{ self, db };
-        }
+            // Transfer ownership of the ArrayList's internal buffer to the Response.
+            // The decoded value's string slices point into response_buf.items,
+            // which is the same memory as the allocatedSlice. We hand that memory
+            // to Response so it stays valid.
+            const alloc_slice = response_buf.allocatedSlice();
+            // Disown from ArrayList so deinit won't free it.
+            response_buf.items = &.{};
+            response_buf.capacity = 0;
 
-        /// Send a command and read the response.
-        pub fn sendCommand(self: *Self, args: []const []const u8) !protocol.RespValue {
-            _ = .{ self, args };
-            return undefined;
+            return Response{
+                .value = result.value,
+                .raw_buf = alloc_slice,
+                .raw_len = result.consumed,
+                .allocator = self.allocator,
+            };
         }
+    }
 
-        /// Read a single RESP3 response from the connection.
-        pub fn readResponse(self: *Self) !protocol.RespValue {
-            _ = .{self};
-            return undefined;
-        }
+    /// Close the connection.
+    pub fn close(self: *Client) void {
+        self.stream.close();
+    }
+};
 
-        /// Pipeline: batch multiple commands, flush, then read all responses.
-        pub fn pipeline(self: *Self, commands: []const []const []const u8) ![]const protocol.RespValue {
-            _ = .{ self, commands };
-            return undefined;
-        }
+// ============================================================================
+// Tests -- unit tests that don't need a Redis server
+// ============================================================================
 
-        /// Flush all pending pipeline commands to the server.
-        pub fn flushPipeline(self: *Self) !void {
-            _ = .{self};
-        }
-
-        /// PING for health checking.
-        pub fn ping(self: *Self) !bool {
-            _ = .{self};
-            return undefined;
-        }
-    };
+test "Client struct is well-formed" {
+    const info = @typeInfo(Client);
+    try std.testing.expect(info == .@"struct");
 }
 
-test "connect and authenticate" {}
+// ============================================================================
+// Integration tests -- gated on Redis being available
+// ============================================================================
 
-test "send command" {}
+test "ping redis" {
+    const allocator = std.testing.allocator;
+    var client = Client.connect(allocator, "127.0.0.1", 6379) catch |err| {
+        if (err == error.ConnectionRefused) return error.SkipZigTest;
+        return err;
+    };
+    defer client.close();
 
-test "pipeline commands" {}
+    const args = [_][]const u8{"PING"};
+    var result = try client.command(&args);
+    defer result.deinit();
 
-test "RESP3 hello" {}
+    // Redis replies to PING with +PONG\r\n
+    try std.testing.expectEqualStrings("PONG", result.value.simple_string);
+}
 
-test "ping health check" {}
+test "set and get" {
+    const allocator = std.testing.allocator;
+    var client = Client.connect(allocator, "127.0.0.1", 6379) catch |err| {
+        if (err == error.ConnectionRefused) return error.SkipZigTest;
+        return err;
+    };
+    defer client.close();
+
+    // SET
+    const set_args = [_][]const u8{ "SET", "snek:test:key", "hello_snek" };
+    var set_result = try client.command(&set_args);
+    defer set_result.deinit();
+    try std.testing.expectEqualStrings("OK", set_result.value.simple_string);
+
+    // GET
+    const get_args = [_][]const u8{ "GET", "snek:test:key" };
+    var get_result = try client.command(&get_args);
+    defer get_result.deinit();
+    try std.testing.expectEqualStrings("hello_snek", get_result.value.bulk_string);
+
+    // DEL (cleanup)
+    const del_args = [_][]const u8{ "DEL", "snek:test:key" };
+    var del_result = try client.command(&del_args);
+    defer del_result.deinit();
+    try std.testing.expect(del_result.value.integer >= 1);
+}
+
+test "get nonexistent key returns null" {
+    const allocator = std.testing.allocator;
+    var client = Client.connect(allocator, "127.0.0.1", 6379) catch |err| {
+        if (err == error.ConnectionRefused) return error.SkipZigTest;
+        return err;
+    };
+    defer client.close();
+
+    const args = [_][]const u8{ "GET", "snek:test:nonexistent_key_xyz" };
+    var result = try client.command(&args);
+    defer result.deinit();
+    try std.testing.expectEqual(protocol.RespValue{ .null_value = {} }, result.value);
+}
