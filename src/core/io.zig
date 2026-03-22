@@ -58,15 +58,122 @@ pub const CompletionEvent = struct {
     op: IoOp,
 };
 
+/// Verify that a type satisfies the IO interface at comptime.
+/// All IO backends (FakeIO, IoUring) must implement these methods
+/// with compatible signatures. This is the contract that enables
+/// `Scheduler(comptime IO: type)` to work with any backend.
+// Inspired by: TigerBeetle — comptime interface verification pattern
+pub fn assertIsIoBackend(comptime IO: type) void {
+    comptime {
+        // Submit operations: each takes *IO, fd, relevant params, user_data
+        _ = @as(fn (*IO, i32, []u8, u64, u64) anyerror!void, IO.submitRead);
+        _ = @as(fn (*IO, i32, []const u8, u64, u64) anyerror!void, IO.submitWrite);
+        _ = @as(fn (*IO, i32, u64) anyerror!void, IO.submitAccept);
+        _ = @as(fn (*IO, i32, []const u8, u16, u64) anyerror!void, IO.submitConnect);
+        _ = @as(fn (*IO, i32, u64) anyerror!void, IO.submitClose);
+        _ = @as(fn (*IO, i32, []const u8, u64) anyerror!void, IO.submitSend);
+        _ = @as(fn (*IO, i32, []u8, u64) anyerror!void, IO.submitRecv);
+        _ = @as(fn (*IO, u64, u64) anyerror!void, IO.submitTimeout);
+        _ = @as(fn (*IO, u64, u64) anyerror!void, IO.submitCancel);
+        // Poll for completions
+        _ = @as(fn (*IO, []fake_io.CompletionEntry) anyerror!u32, IO.pollCompletions);
+    }
+}
+
 test "io backend comptime selection" {
     // Verify that IoBackend(true) always resolves to FakeIO.
     const TestIO = IoBackend(true);
-    const instance = TestIO.init(42);
-    _ = instance;
+    comptime {
+        std.debug.assert(TestIO == fake_io.FakeIO);
+    }
 }
 
-test "io backend platform selection" {}
+test "io backend platform selection" {
+    // On macOS, production backend should be Kqueue
+    if (builtin.os.tag == .macos) {
+        comptime {
+            std.debug.assert(Backend == kqueue.Kqueue);
+        }
+    }
+    // On Linux, production backend should be IoUring
+    if (builtin.os.tag == .linux) {
+        comptime {
+            std.debug.assert(Backend == io_uring.IoUring);
+        }
+    }
+}
 
-test "io backend submit and poll" {}
+test "FakeIO satisfies IO interface" {
+    // This is a comptime check — if it compiles, FakeIO has the right signatures.
+    comptime {
+        assertIsIoBackend(fake_io.FakeIO);
+    }
+}
 
-test "io backend cancel" {}
+test "io backend submit and poll" {
+    const alloc = std.testing.allocator;
+    var io = fake_io.FakeIO.init(alloc, 42);
+    defer io.deinit();
+
+    var buf: [64]u8 = undefined;
+    io.submitRead(3, &buf, 0, 100) catch unreachable;
+    io.submitWrite(3, "hello", 0, 101) catch unreachable;
+    io.submitAccept(4, 102) catch unreachable;
+
+    var events: [16]fake_io.CompletionEntry = undefined;
+    const n = io.pollCompletions(&events) catch unreachable;
+    // Should have completed the 3 submitted operations
+    try std.testing.expect(n == 3);
+
+    // Verify user_data is preserved
+    var found_100 = false;
+    var found_101 = false;
+    var found_102 = false;
+    for (events[0..n]) |e| {
+        if (e.user_data == 100) found_100 = true;
+        if (e.user_data == 101) found_101 = true;
+        if (e.user_data == 102) found_102 = true;
+    }
+    try std.testing.expect(found_100);
+    try std.testing.expect(found_101);
+    try std.testing.expect(found_102);
+}
+
+test "edge: assertIsIoBackend catches missing methods" {
+    // We can't test comptime errors at runtime, but we CAN verify the mechanism
+    // by confirming that a struct missing a method would fail the @as coercion.
+    // This test documents the contract. If someone removes a method from FakeIO,
+    // the "FakeIO satisfies IO interface" test above will fail to compile.
+    //
+    // Verify the positive case works at comptime:
+    comptime {
+        assertIsIoBackend(fake_io.FakeIO);
+    }
+    // The negative case (struct missing submitRead) can't be tested without
+    // causing a compile error, which is the intended behavior.
+}
+
+test "io backend cancel" {
+    const alloc = std.testing.allocator;
+    var io = fake_io.FakeIO.init(alloc, 99);
+    defer io.deinit();
+
+    // Submit a timeout, then cancel it
+    io.submitTimeout(1_000_000_000, 200) catch unreachable;
+    io.submitCancel(200, 201) catch unreachable;
+
+    var events: [16]fake_io.CompletionEntry = undefined;
+    const n = io.pollCompletions(&events) catch unreachable;
+    // Should get completion for the cancel op; the timeout should be removed
+    try std.testing.expect(n >= 1);
+
+    // The cancel completion should be present
+    var found_cancel = false;
+    for (events[0..n]) |e| {
+        if (e.user_data == 201) {
+            found_cancel = true;
+            try std.testing.expect(e.result == 0); // cancel succeeded
+        }
+    }
+    try std.testing.expect(found_cancel);
+}

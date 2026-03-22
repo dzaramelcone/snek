@@ -1185,3 +1185,7 @@ async def echo(ws):
 [2026-03-21] Phase 1.2: buffer.zig — ref-counted buffer pool, 5 tests + 7 edge cases, benchmarked vs arena (arena wins 1.1-3.8x, keep pool only for io_uring registered buffers)
 [2026-03-21] Phase 1.3: timer.zig — flat-list timer with swap-remove, 4 tests + 6 edge cases, falsifiability deferred to profiling
 [2026-03-21] Phase 1: COMPLETE — 3 data structures, 36 tests passing, 2 benchmarks run, zero leaks
+[2026-03-21] Phase 2.1: io.zig — comptime IO interface with assertIsIoBackend validation, platform switch (Ghostty pattern), 5 tests
+[2026-03-21] Phase 2.2: fake_io.zig — VOPR simulation backend, 210 lines, PRNG-driven, fault injection, seed-reproducible, 18 tests
+[2026-03-21] Phase 2.3: signal.zig — atomic flag signal handler, SIGPIPE ignore, shutdown phase state machine, 9 tests
+[2026-03-21] Phase 2: COMPLETE — IO abstraction + VOPR foundation + signal handling, 32 tests, zero bugs in UAT

@@ -36,6 +36,30 @@ Each must be verified before we rely on it.
 - **Benchmark**: Schedule N timers, measure tick() latency at N=100, 1000, 10000.
 - **Context**: snek will have request timeouts + keepalive timers. Hundreds, not millions.
 
+## Custom SignalHandler vs direct std.posix.sigaction — PENDING
+
+- **Claim**: A SignalHandler struct with shutdown phase state machine provides
+  cleaner lifecycle management than calling std.posix.sigaction directly.
+- **Source**: Ghostty's SIGPIPE ignore pattern, our own design.md §15.1.
+- **Alternative**: Just call `std.posix.sigaction` at startup to ignore SIGPIPE
+  and register SIGTERM/SIGINT handlers. Set an atomic bool. Check it in the
+  scheduler's main loop. No wrapper struct, no state machine.
+- **Threshold**: If the SignalHandler struct is > 80 lines and the phase state
+  machine isn't used by anything outside signal.zig, it's over-abstracted.
+  The scheduler (Phase 5) will own the actual shutdown sequence — signal.zig
+  just needs to set a flag.
+- **Context**: Signal handling is inherently simple — set a flag, check it in
+  the loop. The 8-step shutdown protocol lives in the scheduler, not in the
+  signal handler. The signal handler's only job is "flag was set."
+- **Research findings** (from refs/ analysis):
+  - TigerBeetle avoids signals entirely — pure event-based shutdown via io_uring
+  - Bun uses a dedicated signal-watcher thread with semaphore (most robust)
+  - http.zig's example is NOT async-signal-safe (calls server.stop() from handler)
+  - Linux signalfd() can deliver signals as io_uring completions — no handler needed
+  - Zig stdlib uses SA.RESETHAND to prevent recursive handler calls
+- **Best option for snek**: signalfd() + io_uring read = signals as completions.
+  Evaluate at Phase 3/5 when io_uring backend is integrated.
+
 ---
 
 ## Phase 0
