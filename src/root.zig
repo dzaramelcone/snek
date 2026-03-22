@@ -68,6 +68,8 @@ pub const http = struct {
     pub const validate = @import("http/validate.zig");
 };
 
+pub const server = @import("server.zig");
+
 pub const json = struct {
     pub const parse = @import("json/parse.zig");
     pub const serialize = @import("json/serialize.zig");

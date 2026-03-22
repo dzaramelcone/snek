@@ -96,6 +96,7 @@ pub fn build(b: *std.Build) void {
         "src/http/request.zig",
         "src/http/response.zig",
         "src/http/router.zig",
+        "src/server.zig",
         "src/http/middleware.zig",
         "src/http/cookies.zig",
         "src/http/compress.zig",

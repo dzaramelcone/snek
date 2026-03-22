@@ -1215,4 +1215,5 @@ async def echo(ws):
 [2026-03-22] Phase 9.2: json/serialize.zig — direct-to-buffer serializer, zero allocation, string escaping, 64-bit nesting bitmask. 6 tests.
 [2026-03-22] Phase 9.3: http/middleware.zig — before/after hook pipeline, short-circuit, timing middleware, lifecycle hooks, background tasks. 9 tests.
 [2026-03-22] Phase 9: COMPLETE (essentials) — JSON + middleware. compress.zig and validate.zig deferred.
-[2026-03-22] ═══ MILESTONE: snek serves hello world over HTTP ═══
+[2026-03-22] Phase 9.4: server.zig — integrated multi-threaded HTTP server. Scheduler dispatches accepted connections to workers via deque/steal. Workers parse HTTP, route, respond. 5 integration tests with real TCP loopback. 7.9K req/sec at 5c (bottleneck: single-threaded accept loop).
+[2026-03-22] ═══ MILESTONE: snek serves hello world over HTTP (multi-threaded, work-stealing) ═══

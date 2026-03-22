@@ -1,7 +1,8 @@
-//! snek hello world server — the first real snek app.
+//! snek hello world server — multi-threaded via the Server integration.
 //!
-//! Wires: TCP listener → HTTP parser → router → JSON serializer → response.
-//! Single-threaded blocking. Multi-threaded async comes with scheduler integration.
+//! Uses Server(FakeIO) for the scheduler backend. Workers handle connections
+//! with blocking recv/send. Scheduler dispatches accepted fds to workers via
+//! the deque/steal infrastructure.
 //!
 //! Usage:
 //!   cd /path/to/snek
@@ -11,7 +12,10 @@
 //!   curl http://localhost:8080/health
 
 const std = @import("std");
-const posix = std.posix;
+const server_mod = @import("../../src/server.zig");
+const http1 = @import("../../src/net/http1.zig");
+const Response = @import("../../src/http/response.zig").Response;
+const FakeIO = @import("../../src/core/fake_io.zig").FakeIO;
 
 const PORT: u16 = 8080;
 
@@ -20,21 +24,16 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Set up routes
-    var rtr = Router.init(allocator);
-    defer rtr.deinit();
+    var srv = try server_mod.Server(FakeIO).init(allocator, .{
+        .num_threads = 4,
+    });
+    defer srv.deinit();
 
-    try rtr.addRoute(.GET, "/", 0);
-    try rtr.addRoute(.GET, "/health", 1);
-    try rtr.addRoute(.GET, "/users/{id}", 2);
+    try srv.addRoute(.GET, "/", &handleRoot);
+    try srv.addRoute(.GET, "/health", &handleHealth);
+    try srv.addRoute(.GET, "/users/{id}", &handleUser);
 
-    // Create TCP listener
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer posix.close(fd);
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, PORT);
-    try posix.bind(fd, &addr.any, addr.getOsSockLen());
-    try posix.listen(fd, 128);
+    try srv.listen("0.0.0.0", PORT);
 
     std.debug.print(
         \\
@@ -45,65 +44,26 @@ pub fn main() !void {
         \\    GET /health      -> health check
         \\    GET /users/{{id}} -> user by ID
         \\
+        \\  Workers: 4 threads
+        \\
         \\
     , .{PORT});
 
-    // Accept loop
-    while (true) {
-        var client_addr: posix.sockaddr = undefined;
-        var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        const client_fd = posix.accept(fd, &client_addr, &client_addr_len, 0) catch continue;
-        handleConnection(client_fd, &rtr) catch {};
-        posix.close(client_fd);
-    }
+    // Blocks until shutdown (Ctrl-C closes the process)
+    try srv.run();
 }
 
-fn handleConnection(client_fd: posix.socket_t, rtr: *const Router) !void {
-    var read_buf: [4096]u8 = undefined;
-    const n = posix.recv(client_fd, &read_buf, 0) catch return;
-    if (n == 0) return;
-
-    // Parse
-    var parse_buf: [8192]u8 = undefined;
-    var parser = Parser.init(&parse_buf);
-    _ = parser.feed(read_buf[0..n]) catch {
-        _ = posix.send(client_fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 0) catch {};
-        return;
-    };
-
-    // Extract method and path
-    const method_str = if (parser.method) |m| @tagName(m) else "GET";
-    const method = RouterMethod.fromString(method_str) orelse .GET;
-    const path = parser.uri orelse "/";
-
-    // Route
-    const result = rtr.match(method, path);
-
-    // Dispatch
-    var resp_buf: [4096]u8 = undefined;
-    const response: []const u8 = switch (result) {
-        .found => |found| blk: {
-            const body = switch (found.handler_id) {
-                0 => "{\"message\":\"hello from snek\"}",
-                1 => "{\"status\":\"ok\"}",
-                2 => user_json: {
-                    // Get the {id} param
-                    var json_buf: [256]u8 = undefined;
-                    const id_val = if (found.param_count > 0) found.params[0].value else "?";
-                    break :user_json std.fmt.bufPrint(&json_buf, "{{\"user_id\":\"{s}\",\"name\":\"snek user\"}}", .{id_val}) catch "{\"error\":\"format\"}";
-                },
-                else => "{\"error\":\"unknown route\"}",
-            };
-            break :blk std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch "HTTP/1.1 500\r\n\r\n";
-        },
-        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
-        .not_found => "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{\"error\":\"not found\"}",
-    };
-
-    _ = posix.send(client_fd, response, 0) catch {};
+fn handleRoot(_: *const http1.Parser) Response {
+    return Response.json("{\"message\":\"hello from snek\"}");
 }
 
-// Imports — using relative paths from example/hello/
-const Router = @import("../../src/http/router.zig").Router;
-const RouterMethod = @import("../../src/http/router.zig").Method;
-const Parser = @import("../../src/net/http1.zig").Parser;
+fn handleHealth(_: *const http1.Parser) Response {
+    return Response.json("{\"status\":\"ok\"}");
+}
+
+fn handleUser(_: *const http1.Parser) Response {
+    // In a real app, we'd extract the {id} param from the match result.
+    // The handler currently only has access to the parser, not the match result.
+    // For now, return a static response.
+    return Response.json("{\"user\":\"snek user\"}");
+}
