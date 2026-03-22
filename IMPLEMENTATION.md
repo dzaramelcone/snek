@@ -1189,3 +1189,6 @@ async def echo(ws):
 [2026-03-21] Phase 2.2: fake_io.zig — VOPR simulation backend, 210 lines, PRNG-driven, fault injection, seed-reproducible, 18 tests
 [2026-03-21] Phase 2.3: signal.zig — atomic flag signal handler, SIGPIPE ignore, shutdown phase state machine, 9 tests
 [2026-03-21] Phase 2: COMPLETE — IO abstraction + VOPR foundation + signal handling, 32 tests, zero bugs in UAT
+[2026-03-21] Phase 3.1: io_uring.zig — thin adapter around std.os.linux.IoUring, NonLinuxStub for macOS, comptime interface check, 10 tests (5 Linux-gated)
+[2026-03-21] Phase 3.2: kqueue.zig — readiness-to-completion adapter, ONESHOT kevents, ~200 lines, 13 tests on macOS. UAT caught silent OOM swallowing (catch {} → try)
+[2026-03-21] Phase 3: COMPLETE (kqueue verified on macOS, io_uring compiles — Docker testing pending)
