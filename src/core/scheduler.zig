@@ -122,13 +122,11 @@ pub fn Scheduler(comptime IO: type) type {
             self.metrics.poll_count += 1;
         }
 
-        /// Run the scheduler. Starts the worker pool, loops tick(), and on exit
-        /// always completes the TLA+ lifecycle: start → stop → join → done.
-        /// (See specs/worker_lifecycle.tla MainStart → MainStop → MainJoin)
         /// Run the scheduler. Owns the full pool lifecycle:
         ///   pool.start() → loop tick() → pool.stop()
         /// This is the ONLY place pool start/stop happens.
         /// shutdown() and gracefulShutdown() signal via atomic flag only.
+        /// (See specs/scheduler.tla MainStart → MainShutdown → MainJoin)
         pub fn run(self: *Self) !void {
             // Store running=true BEFORE pool.start() to prevent the startup
             // race where shutdown() sets running=false between pool.start()

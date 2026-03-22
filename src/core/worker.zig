@@ -191,7 +191,7 @@ pub fn WorkerThread(comptime IO: type) type {
 }
 
 /// Worker pool parameterized on the IO backend type.
-/// Lifecycle states match the TLA+ spec (specs/worker_lifecycle.tla):
+/// Lifecycle states match the TLA+ spec (specs/scheduler.tla):
 ///   ready → started → stopping → stopped
 pub fn WorkerPool(comptime IO: type) type {
     return struct {
@@ -289,7 +289,7 @@ pub fn WorkerPool(comptime IO: type) type {
         /// Push work to a specific worker's deque and wake them.
         /// This pairs push + wake atomically, matching the TLA+ spec's
         /// requirement that WorkArrives + WakeWorker are coordinated.
-        /// (See specs/worker_lifecycle.tla:127 — liveness depends on pairing)
+        /// (See specs/scheduler.tla:127 — liveness depends on pairing)
         pub fn pushAndWake(self: *Self, worker_idx: u32, item: u64) void {
             self.workers[worker_idx].local_deque.push(item);
             self.workers[worker_idx].wake();

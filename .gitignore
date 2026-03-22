@@ -12,6 +12,9 @@ __pycache__/
 dist/
 build/
 
+# TLC model checker artifacts
+specs/states/
+
 # Reference repos — track INSIGHTS.md only, not cloned source
 refs/bun/*
 !refs/bun/INSIGHTS.md
