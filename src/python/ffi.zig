@@ -272,6 +272,25 @@ pub fn wrapVarArgs(comptime name: [*:0]const u8, comptime func: *const fn (?*PyO
     };
 }
 
+/// Wrap a Zig function as a METH_NOARGS method that receives the module object.
+/// The Zig function must accept *PyObject (the module) and return PythonError!*PyObject.
+/// Used with multi-phase init where self is the module with per-interpreter state.
+pub fn wrapNoArgsModule(comptime name: [*:0]const u8, comptime func: fn (*PyObject) PythonError!*PyObject) c.PyMethodDef {
+    return .{
+        .ml_name = name,
+        .ml_meth = &struct {
+            fn wrapper(self: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
+                return func(self.?) catch |err| {
+                    c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+                    return null;
+                };
+            }
+        }.wrapper,
+        .ml_flags = c.METH_NOARGS,
+        .ml_doc = null,
+    };
+}
+
 /// Python str check.
 pub fn isString(obj: *PyObject) bool {
     return c.PyUnicode_Check(obj) != 0;
@@ -324,21 +343,46 @@ pub fn objectStr(obj: *PyObject) PythonError!*PyObject {
 
 /// Create a PyModuleDef with the given name and methods table.
 /// The methods slice must be null-terminated (last entry all zeroes).
-pub fn moduleDef(name: [*:0]const u8, methods: [*]c.PyMethodDef) c.PyModuleDef {
+///
+/// For single-phase init: pass m_size = -1, slots = null, no GC callbacks.
+/// For multi-phase init (PEP 489): pass m_size = @sizeOf(State), slots = &slot_array,
+///   and GC callbacks (traverse/clear/free) for any PyObject* in the state.
+pub fn moduleDef(
+    name: [*:0]const u8,
+    methods: [*]c.PyMethodDef,
+    m_size: isize,
+    slots: ?[*]c.PyModuleDef_Slot,
+    traverse: c.traverseproc,
+    clear: c.inquiry,
+    free: c.freefunc,
+) c.PyModuleDef {
     return .{
         .m_base = std.mem.zeroes(c.PyModuleDef_Base),
         .m_name = name,
         .m_doc = null,
-        .m_size = -1,
+        .m_size = m_size,
         .m_methods = methods,
-        .m_slots = null,
-        .m_traverse = null,
-        .m_clear = null,
-        .m_free = null,
+        .m_slots = slots,
+        .m_traverse = traverse,
+        .m_clear = clear,
+        .m_free = free,
     };
 }
 
-/// Create a module from a PyModuleDef. Caller must decref the result.
+/// Initialize a multi-phase module definition (PEP 489).
+/// Returns a PyObject* that CPython uses to create the module per-interpreter.
+pub fn moduleDefInit(def: *c.PyModuleDef) ?*PyObject {
+    return c.PyModuleDef_Init(def);
+}
+
+/// Get the per-interpreter module state from a module object.
+/// Returns null if the module has no state (m_size <= 0).
+pub fn moduleGetState(mod: *PyObject) ?*anyopaque {
+    return c.PyModule_GetState(mod);
+}
+
+/// Create a module from a PyModuleDef (single-phase init).
+/// Caller must decref the result.
 pub fn createModule(def: *c.PyModuleDef) PythonError!*PyObject {
     return c.PyModule_Create(def) orelse return error.PythonError;
 }
@@ -536,7 +580,7 @@ test "wrapNoArgs produces valid method" {
         std.mem.zeroes(c.PyMethodDef),
     };
 
-    var def = moduleDef("test_wrap", &methods);
+    var def = moduleDef("test_wrap", &methods, -1, null, null, null, null);
     const mod = try createModule(&def);
     defer decref(mod);
 

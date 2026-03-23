@@ -440,10 +440,13 @@ pub fn invokePythonHandler(
     params: []const router_mod.PathParam,
     resp_body_buf: []u8,
 ) response_mod.Response {
-    const handler = module.getHandler(handler_id) orelse {
+    const mod = module.getCurrentModule() orelse {
         return response_mod.Response.init(500);
     };
-    const flags = module.getHandlerFlags(handler_id);
+    const handler = module.getHandler(mod, handler_id) orelse {
+        return response_mod.Response.init(500);
+    };
+    const flags = module.getHandlerFlags(mod, handler_id);
 
     // Acquire GIL for Python call
     var guard = gil.GilGuard.acquire();
@@ -563,14 +566,15 @@ fn installShutdownSignals() void {
 /// Start the HTTP server with Python handlers wired in.
 /// Called from _snek.run(host, port).
 pub fn startServer(host: []const u8, port: u16) !void {
+    const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
     var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 4 });
     defer srv.deinit();
     defer releaseCachedKeys();
 
     // Register all Python routes with the Zig router
     var i: u32 = 0;
-    while (i < module.getHandlerCount()) : (i += 1) {
-        const entry = module.getRouteEntry(i) orelse continue;
+    while (i < module.getHandlerCount(mod)) : (i += 1) {
+        const entry = module.getRouteEntry(mod, i) orelse continue;
         const method_slice = entry.method[0..entry.method_len];
         const method = router_mod.Method.fromString(method_slice) orelse continue;
         const path_slice = entry.path[0..entry.path_len];

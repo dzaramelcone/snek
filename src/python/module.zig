@@ -1,12 +1,11 @@
-//! _snek C extension module: the entry point for Python → Zig integration.
+//! _snek C extension module: multi-phase init (PEP 489).
 //!
 //! Exposes module-level functions to Python:
 //!   _snek.add_route(method, path, handler) — registers a route + Python callable
 //!   _snek.run(host, port)                  — starts the Zig HTTP server
 //!
-//! Under the hood, add_route stores the Python callable in a global route table.
-//! run() starts the Zig HTTP server, and for each request the server looks up
-//! the callable by handler_id and calls driver.invokePythonHandler().
+//! All per-interpreter state (handlers, routes, flags) lives in SnekModuleState,
+//! stored via PyModule_GetState. This supports sub-interpreters with per-interpreter GIL.
 
 const std = @import("std");
 const ffi = @import("ffi.zig");
@@ -14,18 +13,15 @@ const c = ffi.c;
 const PyObject = ffi.PyObject;
 const driver = @import("driver.zig");
 
-// ── Global route table ──────────────────────────────────────────────
+// ── Module state ────────────────────────────────────────────────────
 
 /// Maximum number of Python handlers that can be registered.
 const MAX_HANDLERS: usize = 64;
 
-/// Python callables stored by handler_id. Owned references (incref'd).
-var py_handlers: [MAX_HANDLERS]?*PyObject = .{null} ** MAX_HANDLERS;
-var py_handler_count: u32 = 0;
-
 /// Handler calling convention flags, determined at registration time
 /// by inspecting the Python handler's signature.
-pub const HandlerFlags = struct {
+/// extern struct for C ABI compatibility (embedded in SnekModuleState).
+pub const HandlerFlags = extern struct {
     /// Handler takes a single `request` dict argument (default)
     needs_request: bool = true,
     /// Handler takes named path params as **kwargs
@@ -37,37 +33,65 @@ pub const HandlerFlags = struct {
 };
 
 /// Route metadata stored alongside handlers for server setup.
-const RouteEntry = struct {
+/// extern struct for C ABI compatibility (embedded in SnekModuleState).
+pub const RouteEntry = extern struct {
     method: [8]u8,
     method_len: u8,
     path: [256]u8,
     path_len: u16,
 };
 
-var route_entries: [MAX_HANDLERS]RouteEntry = undefined;
-var handler_flags: [MAX_HANDLERS]HandlerFlags = .{HandlerFlags{}} ** MAX_HANDLERS;
+/// Per-interpreter module state. Stored via PyModule_GetState.
+/// All handler/route storage is per-interpreter, not global.
+pub const SnekModuleState = extern struct {
+    py_handlers: [MAX_HANDLERS]?*PyObject,
+    py_handler_count: u32,
+    handler_flags: [MAX_HANDLERS]HandlerFlags,
+    route_entries: [MAX_HANDLERS]RouteEntry,
+};
+
+/// Temporary global module reference. Set during pyRun so driver.startServer
+/// can access the module state. Will be replaced by per-worker interpreter
+/// state in the next refactor step.
+var g_current_module: ?*PyObject = null;
+
+/// Get the current module object. Used by driver.zig to access state
+/// during server operation (temporary — next step makes this per-worker).
+pub fn getCurrentModule() ?*PyObject {
+    return g_current_module;
+}
+
+/// Get module state from a module object.
+pub fn getState(mod: *PyObject) ?*SnekModuleState {
+    const raw = ffi.moduleGetState(mod) orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
 
 /// Get stored Python callable by handler_id.
-pub fn getHandler(handler_id: u32) ?*PyObject {
+pub fn getHandler(mod: *PyObject, handler_id: u32) ?*PyObject {
+    const state = getState(mod) orelse return null;
     if (handler_id >= MAX_HANDLERS) return null;
-    return py_handlers[handler_id];
+    return state.py_handlers[handler_id];
 }
 
 /// Get the current handler count.
-pub fn getHandlerCount() u32 {
-    return py_handler_count;
+pub fn getHandlerCount(mod: *PyObject) u32 {
+    const state = getState(mod) orelse return 0;
+    return state.py_handler_count;
 }
 
 /// Get route entry by handler_id.
-pub fn getRouteEntry(handler_id: u32) ?RouteEntry {
-    if (handler_id >= py_handler_count) return null;
-    return route_entries[handler_id];
+pub fn getRouteEntry(mod: *PyObject, handler_id: u32) ?RouteEntry {
+    const state = getState(mod) orelse return null;
+    if (handler_id >= state.py_handler_count) return null;
+    return state.route_entries[handler_id];
 }
 
 /// Get handler flags by handler_id.
-pub fn getHandlerFlags(handler_id: u32) HandlerFlags {
-    if (handler_id >= py_handler_count) return HandlerFlags{};
-    return handler_flags[handler_id];
+pub fn getHandlerFlags(mod: *PyObject, handler_id: u32) HandlerFlags {
+    const state = getState(mod) orelse return HandlerFlags{};
+    if (handler_id >= state.py_handler_count) return HandlerFlags{};
+    return state.handler_flags[handler_id];
 }
 
 // ── Handler introspection ───────────────────────────────────────────
@@ -174,9 +198,17 @@ fn isCoroutineFunction(obj: *PyObject) bool {
 /// _snek.add_route(method: str, path: str, handler: callable)
 ///
 /// Registers a Python handler for the given HTTP method + path.
-/// The handler must be a callable that accepts a request dict and returns
-/// a dict (JSON), string (text/plain), or tuple (status, body).
-fn pyAddRoute(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+/// In multi-phase init, self is the module object with per-interpreter state.
+fn pyAddRoute(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const mod = self_mod orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
+        return null;
+    };
+    const state: *SnekModuleState = getState(mod) orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
+        return null;
+    };
+
     const tuple = args orelse {
         c.PyErr_SetString(c.PyExc_TypeError, "add_route requires 3 arguments");
         return null;
@@ -226,12 +258,12 @@ fn pyAddRoute(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     }
 
     // Store handler
-    if (py_handler_count >= MAX_HANDLERS) {
+    if (state.py_handler_count >= MAX_HANDLERS) {
         c.PyErr_SetString(c.PyExc_RuntimeError, "too many handlers registered (max 64)");
         return null;
     }
 
-    const id = py_handler_count;
+    const id = state.py_handler_count;
 
     // Store route metadata
     const method_span = std.mem.span(method_str);
@@ -251,17 +283,16 @@ fn pyAddRoute(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     entry.method_len = @intCast(method_span.len);
     @memcpy(entry.path[0..path_span.len], path_span);
     entry.path_len = @intCast(path_span.len);
-    route_entries[id] = entry;
+    state.route_entries[id] = entry;
 
     // Incref the handler — we own a reference now
     ffi.incref(handler_obj);
-    py_handlers[id] = handler_obj;
+    state.py_handlers[id] = handler_obj;
 
     // Inspect handler signature to determine calling convention flags.
-    // Check __code__.co_argcount to decide what to pass at call time.
-    handler_flags[id] = inspectHandlerFlags(handler_obj);
+    state.handler_flags[id] = inspectHandlerFlags(handler_obj);
 
-    py_handler_count = id + 1;
+    state.py_handler_count = id + 1;
 
     return ffi.getNone();
 }
@@ -270,7 +301,12 @@ fn pyAddRoute(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 ///
 /// Starts the Zig HTTP server. Blocks until the server shuts down.
 /// Routes must be registered via add_route() before calling run().
-fn pyRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const mod = self_mod orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
+        return null;
+    };
+
     const tuple = args orelse {
         c.PyErr_SetString(c.PyExc_TypeError, "run requires 2 arguments");
         return null;
@@ -312,6 +348,10 @@ fn pyRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const host_span = std.mem.span(host_str);
     const port: u16 = @intCast(port_long);
 
+    // Set global module ref so driver can access state (temporary)
+    g_current_module = mod;
+    defer g_current_module = null;
+
     // Start the server with Python handlers wired in.
     // Release the GIL while the server runs (it will reacquire per-request).
     driver.startServer(host_span, port) catch {
@@ -322,32 +362,98 @@ fn pyRun(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     return ffi.getNone();
 }
 
-// ── Module definition ───────────────────────────────────────────────
+// ── Module definition (multi-phase init, PEP 489) ───────────────────
 
-fn pyGetRouteCountImpl() ffi.PythonError!*PyObject {
-    return ffi.longFromLong(@intCast(py_handler_count));
+fn pyGetRouteCountImpl(mod: *PyObject) ffi.PythonError!*PyObject {
+    const state = getState(mod) orelse return error.PythonError;
+    return ffi.longFromLong(@intCast(state.py_handler_count));
 }
 
 var methods = [_]c.PyMethodDef{
     ffi.wrapVarArgs("add_route", &pyAddRoute),
     ffi.wrapVarArgs("run", &pyRun),
-    ffi.wrapNoArgs("get_route_count", pyGetRouteCountImpl),
+    ffi.wrapNoArgsModule("get_route_count", pyGetRouteCountImpl),
     std.mem.zeroes(c.PyMethodDef), // sentinel
 };
 
-var module_def = ffi.moduleDef("_snek", &methods);
+// ── Py_mod_exec slot: initialize module state ───────────────────────
+
+fn snekModuleExec(mod: ?*PyObject) callconv(.c) c_int {
+    const m = mod orelse return -1;
+    const state: *SnekModuleState = getState(m) orelse return -1;
+    state.py_handlers = .{null} ** MAX_HANDLERS;
+    state.py_handler_count = 0;
+    state.handler_flags = .{HandlerFlags{}} ** MAX_HANDLERS;
+    // route_entries don't need zeroing — only valid up to py_handler_count
+    return 0;
+}
+
+// ── GC callbacks for PyObject references in module state ────────────
+
+fn snekModuleTraverse(mod: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const m = mod orelse return 0;
+    const state: *SnekModuleState = getState(m) orelse return 0;
+    var i: u32 = 0;
+    while (i < state.py_handler_count) : (i += 1) {
+        if (state.py_handlers[i]) |handler| {
+            const vret = visit.?(@ptrCast(@constCast(handler)), arg);
+            if (vret != 0) return vret;
+        }
+    }
+    return 0;
+}
+
+fn snekModuleClear(mod: ?*PyObject) callconv(.c) c_int {
+    const m = mod orelse return 0;
+    const state: *SnekModuleState = getState(m) orelse return 0;
+    var i: u32 = 0;
+    while (i < MAX_HANDLERS) : (i += 1) {
+        if (state.py_handlers[i]) |handler| {
+            state.py_handlers[i] = null;
+            ffi.decref(handler);
+        }
+    }
+    state.py_handler_count = 0;
+    return 0;
+}
+
+fn snekModuleFree(mod_ptr: ?*anyopaque) callconv(.c) void {
+    if (mod_ptr) |ptr| {
+        const mod: *PyObject = @ptrCast(@alignCast(ptr));
+        _ = snekModuleClear(mod);
+    }
+}
+
+// ── Module slots (multi-phase init) ─────────────────────────────────
+
+var module_slots = [_]c.PyModuleDef_Slot{
+    .{ .slot = c.Py_mod_exec, .value = @ptrCast(@constCast(&snekModuleExec)) },
+    .{ .slot = c.Py_mod_multiple_interpreters, .value = c.Py_MOD_PER_INTERPRETER_GIL_SUPPORTED },
+    .{ .slot = 0, .value = null }, // sentinel
+};
+
+var module_def = ffi.moduleDef(
+    "_snek",
+    &methods,
+    @sizeOf(SnekModuleState),
+    &module_slots,
+    &snekModuleTraverse,
+    &snekModuleClear,
+    &snekModuleFree,
+);
 
 /// CPython calls this when `import _snek` executes.
+/// Multi-phase init: returns the module definition, not a created module.
 pub export fn PyInit__snek() ?*PyObject {
-    return ffi.createModule(&module_def) catch null;
+    return ffi.moduleDefInit(&module_def);
 }
 
 // ── Registration for embedded interpreter ───────────────────────────
 
 /// Register the _snek module as a built-in so the embedded interpreter
 /// can import it. Must be called BEFORE Py_Initialize().
+/// PyImport_AppendInittab works with multi-phase init.
 pub fn registerBuiltin() void {
-    // PyImport_AppendInittab adds our init function to the built-in module table.
     _ = c.PyImport_AppendInittab("_snek", &pyInitSnek);
 }
 
@@ -357,16 +463,18 @@ fn pyInitSnek() callconv(.c) ?*PyObject {
 
 // ── Cleanup ─────────────────────────────────────────────────────────
 
-/// Release all stored Python handler references.
-pub fn releaseHandlers() void {
-    for (&py_handlers, 0..) |*h, i| {
-        if (h.*) |obj| {
-            ffi.decref(obj);
-            h.* = null;
+/// Release all stored Python handler references for a given module.
+pub fn releaseHandlers(mod: *PyObject) void {
+    const state = getState(mod) orelse return;
+    var i: u32 = 0;
+    while (i < MAX_HANDLERS) : (i += 1) {
+        if (state.py_handlers[i]) |handler| {
+            ffi.decref(handler);
+            state.py_handlers[i] = null;
         }
-        handler_flags[i] = HandlerFlags{};
+        state.handler_flags[i] = HandlerFlags{};
     }
-    py_handler_count = 0;
+    state.py_handler_count = 0;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -375,11 +483,11 @@ test "module registers and imports" {
     registerBuiltin();
     ffi.init();
     defer ffi.deinit();
-    defer releaseHandlers();
 
     // Import the module
     const mod = try ffi.importModule("_snek");
     defer ffi.decref(mod);
+    defer releaseHandlers(mod);
 
     // Verify get_route_count works
     const func = try ffi.getAttr(mod, "get_route_count");
@@ -394,7 +502,10 @@ test "add_route stores handler" {
     registerBuiltin();
     ffi.init();
     defer ffi.deinit();
-    defer releaseHandlers();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
 
     // Register a lambda handler via Python
     try ffi.runString(
@@ -402,12 +513,13 @@ test "add_route stores handler" {
         \\_snek.add_route("GET", "/test", lambda req: {"status": "ok"})
     );
 
-    // Verify handler count
-    std.testing.expectEqual(@as(u32, 1), py_handler_count) catch unreachable;
-    std.testing.expect(py_handlers[0] != null) catch unreachable;
+    // Verify handler count via module state
+    const state = getState(mod).?;
+    std.testing.expectEqual(@as(u32, 1), state.py_handler_count) catch unreachable;
+    std.testing.expect(state.py_handlers[0] != null) catch unreachable;
 
     // Verify route metadata
-    const entry = route_entries[0];
+    const entry = state.route_entries[0];
     std.testing.expect(std.mem.eql(u8, entry.method[0..entry.method_len], "GET")) catch unreachable;
     std.testing.expect(std.mem.eql(u8, entry.path[0..entry.path_len], "/test")) catch unreachable;
 }
@@ -416,7 +528,10 @@ test "add_route rejects non-callable" {
     registerBuiltin();
     ffi.init();
     defer ffi.deinit();
-    defer releaseHandlers();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
 
     // This should raise TypeError in Python
     const err = ffi.runString(
@@ -430,7 +545,10 @@ test "add_route multiple routes" {
     registerBuiltin();
     ffi.init();
     defer ffi.deinit();
-    defer releaseHandlers();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
 
     try ffi.runString(
         \\import _snek
@@ -439,18 +557,19 @@ test "add_route multiple routes" {
         \\_snek.add_route("GET", "/users/{id}", lambda req, **kw: {"id": kw.get("id")})
     );
 
-    std.testing.expectEqual(@as(u32, 3), py_handler_count) catch unreachable;
+    const state = getState(mod).?;
+    std.testing.expectEqual(@as(u32, 3), state.py_handler_count) catch unreachable;
 
     // Check each route entry
-    const e0 = route_entries[0];
+    const e0 = state.route_entries[0];
     std.testing.expect(std.mem.eql(u8, e0.method[0..e0.method_len], "GET")) catch unreachable;
     std.testing.expect(std.mem.eql(u8, e0.path[0..e0.path_len], "/")) catch unreachable;
 
-    const e1 = route_entries[1];
+    const e1 = state.route_entries[1];
     std.testing.expect(std.mem.eql(u8, e1.method[0..e1.method_len], "POST")) catch unreachable;
     std.testing.expect(std.mem.eql(u8, e1.path[0..e1.path_len], "/users")) catch unreachable;
 
-    const e2 = route_entries[2];
+    const e2 = state.route_entries[2];
     std.testing.expect(std.mem.eql(u8, e2.method[0..e2.method_len], "GET")) catch unreachable;
     std.testing.expect(std.mem.eql(u8, e2.path[0..e2.path_len], "/users/{id}")) catch unreachable;
 }
@@ -459,15 +578,19 @@ test "call stored handler" {
     registerBuiltin();
     ffi.init();
     defer ffi.deinit();
-    defer releaseHandlers();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
 
     try ffi.runString(
         \\import _snek
         \\_snek.add_route("GET", "/hello", lambda req: {"message": "hello from python"})
     );
 
-    // Get the handler and call it directly
-    const handler = py_handlers[0].?;
+    // Get the handler via state
+    const state = getState(mod).?;
+    const handler = state.py_handlers[0].?;
 
     // Build a request dict
     const req = try ffi.dictNew();
