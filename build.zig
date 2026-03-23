@@ -1,12 +1,17 @@
 const std = @import("std");
-
-const py_include = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14";
-const py_lib = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib";
+const builtin = @import("builtin");
 
 fn linkPython(m: *std.Build.Module) void {
-    m.addIncludePath(.{ .cwd_relative = py_include });
-    m.addLibraryPath(.{ .cwd_relative = py_lib });
+    const os = m.resolved_target.?.result.os.tag;
+    if (os == .macos) {
+        m.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14" });
+        m.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib" });
+    } else {
+        m.addIncludePath(.{ .cwd_relative = "sysroot/linux-aarch64/include/python3.14" });
+        m.addLibraryPath(.{ .cwd_relative = "sysroot/linux-aarch64/lib" });
+    }
     m.linkSystemLibrary("python3.14", .{});
+    m.link_libc = true;
 }
 
 pub fn build(b: *std.Build) void {
