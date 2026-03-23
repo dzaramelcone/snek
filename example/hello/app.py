@@ -1,4 +1,4 @@
-"""snek hello world — @app.get style decorators."""
+"""snek hello world — async handlers with redis."""
 
 from snek import App
 
@@ -7,7 +7,7 @@ app = App()
 
 @app.get("/")
 async def hello():
-    return {"message": "hello from snek python"}
+    return {"message": "hello from snek"}
 
 
 @app.get("/health")
@@ -22,19 +22,19 @@ async def greet(name: str):
 
 @app.get("/redis-ping")
 async def redis_ping():
-    result = app.redis("PING")
+    result = await app.redis.ping()
     return {"redis": result}
 
 
 @app.get("/redis-set/{key}/{value}")
 async def redis_set(key: str, value: str):
-    result = app.redis("SET", key, value)
+    result = await app.redis.set(key, value)
     return {"set": result}
 
 
 @app.get("/redis-get/{key}")
 async def redis_get(key: str):
-    val = app.redis("GET", key)
+    val = await app.redis.get(key)
     return {"key": key, "value": val.decode() if isinstance(val, bytes) else val}
 
 
