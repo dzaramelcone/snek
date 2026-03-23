@@ -1,50 +1,36 @@
 //! Stackless async runtime — implements io.Runtime.
 //!
 //! Everything is a task driven by completions. No stack allocation.
-//! Uses tardy's Async (kqueue/io_uring/epoll) for I/O submission and reaping.
-//! call_soon uses a zero-delay timer so all tasks flow through one path.
+//! Uses tardy's Async for I/O and Pool for task management.
 
 const std = @import("std");
 const io = @import("io.zig");
 const aio_lib = @import("vendor/tardy/aio/lib.zig");
 const Async = aio_lib.Async;
+const tardy = @import("vendor/tardy/lib.zig");
+const Pool = tardy.Pool;
 
 const Task = struct {
     ctx: *anyopaque = undefined,
     step: io.StepFn = undefined,
-    active: bool = false,
 };
 
 pub const Stackless = struct {
     aio: Async,
     allocator: std.mem.Allocator,
-    tasks: []Task,
-    free_list: std.ArrayList(io.TaskId),
+    tasks: Pool(Task),
     running: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator, aio: Async, max_tasks: u32) !Stackless {
-        const tasks = try allocator.alloc(Task, max_tasks);
-        @memset(tasks, .{});
-
-        var free_list: std.ArrayList(io.TaskId) = .{};
-        try free_list.ensureTotalCapacity(allocator, max_tasks);
-        var i: io.TaskId = max_tasks;
-        while (i > 0) {
-            i -= 1;
-            free_list.appendAssumeCapacity(i);
-        }
-
+    pub fn init(allocator: std.mem.Allocator, aio: Async, initial_tasks: u32) !Stackless {
         return .{
             .aio = aio,
             .allocator = allocator,
-            .tasks = tasks,
-            .free_list = free_list,
+            .tasks = try Pool(Task).init(allocator, initial_tasks, .grow),
         };
     }
 
     pub fn deinit(self: *Stackless) void {
-        self.free_list.deinit(self.allocator);
-        self.allocator.free(self.tasks);
+        self.tasks.deinit();
     }
 
     pub fn runtime(self: *Stackless) io.Runtime {
@@ -67,15 +53,14 @@ pub const Stackless = struct {
 
     fn registerImpl(ptr: *anyopaque, ctx: *anyopaque, step_fn: io.StepFn) !io.TaskId {
         const s = cast(ptr);
-        const id = s.free_list.popOrNull() orelse return error.TaskPoolExhausted;
-        s.tasks[id] = .{ .ctx = ctx, .step = step_fn, .active = true };
-        return id;
+        const id = try s.tasks.borrow();
+        const task = s.tasks.get_ptr(id);
+        task.* = .{ .ctx = ctx, .step = step_fn };
+        return @intCast(id);
     }
 
     fn releaseImpl(ptr: *anyopaque, id: io.TaskId) void {
-        const s = cast(ptr);
-        s.tasks[id].active = false;
-        s.free_list.append(s.allocator, id) catch {};
+        cast(ptr).tasks.release(id);
     }
 
     fn submitImpl(ptr: *anyopaque, id: io.TaskId, job: io.AsyncSubmission) !void {
@@ -84,8 +69,9 @@ pub const Stackless = struct {
 
     fn callSoonImpl(ptr: *anyopaque, ctx: *anyopaque, step_fn: io.StepFn) !void {
         const s = cast(ptr);
-        const id = s.free_list.popOrNull() orelse return error.TaskPoolExhausted;
-        s.tasks[id] = .{ .ctx = ctx, .step = step_fn, .active = true };
+        const id = try s.tasks.borrow();
+        const task = s.tasks.get_ptr(id);
+        task.* = .{ .ctx = ctx, .step = step_fn };
         try s.aio.queue_job(id, .{ .timer = .{ .seconds = 0, .nanos = 0 } });
     }
 
@@ -103,9 +89,9 @@ pub const Stackless = struct {
                 }
 
                 const id: io.TaskId = @intCast(c.task);
-                if (id >= s.tasks.len or !s.tasks[id].active) continue;
+                if (!s.tasks.dirty.isSet(id)) continue;
 
-                const task = &s.tasks[id];
+                const task = s.tasks.get_ptr(id);
                 if (task.step(task.ctx, id, c.result)) |next_job| {
                     try s.aio.queue_job(id, next_job);
                 }

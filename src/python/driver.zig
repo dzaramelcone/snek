@@ -545,30 +545,13 @@ fn installShutdownSignals() void {
 }
 
 pub fn startServer(host: []const u8, port: u16) !void {
-    const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
-
-    var srv = server_mod.Server.init(std.heap.smp_allocator, .{
-        .host = host,
-        .port = port,
-    });
-    defer srv.deinit();
-
-    var i: u32 = 0;
-    while (i < module.getHandlerCount(mod)) : (i += 1) {
-        const entry = module.getRouteEntry(mod, i) orelse continue;
-        const method_slice = entry.method[0..entry.method_len];
-        const method = router_mod.Method.fromString(method_slice) orelse continue;
-        const path_slice = entry.path[0..entry.path_len];
-        try srv.addPythonRoute(method, path_slice, i);
-    }
-
-    if (module.getModuleRef(mod)) |ref| {
-        srv.setModuleRef(ref);
-    }
+    _ = module.getCurrentModule() orelse return error.ModuleNotSet;
 
     installShutdownSignals();
     _ = gil.PyEval_SaveThread();
-    try srv.run();
+
+    const server2 = @import("../server2.zig");
+    try server2.run(std.heap.smp_allocator, host, port);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

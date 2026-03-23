@@ -1,10 +1,13 @@
-//! snek HTTP server — stackless, built on io.Runtime.
+//! snek HTTP server — stackless runtime with ZeroCopy provisions.
 
 const std = @import("std");
 const io = @import("io.zig");
 const Socket = @import("socket.zig").Socket;
 const Stackless = @import("runtime.zig").Stackless;
 const Acceptor = @import("acceptor.zig").Acceptor;
+const Provision = @import("connection.zig").Provision;
+const tardy = @import("vendor/tardy/lib.zig");
+const Pool = tardy.Pool;
 
 const aio_lib = @import("vendor/tardy/aio/lib.zig");
 const completion_mod = @import("vendor/tardy/aio/completion.zig");
@@ -31,6 +34,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
 }
 
 fn threadMain(allocator: std.mem.Allocator, listen_socket: Socket) !void {
+    // AIO backend
     const AioType = aio_lib.async_to_type(aio_lib.auto_async_match());
     var aio_inner = try allocator.create(AioType);
     aio_inner.* = try AioType.init(allocator, .{
@@ -43,13 +47,20 @@ fn threadMain(allocator: std.mem.Allocator, listen_socket: Socket) !void {
     const completions = try allocator.alloc(completion_mod.Completion, 1024);
     aio.attach(completions);
 
+    // Stackless runtime
     var stackless = try Stackless.init(allocator, aio, 65536);
     defer stackless.deinit();
     const rt = stackless.runtime();
 
+    // Provision pool — grows on demand, reused across connections
+    var provisions = try Pool(Provision).init(allocator, 256, .grow);
+    defer provisions.deinit();
+
+    // Acceptor
     var acceptor = Acceptor{
         .listen_socket = listen_socket,
         .rt = rt,
+        .provisions = &provisions,
         .allocator = allocator,
     };
     const accept_id = try rt.register(@ptrCast(&acceptor), Acceptor.step);

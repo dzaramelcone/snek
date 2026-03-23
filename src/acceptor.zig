@@ -1,13 +1,16 @@
-//! Accept state machine — one per thread, spawns connections.
+//! Accept state machine — borrows provisions from pool, spawns connections.
 
 const std = @import("std");
 const io = @import("io.zig");
 const Socket = @import("socket.zig").Socket;
-const Connection = @import("connection.zig").Connection;
+const Provision = @import("connection.zig").Provision;
+const tardy = @import("vendor/tardy/lib.zig");
+const Pool = tardy.Pool;
 
 pub const Acceptor = struct {
     listen_socket: Socket,
     rt: io.Runtime,
+    provisions: *Pool(Provision),
     allocator: std.mem.Allocator,
 
     pub fn step(ctx: *anyopaque, id: io.TaskId, result: io.Result) ?io.AsyncSubmission {
@@ -23,9 +26,14 @@ pub const Acceptor = struct {
     }
 
     fn spawnConnection(self: *Acceptor, fd: std.posix.socket_t) !void {
-        const conn = try self.allocator.create(Connection);
-        conn.* = .{ .fd = fd };
-        const conn_id = try self.rt.register(@ptrCast(conn), Connection.step);
-        try self.rt.submit(conn_id, conn.recvSubmission());
+        const idx = try self.provisions.borrow();
+        const prov = self.provisions.get_ptr(idx);
+        try prov.ensureInit(self.allocator);
+        try prov.reset();
+        prov.fd = fd;
+
+        const task_id = try self.rt.register(@ptrCast(prov), Provision.step);
+        prov.task_id = task_id;
+        try self.rt.submit(task_id, (Socket{ .handle = fd, .addr = undefined }).recvSubmission(prov.recv_slice));
     }
 };
