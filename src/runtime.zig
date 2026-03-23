@@ -1,8 +1,8 @@
 //! Stackless async runtime — implements io.Runtime.
 //!
-//! Everything is a task — I/O operations, callbacks, timers.
-//! Tasks are state machines driven by completions. No stack allocation.
+//! Everything is a task driven by completions. No stack allocation.
 //! Uses tardy's Async (kqueue/io_uring/epoll) for I/O submission and reaping.
+//! call_soon uses a zero-delay timer so all tasks flow through one path.
 
 const std = @import("std");
 const io = @import("io.zig");
@@ -20,7 +20,6 @@ pub const Stackless = struct {
     allocator: std.mem.Allocator,
     tasks: []Task,
     free_list: std.ArrayList(io.TaskId),
-    ready: std.ArrayList(io.TaskId),
     running: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, aio: Async, max_tasks: u32) !Stackless {
@@ -40,13 +39,11 @@ pub const Stackless = struct {
             .allocator = allocator,
             .tasks = tasks,
             .free_list = free_list,
-            .ready = .{},
         };
     }
 
     pub fn deinit(self: *Stackless) void {
         self.free_list.deinit(self.allocator);
-        self.ready.deinit(self.allocator);
         self.allocator.free(self.tasks);
     }
 
@@ -89,26 +86,13 @@ pub const Stackless = struct {
         const s = cast(ptr);
         const id = s.free_list.popOrNull() orelse return error.TaskPoolExhausted;
         s.tasks[id] = .{ .ctx = ctx, .step = step_fn, .active = true };
-        try s.ready.append(s.allocator, id);
+        try s.aio.queue_job(id, .{ .timer = .{ .seconds = 0, .nanos = 0 } });
     }
 
     fn runImpl(ptr: *anyopaque) !void {
         const s = cast(ptr);
 
         while (s.running) {
-            // Run ready tasks (call_soon, etc.)
-            while (s.ready.items.len > 0) {
-                const id = s.ready.pop();
-                if (!s.tasks[id].active) continue;
-                const task = &s.tasks[id];
-                if (task.step(task.ctx, id, .none)) |next_job| {
-                    try s.aio.queue_job(id, next_job);
-                } else {
-                    s.tasks[id].active = false;
-                    s.free_list.append(s.allocator, id) catch {};
-                }
-            }
-
             try s.aio.submit();
             const completions = try s.aio.reap(true);
 
