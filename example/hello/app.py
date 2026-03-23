@@ -6,17 +6,17 @@ app = App()
 
 
 @app.get("/")
-def hello(request):
+async def hello(request):
     return {"message": "hello from snek python"}
 
 
 @app.get("/health")
-def health(request):
+async def health(request):
     return {"status": "ok"}
 
 
 @app.get("/greet/{name}")
-def greet(request):
+async def greet(request):
     name = request["params"]["name"]
     return {"message": f"hello {name}"}
 

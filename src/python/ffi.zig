@@ -120,6 +120,34 @@ pub fn errPrint() void {
     c.PyErr_Print();
 }
 
+/// Fetch and clear the current exception. Returns (type, value, traceback).
+/// Caller must decref all non-null returned objects.
+pub fn errFetch() struct { exc_type: ?*PyObject, exc_value: ?*PyObject, exc_tb: ?*PyObject } {
+    var t: ?*PyObject = null;
+    var v: ?*PyObject = null;
+    var tb: ?*PyObject = null;
+    c.PyErr_Fetch(&t, &v, &tb);
+    return .{ .exc_type = t, .exc_value = v, .exc_tb = tb };
+}
+
+/// Check if an object is a coroutine (from async def).
+pub fn isCoroutine(obj: *PyObject) bool {
+    return c.PyCoro_CheckExact(obj) != 0;
+}
+
+/// Call a method by name on an object with one argument.
+/// Caller must decref the result.
+pub fn callMethod1(obj: *PyObject, method: [*:0]const u8, arg: *PyObject) PythonError!*PyObject {
+    return c.PyObject_CallMethod(obj, method, "O", arg) orelse {
+        return error.CallError;
+    };
+}
+
+/// Get the StopIteration exception's .value attribute.
+pub fn stopIterationValue(exc_value: *PyObject) ?*PyObject {
+    return c.PyObject_GetAttrString(exc_value, "value");
+}
+
 // ── Object creation helpers ─────────────────────────────────────────
 
 pub fn longFromLong(v: c_long) PythonError!*PyObject {

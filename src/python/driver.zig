@@ -408,16 +408,42 @@ pub fn invokePythonHandler(
         return response_mod.Response.init(500);
     };
 
-    const py_result = ffi.callObject(handler, call_args) catch {
+    const call_result = ffi.callObject(handler, call_args) catch {
         ffi.decref(call_args);
-        // Python exception — return 500 with error info
         if (ffi.errOccurred()) ffi.errPrint();
         return response_mod.Response.init(500);
     };
-    defer ffi.decref(py_result);
     ffi.decref(call_args);
 
-    // Convert Python return value to HTTP response
+    // If the handler is async def, we get a coroutine — drive it to completion
+    const py_result = if (ffi.isCoroutine(call_result)) blk: {
+        const none = ffi.getNone();
+        defer ffi.decref(none);
+        // send(None) starts the coroutine. For non-yielding async defs,
+        // this raises StopIteration immediately with the return value.
+        if (ffi.callMethod1(call_result, "send", none)) |unexpected| {
+            // Coroutine yielded instead of returning — not supported yet
+            ffi.decref(unexpected);
+            ffi.decref(call_result);
+            return response_mod.Response.init(501);
+        } else |_| {
+            // Expected: StopIteration raised, extract .value
+            const exc = ffi.errFetch();
+            defer {
+                if (exc.exc_type) |t| ffi.decref(t);
+                if (exc.exc_tb) |tb| ffi.decref(tb);
+            }
+            ffi.decref(call_result);
+            if (exc.exc_value) |val| {
+                const result = ffi.stopIterationValue(val) orelse val;
+                if (result != val) ffi.decref(val);
+                break :blk result;
+            }
+            return response_mod.Response.init(500);
+        }
+    } else call_result;
+    defer ffi.decref(py_result);
+
     return convertPythonResponse(py_result, resp_body_buf) catch {
         return response_mod.Response.init(500);
     };
