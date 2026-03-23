@@ -58,6 +58,13 @@ pub const CompletionEvent = struct {
     op: IoOp,
 };
 
+/// Uniform IO backend configuration. Each backend uses what it needs.
+pub const IoConfig = struct {
+    allocator: std.mem.Allocator = std.heap.smp_allocator,
+    id: u64 = 0,
+    ring_size: u32 = 256,
+};
+
 /// Verify that a type satisfies the IO interface at comptime.
 /// All IO backends (FakeIO, IoUring) must implement these methods
 /// with compatible signatures. This is the contract that enables
@@ -65,6 +72,8 @@ pub const CompletionEvent = struct {
 // Inspired by: TigerBeetle — comptime interface verification pattern
 pub fn assertIsIoBackend(comptime IO: type) void {
     comptime {
+        // Uniform init/deinit
+        _ = @as(fn (IoConfig) anyerror!IO, IO.init);
         // Submit operations: each takes *IO, fd, relevant params, user_data
         _ = @as(fn (*IO, i32, []u8, u64, u64) anyerror!void, IO.submitRead);
         _ = @as(fn (*IO, i32, []const u8, u64, u64) anyerror!void, IO.submitWrite);
@@ -112,7 +121,7 @@ test "FakeIO satisfies IO interface" {
 
 test "io backend submit and poll" {
     const alloc = std.testing.allocator;
-    var io = fake_io.FakeIO.init(alloc, 42);
+    var io = fake_io.FakeIO.init(.{ .allocator = alloc, .id = 42 });
     defer io.deinit();
 
     var buf: [64]u8 = undefined;
@@ -155,7 +164,7 @@ test "edge: assertIsIoBackend catches missing methods" {
 
 test "io backend cancel" {
     const alloc = std.testing.allocator;
-    var io = fake_io.FakeIO.init(alloc, 99);
+    var io = fake_io.FakeIO.init(.{ .allocator = alloc, .id = 99 });
     defer io.deinit();
 
     // Submit a timeout, then cancel it

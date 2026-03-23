@@ -44,7 +44,7 @@ pub fn WorkerThread(comptime IO: type) type {
             var self = Self{
                 .id = id,
                 .local_deque = try deque.ChaseLevDeque(u64).init(allocator, cfg.deque_capacity),
-                .io = IO.init(allocator, id),
+                .io = try IO.init(.{ .allocator = allocator, .id = id }),
                 .running = std.atomic.Value(bool).init(false),
                 .park_state = std.atomic.Value(u32).init(0),
                 .config = cfg,

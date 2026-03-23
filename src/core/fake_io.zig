@@ -61,20 +61,20 @@ pub const FakeIO = struct {
     injected_faults: std.AutoHashMap(i32, Fault),
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, seed: u64) FakeIO {
+    pub fn init(cfg: @import("io.zig").IoConfig) FakeIO {
         return .{
-            .prng = std.Random.DefaultPrng.init(seed),
+            .prng = std.Random.DefaultPrng.init(cfg.id),
             .current_time_ns = 0,
             .fault_config = .{},
             .pending = .{},
             .next_fake_fd = 100,
-            .injected_faults = std.AutoHashMap(i32, Fault).init(allocator),
-            .allocator = allocator,
+            .injected_faults = std.AutoHashMap(i32, Fault).init(cfg.allocator),
+            .allocator = cfg.allocator,
         };
     }
 
     pub fn initWithFaults(allocator: Allocator, seed: u64, config: FaultConfig) FakeIO {
-        var result = init(allocator, seed);
+        var result = init(.{ .allocator = allocator, .id = seed });
         result.fault_config = config;
         return result;
     }
@@ -349,7 +349,7 @@ test "fake io deterministic replay" {
 
     for (seeds) |seed| {
         // Run 1
-        var io1 = FakeIO.init(alloc, seed);
+        var io1 = FakeIO.init(.{ .allocator = alloc, .id = seed });
         defer io1.deinit();
 
         var buf1: [32]u8 = undefined;
@@ -361,7 +361,7 @@ test "fake io deterministic replay" {
         const n1 = io1.pollCompletions(&events1) catch unreachable;
 
         // Run 2 — same seed, same operations
-        var io2 = FakeIO.init(alloc, seed);
+        var io2 = FakeIO.init(.{ .allocator = alloc, .id = seed });
         defer io2.deinit();
 
         var buf2: [32]u8 = undefined;
@@ -389,7 +389,7 @@ test "fake io deterministic replay" {
 
 test "fake io fault injection" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 42);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 42 });
     defer fio.deinit();
 
     // Inject a drop fault on fd 5
@@ -442,7 +442,7 @@ test "fake io storage fault" {
 
 test "fake io simulated time" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 42);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 42 });
     defer fio.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), fio.currentTime());
@@ -476,7 +476,7 @@ test "fake io same interface as real io" {
 
 test "fake io accept returns incrementing fds" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     fio.submitAccept(4, 1) catch unreachable;
@@ -495,7 +495,7 @@ test "fake io accept returns incrementing fds" {
 
 test "fake io empty poll returns zero" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     var events: [16]CompletionEntry = undefined;
@@ -505,7 +505,7 @@ test "fake io empty poll returns zero" {
 
 test "fake io cancel nonexistent is still ok" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     // Cancel something that doesn't exist — should still produce a cancel completion
@@ -519,7 +519,7 @@ test "fake io cancel nonexistent is still ok" {
 
 test "fake io events buffer smaller than pending" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     // Submit 5 ops but only provide space for 2
@@ -544,7 +544,7 @@ test "fake io events buffer smaller than pending" {
 
 test "edge: pollCompletions with zero-length events buffer" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     fio.submitClose(1, 1) catch unreachable;
@@ -560,7 +560,7 @@ test "edge: pollCompletions with zero-length events buffer" {
 
 test "edge: submit 1000 ops, poll with buffer of 1" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     for (0..1000) |i| {
@@ -579,7 +579,7 @@ test "edge: submit 1000 ops, poll with buffer of 1" {
 
 test "edge: two submits with same user_data, cancel removes first" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     fio.submitClose(1, 42) catch unreachable;
@@ -608,7 +608,7 @@ test "edge: two submits with same user_data, cancel removes first" {
 
 test "edge: advanceTime by u64 max — wrapping" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     fio.advanceTime(100);
@@ -622,7 +622,7 @@ test "edge: advanceTime by u64 max — wrapping" {
 
 test "edge: injectFault on fd with no pending ops — no crash" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     // Inject fault for fd that has no pending ops
@@ -642,7 +642,7 @@ test "edge: injectFault on fd with no pending ops — no crash" {
 
 test "edge: multiple faults on same fd — last one wins" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 0);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 0 });
     defer fio.deinit();
 
     fio.injectFault(5, .drop);
@@ -663,9 +663,9 @@ test "edge: PRNG determinism with different fault configs" {
     // Two runs with same seed but different fault configs should diverge in PRNG state
     // when faults are checked — but operations that don't trigger fault checks should
     // still be deterministic
-    var fio1 = FakeIO.init(alloc, 42);
+    var fio1 = FakeIO.init(.{ .allocator = alloc, .id = 42 });
     defer fio1.deinit();
-    var fio2 = FakeIO.init(alloc, 42);
+    var fio2 = FakeIO.init(.{ .allocator = alloc, .id = 42 });
     defer fio2.deinit();
 
     // accept doesn't check any faults, so both should produce identical results
@@ -683,7 +683,7 @@ test "edge: PRNG determinism with different fault configs" {
 
 test "fake io connection reset fault" {
     const alloc = std.testing.allocator;
-    var fio = FakeIO.init(alloc, 42);
+    var fio = FakeIO.init(.{ .allocator = alloc, .id = 42 });
     defer fio.deinit();
 
     fio.injectFault(7, .connection_reset);

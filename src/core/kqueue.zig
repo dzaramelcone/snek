@@ -39,7 +39,8 @@ pub const Kqueue = struct {
     immediate: std.ArrayList(CompletionEntry),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) !Kqueue {
+    pub fn init(cfg: @import("io.zig").IoConfig) !Kqueue {
+        const allocator = cfg.allocator;
         const kq = blk: {
             const ret = std.c.kqueue();
             if (ret == -1) return error.KqueueCreateFailed;

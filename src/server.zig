@@ -20,19 +20,22 @@ const http1 = @import("net/http1.zig");
 const response_mod = @import("http/response.zig");
 const io_mod = @import("core/io.zig");
 const fake_io = @import("core/fake_io.zig");
-// Python imports are lazy — only resolved when Python handler paths are used.
-// This allows the pure-Zig benchmark to compile without Python linkage.
-const py_driver = struct {
-    const mod = @import("python/driver.zig");
-};
-const subinterp = struct {
-    const mod = @import("python/subinterp.zig");
-};
+// Python handler invocation is injected via function pointer — no compile-time
+// dependency on Python. This lets the pure-Zig benchmark build without Python.
 
 const IO = io_mod.Backend;
 const CompletionEntry = fake_io.CompletionEntry;
 
 pub const HandlerFn = *const fn (*const http1.Parser) response_mod.Response;
+
+/// Python handler invocation function type. Injected by driver.zig at startup.
+/// Opaque context pointer is per-worker (sub-interpreter or null for shared GIL).
+pub const PyHandlerFn = *const fn (py_ctx: ?*anyopaque, handler_id: u32, parser: *const http1.Parser, params: []const router_mod.PathParam, buf: []u8) response_mod.Response;
+
+/// Worker context factory: creates a per-worker Python context (sub-interpreter).
+pub const WorkerCtxInitFn = *const fn (module_ref: []const u8) ?*anyopaque;
+/// Worker context destructor.
+pub const WorkerCtxDeinitFn = *const fn (ctx: *anyopaque) void;
 
 pub const Config = struct {
     num_threads: u32 = 0, // 0 = auto-detect CPU count
@@ -84,6 +87,10 @@ pub const Server = struct {
     /// "module:attr" ref for sub-interpreters to re-import the user app.
     module_ref: [256]u8,
     module_ref_len: u16,
+    /// Injected Python handler functions (null when running pure Zig).
+    py_handler_fn: ?PyHandlerFn,
+    worker_ctx_init: ?WorkerCtxInitFn,
+    worker_ctx_deinit: ?WorkerCtxDeinitFn,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const num_threads = if (config.num_threads == 0)
@@ -105,6 +112,9 @@ pub const Server = struct {
             .workers = &.{},
             .module_ref = .{0} ** 256,
             .module_ref_len = 0,
+            .py_handler_fn = null,
+            .worker_ctx_init = null,
+            .worker_ctx_deinit = null,
         };
     }
 
@@ -217,17 +227,16 @@ pub const Server = struct {
     }
 
     fn workerAcceptLoop(self: *Server, listen_fd: posix.socket_t, is_main_thread: bool) void {
-        // Sub-interpreter setup for worker threads with Python handlers
-        var worker_ctx: ?subinterp.mod.WorkerPyContext = null;
-        if (self.hasSubInterpreters() and !is_main_thread) {
-            worker_ctx = subinterp.mod.WorkerPyContext.init(
-                self.module_ref[0..self.module_ref_len],
-            ) catch |err| {
-                std.log.err("sub-interpreter init failed: {}", .{err});
-                return;
-            };
+        // Per-worker Python context (sub-interpreter) — created via injected factory
+        var worker_py_ctx: ?*anyopaque = null;
+        if (self.worker_ctx_init) |init_fn| {
+            if (!is_main_thread) {
+                worker_py_ctx = init_fn(self.module_ref[0..self.module_ref_len]);
+            }
         }
-        defer if (worker_ctx) |*ctx| ctx.deinit();
+        defer if (worker_py_ctx) |ctx| {
+            if (self.worker_ctx_deinit) |deinit_fn| deinit_fn(ctx);
+        };
 
         var backend = initBackend(self.allocator);
         defer backend.deinit();
@@ -266,7 +275,7 @@ pub const Server = struct {
                     if (idx >= MAX_CONNS) {
                         std.debug.panic("completion user_data out of range: {}", .{idx});
                     }
-                    self.handleConnectionCompletion(&backend, &conns.*[idx], ev, if (worker_ctx) |*ctx| ctx else null);
+                    self.handleConnectionCompletion(&backend, &conns.*[idx], ev, worker_py_ctx);
                 }
             }
         }
@@ -296,6 +305,9 @@ pub const Server = struct {
         if (ev.result < 0) return; // accept error, skip
         const client_fd: posix.socket_t = @intCast(ev.result);
 
+        // Disable Nagle — send responses immediately, don't wait to coalesce
+        posix.setsockopt(client_fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+
         // Find a free connection slot
         const slot_idx = findFreeSlot(conns) orelse {
             // No free slots — drop the connection
@@ -317,10 +329,10 @@ pub const Server = struct {
         backend: *IO,
         conn: *Connection,
         ev: CompletionEntry,
-        worker_ctx: ?*subinterp.mod.WorkerPyContext,
+        py_ctx: ?*anyopaque,
     ) void {
         switch (conn.state) {
-            .reading => self.handleRecvCompletion(backend, conn, ev, worker_ctx),
+            .reading => self.handleRecvCompletion(backend, conn, ev, py_ctx),
             .writing => handleSendCompletion(backend, conn, ev),
             .closing => conn.reset(),
             .free => std.debug.panic("completion on free connection slot", .{}),
@@ -332,7 +344,7 @@ pub const Server = struct {
         backend: *IO,
         conn: *Connection,
         ev: CompletionEntry,
-        worker_ctx: ?*subinterp.mod.WorkerPyContext,
+        py_ctx: ?*anyopaque,
     ) void {
         // recv error or EOF
         if (ev.result <= 0) {
@@ -369,22 +381,16 @@ pub const Server = struct {
                     // Check for Python handler first
                     if (self.py_handler_ids[found.handler_id]) |py_id| {
                         var py_body_buf: [4096]u8 = undefined;
-                        var resp = if (worker_ctx) |ctx|
-                            // Sub-interpreter path: use worker's own interpreter
-                            ctx.invokePythonHandler(
+                        var resp = if (self.py_handler_fn) |handler_fn|
+                            handler_fn(
+                                py_ctx,
                                 py_id,
                                 &parser,
                                 found.params[0..found.param_count],
                                 &py_body_buf,
                             )
                         else
-                            // Main thread / legacy path: shared GIL
-                            py_driver.mod.invokePythonHandler(
-                                py_id,
-                                &parser,
-                                found.params[0..found.param_count],
-                                &py_body_buf,
-                            );
+                            response_mod.Response.init(501);
                         _ = resp.setHeader("Connection", "close");
                         const resp_n = resp.serialize(&conn.resp_buf) catch |err|
                             std.debug.panic("serialize failed: {}", .{err});
@@ -445,16 +451,8 @@ fn findFreeSlot(conns: *[MAX_CONNS]Connection) ?usize {
 /// Initialize the platform IO backend.
 /// Kqueue takes an allocator; IoUring takes a RingConfig.
 fn initBackend(allocator: std.mem.Allocator) IO {
-    if (comptime builtin.os.tag == .macos) {
-        return IO.init(allocator) catch |err|
-            std.debug.panic("kqueue init failed: {}", .{err});
-    } else if (comptime builtin.os.tag == .linux) {
-        const io_uring_mod = @import("core/io_uring.zig");
-        return IO.init(io_uring_mod.RingConfig{ .ring_size = 256, .allocator = allocator }) catch |err|
-            std.debug.panic("io_uring init failed: {}", .{err});
-    } else {
-        @compileError("unsupported platform");
-    }
+    return IO.init(.{ .allocator = allocator }) catch |err|
+        std.debug.panic("IO backend init failed: {}", .{err});
 }
 
 fn createListenSocket(addr: []const u8, port: u16) !posix.socket_t {

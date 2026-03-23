@@ -94,17 +94,13 @@ const LinuxIoUring = struct {
     timeout_storage: [16]linux.kernel_timespec = undefined,
     timeout_count: u8 = 0,
 
-    pub fn init(cfg: RingConfig) !LinuxIoUring {
-        var flags: u32 = 0;
-        if (cfg.sqpoll) {
-            flags |= linux.IORING_SETUP_SQPOLL;
-        }
-        const ring = linux.IoUring.init(@intCast(cfg.ring_size), flags) catch |err| {
+    pub fn init(cfg: @import("io.zig").IoConfig) !LinuxIoUring {
+        const ring = linux.IoUring.init(@intCast(cfg.ring_size), 0) catch |err| {
             return err;
         };
         return .{
             .ring = ring,
-            .config = cfg,
+            .config = .{ .ring_size = cfg.ring_size, .allocator = cfg.allocator },
         };
     }
 
@@ -188,20 +184,27 @@ const LinuxIoUring = struct {
         };
     }
 
+    /// Submit pending SQEs and collect completions.
+    /// TigerBeetle pattern: submit non-blocking first, peek for CQEs.
+    /// Only block (wait_nr=1) when the caller has no work to do.
     pub fn pollCompletions(self: *LinuxIoUring, events: []fake_io.CompletionEntry) !u32 {
         if (events.len == 0) return 0;
-        // Allocate temporary CQE buffer on the stack (bounded by events.len, max 256).
         const max_cqes = @min(events.len, 256);
         var cqe_buf: [256]linux.io_uring_cqe = undefined;
         const cqes = cqe_buf[0..max_cqes];
 
-        // Submit pending SQEs and wait for at least 1 completion in a
-        // SINGLE io_uring_enter syscall. This replaces the old pattern of
-        // submit() + copy_cqes(0) which made 2 syscalls and spun when idle.
-        _ = try self.ring.submit_and_wait(1);
-        const count = try self.ring.copy_cqes(cqes, 0);
+        // Non-blocking submit: flush all queued SQEs without waiting.
+        _ = try self.ring.submit();
 
-        // Translate from linux.io_uring_cqe to our CompletionEntry format.
+        // Peek for completions (no syscall if nothing ready).
+        var count = try self.ring.copy_cqes(cqes, 0);
+
+        // If nothing ready, block for at least 1 completion.
+        if (count == 0) {
+            _ = try self.ring.submit_and_wait(1);
+            count = try self.ring.copy_cqes(cqes, 0);
+        }
+
         for (0..count) |i| {
             events[i] = .{
                 .user_data = cqes[i].user_data,
@@ -210,9 +213,7 @@ const LinuxIoUring = struct {
             };
         }
 
-        // Reset timeout storage after polling (timeouts are one-shot).
         self.timeout_count = 0;
-
         return count;
     }
 

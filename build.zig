@@ -47,7 +47,11 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // --- Zig benchmark server (uses snek module, needs Python for compilation) ---
+    // --- Pure Zig benchmark server (no Python dependency) ---
+    const snek_core = b.addModule("snek_core", .{
+        .root_source_file = b.path("src/server_only.zig"),
+        .target = target,
+    });
     const bench_zig = b.addExecutable(.{
         .name = "bench-zig",
         .root_module = b.createModule(.{
@@ -55,7 +59,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "snek", .module = mod },
+                .{ .name = "snek", .module = snek_core },
             },
         }),
     });
