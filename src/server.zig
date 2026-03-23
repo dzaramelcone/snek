@@ -42,6 +42,7 @@ const ConnState = enum {
     free, // slot is unused
     reading, // waiting for recv to complete
     writing, // waiting for send to complete
+    closing, // waiting for async close to complete
 };
 
 const Connection = struct {
@@ -281,7 +282,8 @@ pub const Server = struct {
     ) void {
         switch (conn.state) {
             .reading => self.handleRecvCompletion(backend, conn, ev),
-            .writing => handleSendCompletion(conn, ev),
+            .writing => handleSendCompletion(backend, conn, ev),
+            .closing => conn.reset(),
             .free => std.debug.panic("completion on free connection slot", .{}),
         }
     }
@@ -374,10 +376,11 @@ pub const Server = struct {
             std.debug.panic("submitSend failed: {}", .{err});
     }
 
-    fn handleSendCompletion(conn: *Connection, ev: CompletionEntry) void {
-        _ = ev; // send result doesn't matter — we close regardless
-        posix.close(conn.fd);
-        conn.reset();
+    fn handleSendCompletion(backend: *IO, conn: *Connection, ev: CompletionEntry) void {
+        // Send done — submit async close instead of blocking posix.close
+        conn.state = .closing;
+        backend.submitClose(conn.fd, ev.user_data) catch |err|
+            std.debug.panic("submitClose failed: {}", .{err});
     }
 
 };
