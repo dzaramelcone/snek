@@ -1,19 +1,7 @@
-//! Python handler driver: the bridge between Zig HTTP and Python handlers.
+//! Python handler driver: bridge between Zig HTTP and Python handlers.
 //!
-//! When a request comes in:
-//!   1. Zig parses HTTP, matches route → gets handler_id
-//!   2. Acquire GIL
-//!   3. Build a Python dict for the request (method, path, headers, body, params)
-//!   4. Call the Python handler: result = handler(request_dict)
-//!   5. Convert the Python return value to an HTTP response
-//!   6. Release GIL
-//!   7. Send the response
-//!
-//! For minimum viable: synchronous handlers only (no async def yet).
-//!
-//! Sources:
-//!   - Sentinel/trap-based coroutine driving from curio
-//!     (src/python/REFERENCES_eventloop.md — curio is the intellectual ancestor)
+//! Builds request dicts, invokes handlers, drives coroutines, converts responses.
+//! GIL management is the caller's responsibility (each sub-interpreter owns its GIL).
 
 const std = @import("std");
 const ffi = @import("ffi.zig");
@@ -24,15 +12,6 @@ const module = @import("module.zig");
 const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
-
-// ── Dict key helpers ────────────────────────────────────────────────
-// With sub-interpreters each interpreter has its own PyObject space, so
-// pre-interned key caching across interpreters is invalid. We use
-// PyDict_SetItemString (creates a temporary each call) which is correct
-// for both the main interpreter and any sub-interpreter.
-
-/// No-op — cached key cleanup removed (sub-interpreter safe).
-pub fn releaseCachedKeys() void {}
 
 // ── Request dict builder ────────────────────────────────────────────
 
@@ -106,25 +85,9 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
         try ffi.dictSetItemString(dict, "body", none);
     }
 
-    // Path params
     if (params.len > 0) {
-        const params_dict = try ffi.dictNew();
+        const params_dict = try buildParamsKwargs(params);
         defer ffi.decref(params_dict);
-        for (params) |p| {
-            var pname_buf: [256:0]u8 = undefined;
-            if (p.name.len >= pname_buf.len) continue;
-            @memcpy(pname_buf[0..p.name.len], p.name);
-            pname_buf[p.name.len] = 0;
-
-            var pval_buf: [1024:0]u8 = undefined;
-            if (p.value.len >= pval_buf.len) continue;
-            @memcpy(pval_buf[0..p.value.len], p.value);
-            pval_buf[p.value.len] = 0;
-
-            const pval_obj = try ffi.unicodeFromString(pval_buf[0..p.value.len :0]);
-            defer ffi.decref(pval_obj);
-            try ffi.dictSetItemString(params_dict, pname_buf[0..p.name.len :0], pval_obj);
-        }
         try ffi.dictSetItemString(dict, "params", params_dict);
     }
 
@@ -201,7 +164,7 @@ pub fn convertPythonResponse(py_result: *PyObject, resp_body_buf: []u8) ffi.Pyth
     }
 
     // Fallback: str() the object
-    const str_result = ffi.objectStr(py_result) catch return error.ConversionError;
+    const str_result = try ffi.objectStr(py_result);
     defer ffi.decref(str_result);
     const text = try pyObjToString(str_result, resp_body_buf);
     return response_mod.Response.text(text);
@@ -217,7 +180,7 @@ fn pyObjToString(obj: *PyObject, buf: []u8) ffi.PythonError![]const u8 {
         return buf[0..span.len];
     }
     // Not a string — try str()
-    const str_obj = ffi.objectStr(obj) catch return error.ConversionError;
+    const str_obj = try ffi.objectStr(obj);
     defer ffi.decref(str_obj);
     const s = try ffi.unicodeAsUTF8(str_obj);
     const span = std.mem.span(s);
@@ -398,57 +361,36 @@ fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
     }
 
     // Fallback: str() then quote
-    const str_obj = ffi.objectStr(obj) catch return error.ConversionError;
+    const str_obj = try ffi.objectStr(obj);
     defer ffi.decref(str_obj);
     try writeJsonValue(str_obj, buf, pos);
 }
 
 // ── Python handler invocation ───────────────────────────────────────
 
-/// Invoke the Python handler for the given handler_id with the parsed request.
-/// Acquires and releases the GIL. Returns an HTTP response.
-///
-/// This is called from the Zig server's request handling path.
-/// Uses handler_flags (inspected at registration time) to skip work:
-///   - no_args: call handler() with no arguments, skip dict building entirely
-///   - needs_params: call handler(**kwargs) with path params as keyword args
-///   - needs_request (default): build full request dict, call handler(request)
+/// Invoke a Python handler. Caller must hold the GIL and provide the _snek module.
 pub fn invokePythonHandler(
+    mod: *PyObject,
     handler_id: u32,
     parser: *const http1.Parser,
     params: []const router_mod.PathParam,
     resp_body_buf: []u8,
 ) response_mod.Response {
-    const mod = module.getCurrentModule() orelse {
+    const handler = module.getHandler(mod, handler_id) orelse
         return response_mod.Response.init(500);
-    };
-    const handler = module.getHandler(mod, handler_id) orelse {
-        return response_mod.Response.init(500);
-    };
     const flags = module.getHandlerFlags(mod, handler_id);
 
-    // Acquire GIL for Python call
-    var guard = gil.GilGuard.acquire();
-    defer guard.release();
-
-    // Dispatch based on handler flags
     const call_result = if (flags.no_args) blk: {
-        // Handler takes no arguments — skip dict building entirely
         break :blk ffi.callObject(handler, null) catch {
             if (ffi.errOccurred()) ffi.errPrint();
             return response_mod.Response.init(500);
         };
     } else if (flags.needs_params) blk: {
-        // Handler takes named params as kwargs — inject path params directly
-        const empty_args = ffi.tupleNew(0) catch {
-            return response_mod.Response.init(500);
-        };
+        const empty_args = ffi.tupleNew(0) catch return response_mod.Response.init(500);
         defer ffi.decref(empty_args);
 
         if (params.len > 0) {
-            const kwargs = buildParamsKwargs(params) catch {
-                return response_mod.Response.init(500);
-            };
+            const kwargs = buildParamsKwargs(params) catch return response_mod.Response.init(500);
             defer ffi.decref(kwargs);
             break :blk ffi.callObjectKwargs(handler, empty_args, kwargs) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
@@ -461,21 +403,14 @@ pub fn invokePythonHandler(
             };
         }
     } else blk: {
-        // Default: build full request dict
-        const req_dict = buildRequestDict(parser, params) catch {
-            return response_mod.Response.init(500);
-        };
+        const req_dict = buildRequestDict(parser, params) catch return response_mod.Response.init(500);
         defer ffi.decref(req_dict);
-
-        const call_args = ffi.tupleNew(1) catch {
-            return response_mod.Response.init(500);
-        };
+        const call_args = ffi.tupleNew(1) catch return response_mod.Response.init(500);
         ffi.incref(req_dict);
         ffi.tupleSetItem(call_args, 0, req_dict) catch {
             ffi.decref(call_args);
             return response_mod.Response.init(500);
         };
-
         const result = ffi.callObject(handler, call_args) catch {
             ffi.decref(call_args);
             if (ffi.errOccurred()) ffi.errPrint();
@@ -485,19 +420,15 @@ pub fn invokePythonHandler(
         break :blk result;
     };
 
-    // If the handler is async def, we get a coroutine — drive it to completion
+    // Drive coroutines (async def) to completion
     const py_result = if (ffi.isCoroutine(call_result)) blk: {
         const none = ffi.getNone();
         defer ffi.decref(none);
-        // send(None) starts the coroutine. For non-yielding async defs,
-        // this raises StopIteration immediately with the return value.
         if (ffi.callMethod1(call_result, "send", none)) |unexpected| {
-            // Coroutine yielded instead of returning — not supported yet
             ffi.decref(unexpected);
             ffi.decref(call_result);
             return response_mod.Response.init(501);
         } else |_| {
-            // Expected: StopIteration raised, extract .value
             const exc = ffi.errFetch();
             defer {
                 if (exc.exc_type) |t| ffi.decref(t);
@@ -514,19 +445,7 @@ pub fn invokePythonHandler(
     } else call_result;
     defer ffi.decref(py_result);
 
-    return convertPythonResponse(py_result, resp_body_buf) catch {
-        return response_mod.Response.init(500);
-    };
-}
-
-fn pyHandlerBridge(
-    _: ?*anyopaque,
-    handler_id: u32,
-    parser: *const http1.Parser,
-    params: []const router_mod.PathParam,
-    buf: []u8,
-) response_mod.Response {
-    return invokePythonHandler(handler_id, parser, params, buf);
+    return convertPythonResponse(py_result, resp_body_buf) catch response_mod.Response.init(500);
 }
 
 // ── Server startup ──────────────────────────────────────────────────
@@ -534,11 +453,9 @@ fn pyHandlerBridge(
 const server_mod = @import("../server.zig");
 const posix = std.posix;
 
-var global_server: ?*server_mod.Server = null;
-
 fn shutdownSignalHandler(_: c_int) callconv(.c) void {
-    // TODO: graceful shutdown via tardy runtime
-    if (global_server) |_| std.process.exit(0);
+    // Crash-fast: skip atexit handlers entirely. The OS reclaims everything.
+    std.posix.exit(0);
 }
 
 fn installShutdownSignals() void {
@@ -560,7 +477,6 @@ pub fn startServer(host: []const u8, port: u16) !void {
     });
     defer srv.deinit();
 
-    // Register Python routes
     var i: u32 = 0;
     while (i < module.getHandlerCount(mod)) : (i += 1) {
         const entry = module.getRouteEntry(mod, i) orelse continue;
@@ -570,29 +486,23 @@ pub fn startServer(host: []const u8, port: u16) !void {
         try srv.addPythonRoute(method, path_slice, i);
     }
 
-    // Inject the Python handler function (wrapper adds py_ctx param)
-    srv.py_handler_fn = &pyHandlerBridge;
+    if (module.getModuleRef(mod)) |ref| {
+        srv.setModuleRef(ref);
+    }
 
-    global_server = &srv;
     installShutdownSignals();
-    defer global_server = null;
 
-    // Release GIL while server runs
-    const saved_state = gil.PyEval_SaveThread();
-
-    srv.run() catch |err| {
-        gil.PyEval_RestoreThread(saved_state);
-        return err;
-    };
-
-    gil.PyEval_RestoreThread(saved_state);
+    // Release main GIL. Each tardy thread creates its own sub-interpreter.
+    // srv.run() blocks until exit(0) from signal handler — no cleanup needed.
+    _ = gil.PyEval_SaveThread();
+    try srv.run();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "build request dict" {
     ffi.init();
-    defer releaseCachedKeys();
+
     defer ffi.deinit();
 
     var parse_buf: [8192]u8 = undefined;
@@ -620,7 +530,7 @@ test "build request dict" {
 
 test "build request dict with params" {
     ffi.init();
-    defer releaseCachedKeys();
+
     defer ffi.deinit();
 
     var parse_buf: [8192]u8 = undefined;

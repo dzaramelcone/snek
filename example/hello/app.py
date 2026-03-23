@@ -20,5 +20,23 @@ async def greet(name: str):
     return {"message": f"hello {name}"}
 
 
+@app.get("/redis-ping")
+async def redis_ping():
+    result = app.redis("PING")
+    return {"redis": result}
+
+
+@app.get("/redis-set/{key}/{value}")
+async def redis_set(key: str, value: str):
+    result = app.redis("SET", key, value)
+    return {"set": result}
+
+
+@app.get("/redis-get/{key}")
+async def redis_get(key: str):
+    val = app.redis("GET", key)
+    return {"key": key, "value": val.decode() if isinstance(val, bytes) else val}
+
+
 if __name__ == "__main__":
     app.run()

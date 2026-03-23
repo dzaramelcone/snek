@@ -29,6 +29,10 @@ class App:
             return func
         return decorator
 
+    @staticmethod
+    def redis(*args: str):
+        return _snek.redis_command(*args)
+
     def run(self, host="0.0.0.0", port=8080, module_ref=""):
         print(f"\n  snek listening on http://{host}:{port}/")
         print(f"  {len(self._routes)} routes registered\n")
