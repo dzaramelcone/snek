@@ -61,13 +61,11 @@ pub const Connection = struct {
 };
 
 fn processRequest(raw: []const u8, resp_buf: []u8) ![]const u8 {
-    var parse_buf: [8192]u8 = undefined;
-    var parser = http1.Parser.init(&parse_buf);
-    _ = try parser.feed(raw);
+    const req = try http1.Request.parse(raw);
 
-    const method_str = if (parser.method) |m| @tagName(m) else "GET";
+    const method_str = if (req.method) |m| @tagName(m) else "GET";
     const method = router_mod.Method.fromString(method_str) orelse .GET;
-    const path = parser.uri orelse "/";
+    const path = req.uri orelse "/";
 
     // TODO: wire to router + python handlers
     _ = method;

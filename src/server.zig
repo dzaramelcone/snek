@@ -16,7 +16,7 @@ const subinterp = @import("python/subinterp.zig");
 const driver = @import("python/driver.zig");
 const redis = @import("redis/connection.zig");
 
-pub const HandlerFn = *const fn (*const http1.Parser) response_mod.Response;
+pub const HandlerFn = *const fn (*const http1.Request) response_mod.Response;
 
 pub const Config = struct {
     num_threads: u32 = 0,
@@ -158,13 +158,11 @@ pub const Server = struct {
     }
 
     fn serveRequest(rt: *Runtime, server: *const Server, raw: []const u8, resp_buf: []u8) ![]const u8 {
-        var parse_buf: [8192]u8 = undefined;
-        var parser = http1.Parser.init(&parse_buf);
-        _ = try parser.feed(raw);
+        const req = try http1.Request.parse(raw);
 
-        const method_str = if (parser.method) |m| @tagName(m) else "GET";
+        const method_str = if (req.method) |m| @tagName(m) else "GET";
         const method = router_mod.Method.fromString(method_str) orelse .GET;
-        const path = parser.uri orelse "/";
+        const path = req.uri orelse "/";
 
         var resp = switch (server.router.match(method, path)) {
             .found => |found| blk: {
@@ -174,14 +172,14 @@ pub const Server = struct {
                         ctx.rt = rt;
                         var py_body_buf: [4096]u8 = undefined;
                         break :blk driver.invokePythonHandler(
-                            ctx.py.snek_module, py_id, &parser,
+                            ctx.py.snek_module, py_id, &req,
                             found.params[0..found.param_count], &py_body_buf,
                         );
                     }
                     return "HTTP/1.1 503\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 }
                 if (server.handlers[found.handler_id]) |handler|
-                    break :blk handler(&parser);
+                    break :blk handler(&req);
                 return "HTTP/1.1 500\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             },
             .not_found => response_mod.Response.notFound(),

@@ -1,6 +1,6 @@
 //! Higher-level HTTP request object built from parsed HTTP/1.1 data.
 //!
-//! Wraps the low-level net/http1.Parser result into a user-friendly API
+//! Wraps the low-level net/http1.Request result into a user-friendly API
 //! with lazy query string parsing, case-insensitive header lookup, and
 //! route parameter access.
 //!

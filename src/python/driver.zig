@@ -20,11 +20,11 @@ const router_mod = @import("../http/router.zig");
 /// Returns a new dict: {"method": "GET", "path": "/", "headers": {...}, "body": "..."}
 /// Caller must decref the returned dict.
 /// Safe to call from any interpreter (main or sub-interpreter).
-pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
+pub fn buildRequestDict(req: *const http1.Request, params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
     const dict = try ffi.dictNew();
 
     // Method
-    const method_str: [*:0]const u8 = if (parser.method) |m| switch (m) {
+    const method_str: [*:0]const u8 = if (req.method) |m| switch (m) {
         .GET => "GET",
         .POST => "POST",
         .PUT => "PUT",
@@ -40,7 +40,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
     try ffi.dictSetItemString(dict, "method", method_obj);
 
     // Path
-    const path = parser.uri orelse "/";
+    const path = req.uri orelse "/";
     var path_buf: [8192:0]u8 = undefined;
     if (path.len >= path_buf.len) return error.PythonError;
     @memcpy(path_buf[0..path.len], path);
@@ -52,7 +52,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
     // Headers dict
     const headers_dict = try ffi.dictNew();
     defer ffi.decref(headers_dict);
-    for (parser.headers[0..parser.header_count]) |h| {
+    for (req.headers[0..req.header_count]) |h| {
         var name_buf: [256:0]u8 = undefined;
         if (h.name.len >= name_buf.len) continue;
         @memcpy(name_buf[0..h.name.len], h.name);
@@ -70,7 +70,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
     try ffi.dictSetItemString(dict, "headers", headers_dict);
 
     // Body (if present)
-    if (parser.body()) |body_slice| {
+    if (req.body) |body_slice| {
         var body_buf: [8192:0]u8 = undefined;
         if (body_slice.len < body_buf.len) {
             @memcpy(body_buf[0..body_slice.len], body_slice);
@@ -372,7 +372,7 @@ fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
 pub fn invokePythonHandler(
     mod: *PyObject,
     handler_id: u32,
-    parser: *const http1.Parser,
+    req: *const http1.Request,
     params: []const router_mod.PathParam,
     resp_body_buf: []u8,
 ) response_mod.Response {
@@ -403,7 +403,7 @@ pub fn invokePythonHandler(
             };
         }
     } else blk: {
-        const req_dict = buildRequestDict(parser, params) catch return response_mod.Response.init(500);
+        const req_dict = buildRequestDict(req, params) catch return response_mod.Response.init(500);
         defer ffi.decref(req_dict);
         const call_args = ffi.tupleNew(1) catch return response_mod.Response.init(500);
         ffi.incref(req_dict);
@@ -578,12 +578,10 @@ test "build request dict" {
 
     defer ffi.deinit();
 
-    var parse_buf: [8192]u8 = undefined;
-    var parser = http1.Parser.init(&parse_buf);
-    _ = try parser.feed("GET /hello HTTP/1.1\r\nHost: localhost\r\nX-Test: value\r\n\r\n");
+    const req = try http1.Request.parse("GET /hello HTTP/1.1\r\nHost: localhost\r\nX-Test: value\r\n\r\n");
 
     const empty_params: [0]router_mod.PathParam = .{};
-    const dict = try buildRequestDict(&parser, &empty_params);
+    const dict = try buildRequestDict(&req, &empty_params);
     defer ffi.decref(dict);
 
     // Verify method
@@ -606,14 +604,12 @@ test "build request dict with params" {
 
     defer ffi.deinit();
 
-    var parse_buf: [8192]u8 = undefined;
-    var parser = http1.Parser.init(&parse_buf);
-    _ = try parser.feed("GET /users/42 HTTP/1.1\r\nHost: h\r\n\r\n");
+    const req = try http1.Request.parse("GET /users/42 HTTP/1.1\r\nHost: h\r\n\r\n");
 
     const params = [_]router_mod.PathParam{
         .{ .name = "id", .value = "42" },
     };
-    const dict = try buildRequestDict(&parser, &params);
+    const dict = try buildRequestDict(&req, &params);
     defer ffi.decref(dict);
 
     const params_dict = ffi.dictGetItemString(dict, "params") orelse unreachable;
