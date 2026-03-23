@@ -100,7 +100,7 @@ def _run_server(args: dict) -> None:
     sys.path.insert(0, ".")
     mod = importlib.import_module(module_name)
     app = getattr(mod, app_name)
-    app.run(host=args["host"], port=args["port"])
+    app.run(host=args["host"], port=args["port"], module_ref=args["app_ref"])
 
 
 def main():

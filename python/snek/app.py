@@ -29,10 +29,10 @@ class App:
             return func
         return decorator
 
-    def run(self, host="0.0.0.0", port=8080):
+    def run(self, host="0.0.0.0", port=8080, module_ref=""):
         print(f"\n  snek listening on http://{host}:{port}/")
         print(f"  {len(self._routes)} routes registered\n")
         for method, path, _ in self._routes:
             print(f"    {method} {path}")
         print()
-        _snek.run(host, port)
+        _snek.run(host, port, module_ref)

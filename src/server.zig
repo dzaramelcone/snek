@@ -20,7 +20,14 @@ const http1 = @import("net/http1.zig");
 const response_mod = @import("http/response.zig");
 const io_mod = @import("core/io.zig");
 const fake_io = @import("core/fake_io.zig");
-const py_driver = @import("python/driver.zig");
+// Python imports are lazy — only resolved when Python handler paths are used.
+// This allows the pure-Zig benchmark to compile without Python linkage.
+const py_driver = struct {
+    const mod = @import("python/driver.zig");
+};
+const subinterp = struct {
+    const mod = @import("python/subinterp.zig");
+};
 
 const IO = io_mod.Backend;
 const CompletionEntry = fake_io.CompletionEntry;
@@ -74,6 +81,9 @@ pub const Server = struct {
     listen_fd: ?posix.socket_t, // main thread's listen fd (for getPort)
     running: std.atomic.Value(bool),
     workers: []std.Thread,
+    /// "module:attr" ref for sub-interpreters to re-import the user app.
+    module_ref: [256]u8,
+    module_ref_len: u16,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Server {
         const num_threads = if (config.num_threads == 0)
@@ -93,6 +103,8 @@ pub const Server = struct {
             .listen_fd = null,
             .running = std.atomic.Value(bool).init(false),
             .workers = &.{},
+            .module_ref = .{0} ** 256,
+            .module_ref_len = 0,
         };
     }
 
@@ -125,6 +137,19 @@ pub const Server = struct {
         self.py_handler_ids[id] = py_handler_id;
         self.handler_count = id + 1;
         try self.router.addRoute(method, path, id);
+    }
+
+    /// Set the "module:attr" ref so worker sub-interpreters can re-import the app.
+    pub fn setModuleRef(self: *Server, ref: []const u8) void {
+        if (ref.len > 0 and ref.len < self.module_ref.len) {
+            @memcpy(self.module_ref[0..ref.len], ref);
+            self.module_ref_len = @intCast(ref.len);
+        }
+    }
+
+    /// Check if sub-interpreters are configured (module_ref is set).
+    pub fn hasSubInterpreters(self: *const Server) bool {
+        return self.module_ref_len > 0;
     }
 
     pub fn listen(self: *Server, addr: []const u8, port: u16) !void {
@@ -164,8 +189,9 @@ pub const Server = struct {
             spawned += 1;
         }
 
-        // Main thread also runs the IO-driven accept loop
-        workerAcceptLoop(self, self.listen_fd.?);
+        // Main thread also runs the IO-driven accept loop.
+        // is_main_thread=true: main thread uses the shared main GIL (no sub-interp).
+        workerAcceptLoop(self, self.listen_fd.?, true);
 
         // Wait for all workers
         for (self.workers[0..self.num_threads]) |w| w.join();
@@ -187,10 +213,22 @@ pub const Server = struct {
         const fd = createListenSocket(self.bind_addr, self.bind_port) catch |err|
             std.debug.panic("worker createListenSocket failed: {}", .{err});
         defer posix.close(fd);
-        workerAcceptLoop(self, fd);
+        workerAcceptLoop(self, fd, false);
     }
 
-    fn workerAcceptLoop(self: *Server, listen_fd: posix.socket_t) void {
+    fn workerAcceptLoop(self: *Server, listen_fd: posix.socket_t, is_main_thread: bool) void {
+        // Sub-interpreter setup for worker threads with Python handlers
+        var worker_ctx: ?subinterp.mod.WorkerPyContext = null;
+        if (self.hasSubInterpreters() and !is_main_thread) {
+            worker_ctx = subinterp.mod.WorkerPyContext.init(
+                self.module_ref[0..self.module_ref_len],
+            ) catch |err| {
+                std.log.err("sub-interpreter init failed: {}", .{err});
+                return;
+            };
+        }
+        defer if (worker_ctx) |*ctx| ctx.deinit();
+
         var backend = initBackend(self.allocator);
         defer backend.deinit();
 
@@ -200,7 +238,7 @@ pub const Server = struct {
         const conns = self.allocator.create([MAX_CONNS]Connection) catch |err|
             std.debug.panic("connection pool alloc failed: {}", .{err});
         defer self.allocator.destroy(conns);
-        for (conns) |*c| c.reset();
+        for (conns) |*cc| cc.reset();
 
         // Submit initial accept
         backend.submitAccept(listen_fd, ACCEPT_USER_DATA) catch |err|
@@ -228,16 +266,16 @@ pub const Server = struct {
                     if (idx >= MAX_CONNS) {
                         std.debug.panic("completion user_data out of range: {}", .{idx});
                     }
-                    self.handleConnectionCompletion(&backend, &conns.*[idx], ev);
+                    self.handleConnectionCompletion(&backend, &conns.*[idx], ev, if (worker_ctx) |*ctx| ctx else null);
                 }
             }
         }
 
         // Cleanup: close any open connections
-        for (conns) |*c| {
-            if (c.state != .free) {
-                posix.close(c.fd);
-                c.reset();
+        for (conns) |*cc| {
+            if (cc.state != .free) {
+                posix.close(cc.fd);
+                cc.reset();
             }
         }
     }
@@ -279,9 +317,10 @@ pub const Server = struct {
         backend: *IO,
         conn: *Connection,
         ev: CompletionEntry,
+        worker_ctx: ?*subinterp.mod.WorkerPyContext,
     ) void {
         switch (conn.state) {
-            .reading => self.handleRecvCompletion(backend, conn, ev),
+            .reading => self.handleRecvCompletion(backend, conn, ev, worker_ctx),
             .writing => handleSendCompletion(backend, conn, ev),
             .closing => conn.reset(),
             .free => std.debug.panic("completion on free connection slot", .{}),
@@ -293,6 +332,7 @@ pub const Server = struct {
         backend: *IO,
         conn: *Connection,
         ev: CompletionEntry,
+        worker_ctx: ?*subinterp.mod.WorkerPyContext,
     ) void {
         // recv error or EOF
         if (ev.result <= 0) {
@@ -329,12 +369,22 @@ pub const Server = struct {
                     // Check for Python handler first
                     if (self.py_handler_ids[found.handler_id]) |py_id| {
                         var py_body_buf: [4096]u8 = undefined;
-                        var resp = py_driver.invokePythonHandler(
-                            py_id,
-                            &parser,
-                            found.params[0..found.param_count],
-                            &py_body_buf,
-                        );
+                        var resp = if (worker_ctx) |ctx|
+                            // Sub-interpreter path: use worker's own interpreter
+                            ctx.invokePythonHandler(
+                                py_id,
+                                &parser,
+                                found.params[0..found.param_count],
+                                &py_body_buf,
+                            )
+                        else
+                            // Main thread / legacy path: shared GIL
+                            py_driver.mod.invokePythonHandler(
+                                py_id,
+                                &parser,
+                                found.params[0..found.param_count],
+                                &py_body_buf,
+                            );
                         _ = resp.setHeader("Connection", "close");
                         const resp_n = resp.serialize(&conn.resp_buf) catch |err|
                             std.debug.panic("serialize failed: {}", .{err});

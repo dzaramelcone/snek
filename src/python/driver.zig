@@ -25,34 +25,14 @@ const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
 
-// ── Cached dict key strings ─────────────────────────────────────────
+// ── Dict key helpers ────────────────────────────────────────────────
+// With sub-interpreters each interpreter has its own PyObject space, so
+// pre-interned key caching across interpreters is invalid. We use
+// PyDict_SetItemString (creates a temporary each call) which is correct
+// for both the main interpreter and any sub-interpreter.
 
-/// Pre-interned Python string objects for request dict keys.
-/// Created once on first use, reused for every request to avoid
-/// PyDict_SetItemString's per-call temporary string allocation.
-var cached_key_method: ?*PyObject = null;
-var cached_key_path: ?*PyObject = null;
-var cached_key_headers: ?*PyObject = null;
-var cached_key_body: ?*PyObject = null;
-var cached_key_params: ?*PyObject = null;
-
-fn ensureCachedKeys() ffi.PythonError!void {
-    if (cached_key_method != null) return;
-    cached_key_method = try ffi.unicodeFromString("method");
-    cached_key_path = try ffi.unicodeFromString("path");
-    cached_key_headers = try ffi.unicodeFromString("headers");
-    cached_key_body = try ffi.unicodeFromString("body");
-    cached_key_params = try ffi.unicodeFromString("params");
-}
-
-/// Release cached key strings. Called during cleanup.
-pub fn releaseCachedKeys() void {
-    if (cached_key_method) |k| { ffi.decref(k); cached_key_method = null; }
-    if (cached_key_path) |k| { ffi.decref(k); cached_key_path = null; }
-    if (cached_key_headers) |k| { ffi.decref(k); cached_key_headers = null; }
-    if (cached_key_body) |k| { ffi.decref(k); cached_key_body = null; }
-    if (cached_key_params) |k| { ffi.decref(k); cached_key_params = null; }
-}
+/// No-op — cached key cleanup removed (sub-interpreter safe).
+pub fn releaseCachedKeys() void {}
 
 // ── Request dict builder ────────────────────────────────────────────
 
@@ -60,8 +40,8 @@ pub fn releaseCachedKeys() void {
 ///
 /// Returns a new dict: {"method": "GET", "path": "/", "headers": {...}, "body": "..."}
 /// Caller must decref the returned dict.
+/// Safe to call from any interpreter (main or sub-interpreter).
 pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
-    try ensureCachedKeys();
     const dict = try ffi.dictNew();
 
     // Method
@@ -78,18 +58,17 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
     } else "GET";
     const method_obj = try ffi.unicodeFromString(method_str);
     defer ffi.decref(method_obj);
-    try ffi.dictSetItem(dict, cached_key_method.?, method_obj);
+    try ffi.dictSetItemString(dict, "method", method_obj);
 
     // Path
     const path = parser.uri orelse "/";
-    // Need a null-terminated copy for unicodeFromString
     var path_buf: [8192:0]u8 = undefined;
     if (path.len >= path_buf.len) return error.PythonError;
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
     const path_obj = try ffi.unicodeFromString(path_buf[0..path.len :0]);
     defer ffi.decref(path_obj);
-    try ffi.dictSetItem(dict, cached_key_path.?, path_obj);
+    try ffi.dictSetItemString(dict, "path", path_obj);
 
     // Headers dict
     const headers_dict = try ffi.dictNew();
@@ -109,7 +88,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
         defer ffi.decref(val_obj);
         try ffi.dictSetItemString(headers_dict, name_buf[0..h.name.len :0], val_obj);
     }
-    try ffi.dictSetItem(dict, cached_key_headers.?, headers_dict);
+    try ffi.dictSetItemString(dict, "headers", headers_dict);
 
     // Body (if present)
     if (parser.body()) |body_slice| {
@@ -119,12 +98,12 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
             body_buf[body_slice.len] = 0;
             const body_obj = try ffi.unicodeFromString(body_buf[0..body_slice.len :0]);
             defer ffi.decref(body_obj);
-            try ffi.dictSetItem(dict, cached_key_body.?, body_obj);
+            try ffi.dictSetItemString(dict, "body", body_obj);
         }
     } else {
         const none = ffi.getNone();
         defer ffi.decref(none);
-        try ffi.dictSetItem(dict, cached_key_body.?, none);
+        try ffi.dictSetItemString(dict, "body", none);
     }
 
     // Path params
@@ -146,7 +125,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
             defer ffi.decref(pval_obj);
             try ffi.dictSetItemString(params_dict, pname_buf[0..p.name.len :0], pval_obj);
         }
-        try ffi.dictSetItem(dict, cached_key_params.?, params_dict);
+        try ffi.dictSetItemString(dict, "params", params_dict);
     }
 
     return dict;
@@ -154,7 +133,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
 
 /// Build a kwargs dict from path params for direct injection.
 /// Caller must decref the returned dict.
-fn buildParamsKwargs(params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
+pub fn buildParamsKwargs(params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
     const kwargs = try ffi.dictNew();
     for (params) |p| {
         var pname_buf: [256:0]u8 = undefined;
@@ -564,7 +543,7 @@ fn installShutdownSignals() void {
 }
 
 /// Start the HTTP server with Python handlers wired in.
-/// Called from _snek.run(host, port).
+/// Called from _snek.run(host, port[, module_ref]).
 pub fn startServer(host: []const u8, port: u16) !void {
     const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
     var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 4 });
@@ -583,6 +562,11 @@ pub fn startServer(host: []const u8, port: u16) !void {
         try srv.addPythonRoute(method, path_slice, i);
     }
 
+    // Pass module_ref to server so worker threads can create sub-interpreters
+    if (module.getModuleRef(mod)) |ref| {
+        srv.setModuleRef(ref);
+    }
+
     try srv.listen(host, port);
 
     // Install SIGTERM/SIGINT handlers so the server shuts down cleanly
@@ -590,7 +574,9 @@ pub fn startServer(host: []const u8, port: u16) !void {
     installShutdownSignals();
     defer global_server = null;
 
-    // Release GIL while server runs — worker threads will acquire per-request
+    // Release GIL while server runs.
+    // With sub-interpreters: worker threads create their own interpreters + GILs.
+    // Without: workers fall back to shared GIL acquire/release per request.
     const saved_state = gil.PyEval_SaveThread();
 
     srv.run() catch |err| {

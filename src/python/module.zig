@@ -48,6 +48,10 @@ pub const SnekModuleState = extern struct {
     py_handler_count: u32,
     handler_flags: [MAX_HANDLERS]HandlerFlags,
     route_entries: [MAX_HANDLERS]RouteEntry,
+    /// "module:attr" ref for sub-interpreters to re-import the user app.
+    /// Stored as a null-terminated fixed buffer (e.g. "app:app\x00...").
+    module_ref: [256]u8,
+    module_ref_len: u16,
 };
 
 /// Temporary global module reference. Set during pyRun so driver.startServer
@@ -92,6 +96,13 @@ pub fn getHandlerFlags(mod: *PyObject, handler_id: u32) HandlerFlags {
     const state = getState(mod) orelse return HandlerFlags{};
     if (handler_id >= state.py_handler_count) return HandlerFlags{};
     return state.handler_flags[handler_id];
+}
+
+/// Get the stored "module:attr" reference string for sub-interpreter re-import.
+pub fn getModuleRef(mod: *PyObject) ?[]const u8 {
+    const state = getState(mod) orelse return null;
+    if (state.module_ref_len == 0) return null;
+    return state.module_ref[0..state.module_ref_len];
 }
 
 // ── Handler introspection ───────────────────────────────────────────
@@ -297,10 +308,12 @@ fn pyAddRoute(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     return ffi.getNone();
 }
 
-/// _snek.run(host: str, port: int)
+/// _snek.run(host: str, port: int, module_ref: str = "")
 ///
 /// Starts the Zig HTTP server. Blocks until the server shuts down.
 /// Routes must be registered via add_route() before calling run().
+/// module_ref is "module:attr" (e.g. "app:app") so sub-interpreters
+/// can re-import the user's app independently.
 fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const mod = self_mod orelse {
         c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
@@ -308,12 +321,13 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     };
 
     const tuple = args orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "run requires 2 arguments");
+        c.PyErr_SetString(c.PyExc_TypeError, "run requires 2-3 arguments");
         return null;
     };
 
-    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
-        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port) requires exactly 2 arguments");
+    const tuple_size = if (ffi.isTuple(tuple)) ffi.tupleSize(tuple) else 0;
+    if (tuple_size < 2 or tuple_size > 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port[, module_ref]) requires 2-3 arguments");
         return null;
     }
 
@@ -345,6 +359,29 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         return null;
     }
 
+    // Extract optional module_ref string (e.g. "app:app")
+    const state: *SnekModuleState = getState(mod) orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
+        return null;
+    };
+    if (tuple_size >= 3) {
+        const ref_obj = ffi.tupleGetItem(tuple, 2) orelse {
+            c.PyErr_SetString(c.PyExc_TypeError, "module_ref must be a string");
+            return null;
+        };
+        if (ffi.isString(ref_obj)) {
+            const ref_str = ffi.unicodeAsUTF8(ref_obj) catch {
+                c.PyErr_SetString(c.PyExc_TypeError, "module_ref must be valid UTF-8");
+                return null;
+            };
+            const ref_span = std.mem.span(ref_str);
+            if (ref_span.len > 0 and ref_span.len < state.module_ref.len) {
+                @memcpy(state.module_ref[0..ref_span.len], ref_span);
+                state.module_ref_len = @intCast(ref_span.len);
+            }
+        }
+    }
+
     const host_span = std.mem.span(host_str);
     const port: u16 = @intCast(port_long);
 
@@ -353,7 +390,6 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     defer g_current_module = null;
 
     // Start the server with Python handlers wired in.
-    // Release the GIL while the server runs (it will reacquire per-request).
     driver.startServer(host_span, port) catch {
         c.PyErr_SetString(c.PyExc_RuntimeError, "failed to start server");
         return null;
@@ -385,6 +421,8 @@ fn snekModuleExec(mod: ?*PyObject) callconv(.c) c_int {
     state.py_handler_count = 0;
     state.handler_flags = .{HandlerFlags{}} ** MAX_HANDLERS;
     // route_entries don't need zeroing — only valid up to py_handler_count
+    state.module_ref = .{0} ** 256;
+    state.module_ref_len = 0;
     return 0;
 }
 

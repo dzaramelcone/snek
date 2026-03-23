@@ -1,0 +1,13 @@
+concurrency,rps,avg_latency_us,transfer_per_sec
+1,13523.76,44.15us
+Distribution,1.16MB
+10,15326.71,220.33us
+Distribution,1.32MB
+50,15966.19,2.34ms
+Distribution,1.37MB
+100,15638.46,6.22ms
+Distribution,1.34MB
+200,15201.33,7.26ms
+Distribution,1.30MB
+500,15062.38,11.25ms
+Distribution,1.29MB

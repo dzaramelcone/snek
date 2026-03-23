@@ -36,6 +36,7 @@ pub const python = struct {
     pub const module = @import("python/module.zig");
     pub const context = @import("python/context.zig");
     pub const inject = @import("python/inject.zig");
+    pub const subinterp = @import("python/subinterp.zig");
 };
 
 pub const db = struct {

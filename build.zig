@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    linkPython(mod);
 
     // --- Executable ---
     const exe = b.addExecutable(.{
@@ -45,6 +46,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // --- Zig benchmark server (uses snek module, needs Python for compilation) ---
+    const bench_zig = b.addExecutable(.{
+        .name = "bench-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/controls/zig/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snek", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bench_zig);
 
     // --- Python extension shared library (_snek.so) ---
     const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
@@ -134,7 +149,7 @@ pub fn build(b: *std.Build) void {
         "src/http/request.zig",
         "src/http/response.zig",
         "src/http/router.zig",
-        "src/server.zig",
+        // server.zig imports python/subinterp.zig; tested in python_test_sources
         "src/http/middleware.zig",
         "src/http/cookies.zig",
         "src/http/compress.zig",
@@ -180,6 +195,8 @@ pub fn build(b: *std.Build) void {
         "src/python/context.zig",
         "src/python/inject.zig",
         "src/python/module.zig",
+        // subinterp.zig uses cross-domain imports; tested via root module
+        "src/server.zig",
     };
 
     for (python_test_sources) |source| {
