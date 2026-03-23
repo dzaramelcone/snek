@@ -80,6 +80,14 @@ pub fn callObject(callable: *PyObject, args: ?*PyObject) PythonError!*PyObject {
     };
 }
 
+/// Call a Python callable with args tuple and kwargs dict. Caller must decref result.
+pub fn callObjectKwargs(callable: *PyObject, args: ?*PyObject, kwargs: *PyObject) PythonError!*PyObject {
+    return c.PyObject_Call(callable, args, kwargs) orelse {
+        c.PyErr_Print();
+        return error.CallError;
+    };
+}
+
 // ── Reference counting ──────────────────────────────────────────────
 
 pub fn incref(obj: *PyObject) void {
@@ -210,6 +218,11 @@ pub fn dictNew() PythonError!*PyObject {
 
 pub fn dictSetItemString(dict: *PyObject, key: [*:0]const u8, value: *PyObject) PythonError!void {
     if (c.PyDict_SetItemString(dict, key, value) != 0) return error.PythonError;
+}
+
+/// Set a dict item using a PyObject key (avoids temporary string creation).
+pub fn dictSetItem(dict: *PyObject, key: *PyObject, value: *PyObject) PythonError!void {
+    if (c.PyDict_SetItem(dict, key, value) != 0) return error.PythonError;
 }
 
 /// Returns a borrowed reference (do not decref).

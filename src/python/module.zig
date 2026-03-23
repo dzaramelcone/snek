@@ -23,6 +23,19 @@ const MAX_HANDLERS: usize = 64;
 var py_handlers: [MAX_HANDLERS]?*PyObject = .{null} ** MAX_HANDLERS;
 var py_handler_count: u32 = 0;
 
+/// Handler calling convention flags, determined at registration time
+/// by inspecting the Python handler's signature.
+pub const HandlerFlags = struct {
+    /// Handler takes a single `request` dict argument (default)
+    needs_request: bool = true,
+    /// Handler takes named path params as **kwargs
+    needs_params: bool = false,
+    /// Handler takes no arguments at all
+    no_args: bool = false,
+    /// Handler is async def (pre-computed, saves per-call check)
+    is_async: bool = false,
+};
+
 /// Route metadata stored alongside handlers for server setup.
 const RouteEntry = struct {
     method: [8]u8,
@@ -32,6 +45,7 @@ const RouteEntry = struct {
 };
 
 var route_entries: [MAX_HANDLERS]RouteEntry = undefined;
+var handler_flags: [MAX_HANDLERS]HandlerFlags = .{HandlerFlags{}} ** MAX_HANDLERS;
 
 /// Get stored Python callable by handler_id.
 pub fn getHandler(handler_id: u32) ?*PyObject {
@@ -48,6 +62,111 @@ pub fn getHandlerCount() u32 {
 pub fn getRouteEntry(handler_id: u32) ?RouteEntry {
     if (handler_id >= py_handler_count) return null;
     return route_entries[handler_id];
+}
+
+/// Get handler flags by handler_id.
+pub fn getHandlerFlags(handler_id: u32) HandlerFlags {
+    if (handler_id >= py_handler_count) return HandlerFlags{};
+    return handler_flags[handler_id];
+}
+
+// ── Handler introspection ───────────────────────────────────────────
+
+/// Inspect a Python handler's signature at registration time to determine
+/// what arguments it needs. Uses __code__.co_argcount and co_varnames.
+///
+/// Rules:
+///   - 0 args → no_args (don't build any request dict)
+///   - 1 arg named "request" or "req" → needs_request (full dict)
+///   - named params (not "request"/"req"/"self") → needs_params (kwargs injection)
+///   - fallback → needs_request
+fn inspectHandlerFlags(handler_obj: *PyObject) HandlerFlags {
+    var flags = HandlerFlags{};
+
+    // Detect async: check if the handler is a coroutine function
+    flags.is_async = c.PyCoro_CheckExact(handler_obj) != 0 or isCoroutineFunction(handler_obj);
+
+    // Get __code__ attribute — functions and lambdas have this
+    const code = c.PyObject_GetAttrString(handler_obj, "__code__") orelse {
+        // No __code__ (e.g. a class with __call__) — fall back to needs_request
+        ffi.errClear();
+        return flags;
+    };
+    defer ffi.decref(code);
+
+    // Get co_argcount (excludes *args and **kwargs)
+    const argcount_obj = c.PyObject_GetAttrString(code, "co_argcount") orelse {
+        ffi.errClear();
+        return flags;
+    };
+    defer ffi.decref(argcount_obj);
+    const argcount = ffi.longAsLong(argcount_obj) catch return flags;
+
+    if (argcount == 0) {
+        // Zero positional args — handler() takes nothing
+        flags.no_args = true;
+        flags.needs_request = false;
+        return flags;
+    }
+
+    // Get co_varnames to check the first parameter name
+    const varnames_obj = c.PyObject_GetAttrString(code, "co_varnames") orelse {
+        ffi.errClear();
+        return flags;
+    };
+    defer ffi.decref(varnames_obj);
+
+    // co_varnames is a tuple — get the first element
+    const first_param = ffi.tupleGetItem(varnames_obj, 0) orelse return flags;
+    if (!ffi.isString(first_param)) return flags;
+    const param_name = ffi.unicodeAsUTF8(first_param) catch return flags;
+    const name_span = std.mem.span(param_name);
+
+    // If the first param is "request" or "req", it wants the full dict
+    if (std.mem.eql(u8, name_span, "request") or std.mem.eql(u8, name_span, "req")) {
+        flags.needs_request = true;
+        return flags;
+    }
+
+    // If the first param is "self", this is a method — check second param
+    if (std.mem.eql(u8, name_span, "self")) {
+        if (argcount >= 2) {
+            const second_param = ffi.tupleGetItem(varnames_obj, 1) orelse return flags;
+            if (!ffi.isString(second_param)) return flags;
+            const second_name = ffi.unicodeAsUTF8(second_param) catch return flags;
+            const second_span = std.mem.span(second_name);
+            if (std.mem.eql(u8, second_span, "request") or std.mem.eql(u8, second_span, "req")) {
+                return flags;
+            }
+        }
+        // Method with no recognizable params — needs_request as fallback
+        return flags;
+    }
+
+    // Named params like `name`, `id` etc. — inject as kwargs
+    flags.needs_params = true;
+    flags.needs_request = false;
+    return flags;
+}
+
+/// Check if a callable is an async def (coroutine function).
+fn isCoroutineFunction(obj: *PyObject) bool {
+    // Use inspect.iscoroutinefunction via CO_COROUTINE flag on __code__.co_flags
+    const code = c.PyObject_GetAttrString(obj, "__code__") orelse {
+        ffi.errClear();
+        return false;
+    };
+    defer ffi.decref(code);
+
+    const co_flags_obj = c.PyObject_GetAttrString(code, "co_flags") orelse {
+        ffi.errClear();
+        return false;
+    };
+    defer ffi.decref(co_flags_obj);
+    const co_flags = ffi.longAsLong(co_flags_obj) catch return false;
+
+    // CO_COROUTINE = 0x100 in CPython
+    return (co_flags & 0x100) != 0;
 }
 
 // ── Module methods ──────────────────────────────────────────────────
@@ -137,6 +256,11 @@ fn pyAddRoute(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     // Incref the handler — we own a reference now
     ffi.incref(handler_obj);
     py_handlers[id] = handler_obj;
+
+    // Inspect handler signature to determine calling convention flags.
+    // Check __code__.co_argcount to decide what to pass at call time.
+    handler_flags[id] = inspectHandlerFlags(handler_obj);
+
     py_handler_count = id + 1;
 
     return ffi.getNone();
@@ -235,11 +359,12 @@ fn pyInitSnek() callconv(.c) ?*PyObject {
 
 /// Release all stored Python handler references.
 pub fn releaseHandlers() void {
-    for (&py_handlers) |*h| {
+    for (&py_handlers, 0..) |*h, i| {
         if (h.*) |obj| {
             ffi.decref(obj);
             h.* = null;
         }
+        handler_flags[i] = HandlerFlags{};
     }
     py_handler_count = 0;
 }

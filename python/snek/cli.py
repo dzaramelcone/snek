@@ -104,6 +104,12 @@ def _run_server(args: dict) -> None:
 
 
 def main():
+    # Set mimalloc as the Python memory allocator for better performance.
+    # Must be set before Py_Initialize, so we re-exec if not already set.
+    if os.environ.get("PYTHONMALLOC") != "mimalloc":
+        os.environ["PYTHONMALLOC"] = "mimalloc"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     args = _parse_args(sys.argv[1:])
 
     if args["reload"]:

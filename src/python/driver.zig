@@ -25,6 +25,35 @@ const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
 
+// ── Cached dict key strings ─────────────────────────────────────────
+
+/// Pre-interned Python string objects for request dict keys.
+/// Created once on first use, reused for every request to avoid
+/// PyDict_SetItemString's per-call temporary string allocation.
+var cached_key_method: ?*PyObject = null;
+var cached_key_path: ?*PyObject = null;
+var cached_key_headers: ?*PyObject = null;
+var cached_key_body: ?*PyObject = null;
+var cached_key_params: ?*PyObject = null;
+
+fn ensureCachedKeys() ffi.PythonError!void {
+    if (cached_key_method != null) return;
+    cached_key_method = try ffi.unicodeFromString("method");
+    cached_key_path = try ffi.unicodeFromString("path");
+    cached_key_headers = try ffi.unicodeFromString("headers");
+    cached_key_body = try ffi.unicodeFromString("body");
+    cached_key_params = try ffi.unicodeFromString("params");
+}
+
+/// Release cached key strings. Called during cleanup.
+pub fn releaseCachedKeys() void {
+    if (cached_key_method) |k| { ffi.decref(k); cached_key_method = null; }
+    if (cached_key_path) |k| { ffi.decref(k); cached_key_path = null; }
+    if (cached_key_headers) |k| { ffi.decref(k); cached_key_headers = null; }
+    if (cached_key_body) |k| { ffi.decref(k); cached_key_body = null; }
+    if (cached_key_params) |k| { ffi.decref(k); cached_key_params = null; }
+}
+
 // ── Request dict builder ────────────────────────────────────────────
 
 /// Build a Python dict representing the HTTP request.
@@ -32,6 +61,7 @@ const router_mod = @import("../http/router.zig");
 /// Returns a new dict: {"method": "GET", "path": "/", "headers": {...}, "body": "..."}
 /// Caller must decref the returned dict.
 pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
+    try ensureCachedKeys();
     const dict = try ffi.dictNew();
 
     // Method
@@ -48,7 +78,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
     } else "GET";
     const method_obj = try ffi.unicodeFromString(method_str);
     defer ffi.decref(method_obj);
-    try ffi.dictSetItemString(dict, "method", method_obj);
+    try ffi.dictSetItem(dict, cached_key_method.?, method_obj);
 
     // Path
     const path = parser.uri orelse "/";
@@ -59,7 +89,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
     path_buf[path.len] = 0;
     const path_obj = try ffi.unicodeFromString(path_buf[0..path.len :0]);
     defer ffi.decref(path_obj);
-    try ffi.dictSetItemString(dict, "path", path_obj);
+    try ffi.dictSetItem(dict, cached_key_path.?, path_obj);
 
     // Headers dict
     const headers_dict = try ffi.dictNew();
@@ -79,7 +109,7 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
         defer ffi.decref(val_obj);
         try ffi.dictSetItemString(headers_dict, name_buf[0..h.name.len :0], val_obj);
     }
-    try ffi.dictSetItemString(dict, "headers", headers_dict);
+    try ffi.dictSetItem(dict, cached_key_headers.?, headers_dict);
 
     // Body (if present)
     if (parser.body()) |body_slice| {
@@ -89,12 +119,12 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
             body_buf[body_slice.len] = 0;
             const body_obj = try ffi.unicodeFromString(body_buf[0..body_slice.len :0]);
             defer ffi.decref(body_obj);
-            try ffi.dictSetItemString(dict, "body", body_obj);
+            try ffi.dictSetItem(dict, cached_key_body.?, body_obj);
         }
     } else {
         const none = ffi.getNone();
         defer ffi.decref(none);
-        try ffi.dictSetItemString(dict, "body", none);
+        try ffi.dictSetItem(dict, cached_key_body.?, none);
     }
 
     // Path params
@@ -116,10 +146,32 @@ pub fn buildRequestDict(parser: *const http1.Parser, params: []const router_mod.
             defer ffi.decref(pval_obj);
             try ffi.dictSetItemString(params_dict, pname_buf[0..p.name.len :0], pval_obj);
         }
-        try ffi.dictSetItemString(dict, "params", params_dict);
+        try ffi.dictSetItem(dict, cached_key_params.?, params_dict);
     }
 
     return dict;
+}
+
+/// Build a kwargs dict from path params for direct injection.
+/// Caller must decref the returned dict.
+fn buildParamsKwargs(params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
+    const kwargs = try ffi.dictNew();
+    for (params) |p| {
+        var pname_buf: [256:0]u8 = undefined;
+        if (p.name.len >= pname_buf.len) continue;
+        @memcpy(pname_buf[0..p.name.len], p.name);
+        pname_buf[p.name.len] = 0;
+
+        var pval_buf: [1024:0]u8 = undefined;
+        if (p.value.len >= pval_buf.len) continue;
+        @memcpy(pval_buf[0..p.value.len], p.value);
+        pval_buf[p.value.len] = 0;
+
+        const pval_obj = try ffi.unicodeFromString(pval_buf[0..p.value.len :0]);
+        defer ffi.decref(pval_obj);
+        try ffi.dictSetItemString(kwargs, pname_buf[0..p.name.len :0], pval_obj);
+    }
+    return kwargs;
 }
 
 // ── Response conversion ─────────────────────────────────────────────
@@ -378,6 +430,10 @@ fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
 /// Acquires and releases the GIL. Returns an HTTP response.
 ///
 /// This is called from the Zig server's request handling path.
+/// Uses handler_flags (inspected at registration time) to skip work:
+///   - no_args: call handler() with no arguments, skip dict building entirely
+///   - needs_params: call handler(**kwargs) with path params as keyword args
+///   - needs_request (default): build full request dict, call handler(request)
 pub fn invokePythonHandler(
     handler_id: u32,
     parser: *const http1.Parser,
@@ -387,33 +443,65 @@ pub fn invokePythonHandler(
     const handler = module.getHandler(handler_id) orelse {
         return response_mod.Response.init(500);
     };
+    const flags = module.getHandlerFlags(handler_id);
 
     // Acquire GIL for Python call
     var guard = gil.GilGuard.acquire();
     defer guard.release();
 
-    // Build request dict
-    const req_dict = buildRequestDict(parser, params) catch {
-        return response_mod.Response.init(500);
-    };
-    defer ffi.decref(req_dict);
+    // Dispatch based on handler flags
+    const call_result = if (flags.no_args) blk: {
+        // Handler takes no arguments — skip dict building entirely
+        break :blk ffi.callObject(handler, null) catch {
+            if (ffi.errOccurred()) ffi.errPrint();
+            return response_mod.Response.init(500);
+        };
+    } else if (flags.needs_params) blk: {
+        // Handler takes named params as kwargs — inject path params directly
+        const empty_args = ffi.tupleNew(0) catch {
+            return response_mod.Response.init(500);
+        };
+        defer ffi.decref(empty_args);
 
-    // Call handler(request_dict)
-    const call_args = ffi.tupleNew(1) catch {
-        return response_mod.Response.init(500);
-    };
-    ffi.incref(req_dict);
-    ffi.tupleSetItem(call_args, 0, req_dict) catch {
-        ffi.decref(call_args);
-        return response_mod.Response.init(500);
-    };
+        if (params.len > 0) {
+            const kwargs = buildParamsKwargs(params) catch {
+                return response_mod.Response.init(500);
+            };
+            defer ffi.decref(kwargs);
+            break :blk ffi.callObjectKwargs(handler, empty_args, kwargs) catch {
+                if (ffi.errOccurred()) ffi.errPrint();
+                return response_mod.Response.init(500);
+            };
+        } else {
+            break :blk ffi.callObject(handler, empty_args) catch {
+                if (ffi.errOccurred()) ffi.errPrint();
+                return response_mod.Response.init(500);
+            };
+        }
+    } else blk: {
+        // Default: build full request dict
+        const req_dict = buildRequestDict(parser, params) catch {
+            return response_mod.Response.init(500);
+        };
+        defer ffi.decref(req_dict);
 
-    const call_result = ffi.callObject(handler, call_args) catch {
+        const call_args = ffi.tupleNew(1) catch {
+            return response_mod.Response.init(500);
+        };
+        ffi.incref(req_dict);
+        ffi.tupleSetItem(call_args, 0, req_dict) catch {
+            ffi.decref(call_args);
+            return response_mod.Response.init(500);
+        };
+
+        const result = ffi.callObject(handler, call_args) catch {
+            ffi.decref(call_args);
+            if (ffi.errOccurred()) ffi.errPrint();
+            return response_mod.Response.init(500);
+        };
         ffi.decref(call_args);
-        if (ffi.errOccurred()) ffi.errPrint();
-        return response_mod.Response.init(500);
+        break :blk result;
     };
-    ffi.decref(call_args);
 
     // If the handler is async def, we get a coroutine — drive it to completion
     const py_result = if (ffi.isCoroutine(call_result)) blk: {
@@ -477,6 +565,7 @@ fn installShutdownSignals() void {
 pub fn startServer(host: []const u8, port: u16) !void {
     var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 4 });
     defer srv.deinit();
+    defer releaseCachedKeys();
 
     // Register all Python routes with the Zig router
     var i: u32 = 0;
@@ -512,6 +601,7 @@ pub fn startServer(host: []const u8, port: u16) !void {
 
 test "build request dict" {
     ffi.init();
+    defer releaseCachedKeys();
     defer ffi.deinit();
 
     var parse_buf: [8192]u8 = undefined;
@@ -539,6 +629,7 @@ test "build request dict" {
 
 test "build request dict with params" {
     ffi.init();
+    defer releaseCachedKeys();
     defer ffi.deinit();
 
     var parse_buf: [8192]u8 = undefined;
