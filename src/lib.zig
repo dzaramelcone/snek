@@ -8,7 +8,6 @@ pub const python = struct {
     pub const driver = @import("python/driver.zig");
 };
 
-pub const server = @import("server.zig");
 pub const http = struct {
     pub const router = @import("http/router.zig");
     pub const response = @import("http/response.zig");

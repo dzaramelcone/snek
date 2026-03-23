@@ -19,7 +19,7 @@ pub fn main() !void {
     const port_str = args.next() orelse "8080";
     const port = std.fmt.parseInt(u16, port_str, 10) catch 8080;
 
-    var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 4 });
+    var srv = try server_mod.Server.init(std.heap.page_allocator, .{});
     defer srv.deinit();
 
     try srv.addRoute(.GET, "/", &hello);

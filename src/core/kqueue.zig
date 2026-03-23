@@ -285,6 +285,109 @@ pub const Kqueue = struct {
         return count;
     }
 
+    /// Non-blocking flush + peek: submit pending ops and return whatever is ready.
+    /// Never blocks — returns 0 if nothing is ready yet.
+    pub fn flushAndPeek(self: *Kqueue, events: []CompletionEntry) !u32 {
+        var count: u32 = 0;
+
+        // Drain immediate completions first
+        while (self.immediate.items.len > 0 and count < events.len) {
+            events[count] = self.immediate.orderedRemove(0);
+            count += 1;
+        }
+        if (count >= events.len) return count;
+
+        // Register kevents for all pending ops
+        var changelist: std.ArrayList(std.c.Kevent) = .empty;
+        defer changelist.deinit(self.allocator);
+
+        for (self.pending.items) |op| {
+            switch (op.op_type) {
+                .read, .recv, .accept => {
+                    try changelist.append(self.allocator, .{
+                        .ident = @intCast(op.fd),
+                        .filter = std.c.EVFILT.READ,
+                        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = @intCast(op.user_data),
+                    });
+                },
+                .write, .send, .connect => {
+                    try changelist.append(self.allocator, .{
+                        .ident = @intCast(op.fd),
+                        .filter = std.c.EVFILT.WRITE,
+                        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                        .fflags = 0,
+                        .data = 0,
+                        .udata = @intCast(op.user_data),
+                    });
+                },
+                .timeout => {
+                    try changelist.append(self.allocator, .{
+                        .ident = op.user_data,
+                        .filter = std.c.EVFILT.TIMER,
+                        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                        .fflags = std.c.NOTE.NSECONDS,
+                        .data = @intCast(op.timeout_ns),
+                        .udata = @intCast(op.user_data),
+                    });
+                },
+                .close, .cancel => {},
+            }
+        }
+
+        if (changelist.items.len == 0) return count;
+
+        const remaining = events.len - count;
+        var kevents: [64]std.c.Kevent = undefined;
+        const max_kevents = @min(remaining, 64);
+
+        // Zero timeout — never block
+        const timeout = std.c.timespec{ .sec = 0, .nsec = 0 };
+
+        const n = std.c.kevent(
+            self.kq,
+            changelist.items.ptr,
+            @intCast(changelist.items.len),
+            &kevents,
+            @intCast(max_kevents),
+            &timeout,
+        );
+
+        if (n < 0) return error.KeventFailed;
+
+        // Process ready events
+        for (kevents[0..@intCast(n)]) |kev| {
+            if (count >= events.len) break;
+
+            const user_data: u64 = @intCast(kev.udata);
+
+            // Find and remove matching pending op
+            var found_idx: ?usize = null;
+            for (self.pending.items, 0..) |op, idx| {
+                if (op.user_data == user_data) {
+                    found_idx = idx;
+                    break;
+                }
+            }
+
+            if (found_idx) |idx| {
+                const op = self.pending.items[idx];
+                const result = self.executeOp(op, kev);
+                _ = self.pending.orderedRemove(idx);
+                events[count] = .{
+                    .user_data = user_data,
+                    .result = result,
+                    .flags = 0,
+                };
+                count += 1;
+            }
+        }
+
+        return count;
+    }
+
     fn executeOp(self: *Kqueue, op: PendingOp, kev: std.c.Kevent) i32 {
         _ = self;
 
@@ -361,7 +464,7 @@ fn makeSocketPair() [2]posix.fd_t {
 
 test "init kqueue" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     try std.testing.expect(kq.kq >= 0);
@@ -369,7 +472,7 @@ test "init kqueue" {
 
 test "submit and poll timeout" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     // Submit a 1ms timeout
@@ -390,7 +493,7 @@ test "submit and poll timeout" {
 
 test "socket pair send/recv" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -429,7 +532,7 @@ test "socket pair send/recv" {
 
 test "close generates completion" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     // Create a socket to close
@@ -456,7 +559,7 @@ test "kqueue satisfies IO interface" {
 
 test "cancel removes pending op" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     // Submit a long timeout, then cancel it
@@ -478,7 +581,7 @@ test "cancel removes pending op" {
 
 test "edge: pollCompletions with no pending ops returns 0" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     var events: [16]CompletionEntry = undefined;
@@ -488,7 +591,7 @@ test "edge: pollCompletions with no pending ops returns 0" {
 
 test "edge: poll with events buffer of size 1 returns 1 at a time" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     // Submit 3 immediate ops (close generates immediate completions)
@@ -518,7 +621,7 @@ test "edge: poll with events buffer of size 1 returns 1 at a time" {
 
 test "edge: two reads on same fd" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -549,7 +652,7 @@ test "edge: two reads on same fd" {
 
 test "edge: partial read — send more data than recv buffer" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -579,7 +682,7 @@ test "edge: partial read — send more data than recv buffer" {
 
 test "edge: closed peer — EOF on recv" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -606,7 +709,7 @@ test "edge: closed peer — EOF on recv" {
 
 test "edge: cancel an op that does not exist — no crash" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     // Cancel a non-existent user_data
@@ -626,7 +729,7 @@ test "edge: changelist append propagates allocation errors" {
     // The current implementation uses `catch {}` which swallows OOM.
     // This test verifies the bug exists by using a failing allocator.
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(alloc) catch unreachable;
+    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
     defer kq.deinit();
 
     const pair = makeSocketPair();

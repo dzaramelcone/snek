@@ -47,24 +47,6 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // --- Pure Zig benchmark server (no Python dependency) ---
-    const snek_core = b.addModule("snek_core", .{
-        .root_source_file = b.path("src/server_only.zig"),
-        .target = target,
-    });
-    const bench_zig = b.addExecutable(.{
-        .name = "bench-zig",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/controls/zig/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "snek", .module = snek_core },
-            },
-        }),
-    });
-    b.installArtifact(bench_zig);
-
     // --- Python extension shared library (_snek.so) ---
     const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
     const pyext = b.addLibrary(.{
@@ -115,22 +97,7 @@ pub fn build(b: *std.Build) void {
 
     // Individual module tests
     const test_sources = [_][]const u8{
-        "src/core/coroutine.zig",
-        "src/core/scheduler.zig",
-        "src/core/io.zig",
-        "src/core/worker.zig",
-        "src/core/deque.zig",
-        "src/core/io_uring.zig",
         "src/core/kqueue.zig",
-        "src/core/timer.zig",
-        "src/core/buffer.zig",
-        "src/core/signal.zig",
-        "src/core/fake_io.zig",
-        "src/core/static_alloc.zig",
-        "src/core/pool.zig",
-        "src/core/arena.zig",
-        "src/core/coverage.zig",
-        "src/core/assert.zig",
         "src/net/tcp.zig",
         "src/net/tls.zig",
         "src/net/http1.zig",
@@ -153,7 +120,6 @@ pub fn build(b: *std.Build) void {
         "src/http/request.zig",
         "src/http/response.zig",
         "src/http/router.zig",
-        // server.zig imports python/subinterp.zig; tested in python_test_sources
         "src/http/middleware.zig",
         "src/http/cookies.zig",
         "src/http/compress.zig",
@@ -199,8 +165,7 @@ pub fn build(b: *std.Build) void {
         "src/python/context.zig",
         "src/python/inject.zig",
         "src/python/module.zig",
-        // subinterp.zig uses cross-domain imports; tested via root module
-        "src/server.zig",
+        "src/python/subinterp.zig",
     };
 
     for (python_test_sources) |source| {

@@ -2,22 +2,7 @@
 //! Top-level module re-exporting the public API surface.
 
 pub const core = struct {
-    pub const coroutine = @import("core/coroutine.zig");
-    pub const scheduler = @import("core/scheduler.zig");
-    pub const io = @import("core/io.zig");
-    pub const worker = @import("core/worker.zig");
-    pub const deque = @import("core/deque.zig");
-    pub const io_uring = @import("core/io_uring.zig");
     pub const kqueue = @import("core/kqueue.zig");
-    pub const timer = @import("core/timer.zig");
-    pub const buffer = @import("core/buffer.zig");
-    pub const signal = @import("core/signal.zig");
-    pub const fake_io = @import("core/fake_io.zig");
-    pub const static_alloc = @import("core/static_alloc.zig");
-    pub const pool = @import("core/pool.zig");
-    pub const arena = @import("core/arena.zig");
-    pub const coverage = @import("core/coverage.zig");
-    pub const assert = @import("core/assert.zig");
 };
 
 pub const net = struct {
@@ -69,8 +54,6 @@ pub const http = struct {
     pub const validate = @import("http/validate.zig");
 };
 
-pub const server = @import("server.zig");
-
 pub const json = struct {
     pub const parse = @import("json/parse.zig");
     pub const serialize = @import("json/serialize.zig");
@@ -78,7 +61,6 @@ pub const json = struct {
 
 pub const security = struct {
     pub const cors = @import("security/cors.zig");
-
     pub const headers = @import("security/headers.zig");
     pub const jwt = @import("security/jwt.zig");
 };
@@ -106,12 +88,7 @@ pub const cli = struct {
 };
 
 pub const testing = struct {
-    /// Full-stack test client (TestClient). Makes real HTTP requests over
-    /// loopback. Use for integration and end-to-end tests.
     pub const client = @import("testing/client.zig");
     pub const conformance = @import("testing/conformance.zig");
     pub const simulation = @import("testing/simulation.zig");
-    // Internal: not part of public API. UnitTestClient is for snek's own
-    // development/testing, not for user consumption.
-    // const fake_client = @import("testing/fake_client.zig");
 };

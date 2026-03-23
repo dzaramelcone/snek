@@ -520,71 +520,12 @@ pub fn invokePythonHandler(
 }
 
 // ── Server startup ──────────────────────────────────────────────────
+// TODO: rewrite server from scratch using io_uring properly (tardy pattern)
 
-const server_mod = @import("../server.zig");
-const posix = std.posix;
-
-/// Global server pointer for signal handler context.
-/// Signal handlers are C callbacks with no user data parameter.
-var global_server: ?*server_mod.Server = null;
-
-fn shutdownSignalHandler(_: c_int) callconv(.c) void {
-    if (global_server) |srv| srv.shutdown();
-}
-
-fn installShutdownSignals() void {
-    const act = posix.Sigaction{
-        .handler = .{ .handler = shutdownSignalHandler },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &act, null);
-    posix.sigaction(posix.SIG.INT, &act, null);
-}
-
-/// Start the HTTP server with Python handlers wired in.
-/// Called from _snek.run(host, port[, module_ref]).
 pub fn startServer(host: []const u8, port: u16) !void {
-    const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
-    var srv = try server_mod.Server.init(std.heap.page_allocator, .{ .num_threads = 4 });
-    defer srv.deinit();
-    defer releaseCachedKeys();
-
-    // Register all Python routes with the Zig router
-    var i: u32 = 0;
-    while (i < module.getHandlerCount(mod)) : (i += 1) {
-        const entry = module.getRouteEntry(mod, i) orelse continue;
-        const method_slice = entry.method[0..entry.method_len];
-        const method = router_mod.Method.fromString(method_slice) orelse continue;
-        const path_slice = entry.path[0..entry.path_len];
-
-        // Register with the Zig router using a Python bridge handler
-        try srv.addPythonRoute(method, path_slice, i);
-    }
-
-    // Pass module_ref to server so worker threads can create sub-interpreters
-    if (module.getModuleRef(mod)) |ref| {
-        srv.setModuleRef(ref);
-    }
-
-    try srv.listen(host, port);
-
-    // Install SIGTERM/SIGINT handlers so the server shuts down cleanly
-    global_server = &srv;
-    installShutdownSignals();
-    defer global_server = null;
-
-    // Release GIL while server runs.
-    // With sub-interpreters: worker threads create their own interpreters + GILs.
-    // Without: workers fall back to shared GIL acquire/release per request.
-    const saved_state = gil.PyEval_SaveThread();
-
-    srv.run() catch |err| {
-        gil.PyEval_RestoreThread(saved_state);
-        return err;
-    };
-
-    gil.PyEval_RestoreThread(saved_state);
+    _ = host;
+    _ = port;
+    @panic("server deleted — rewrite in progress");
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
