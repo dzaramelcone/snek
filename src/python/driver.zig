@@ -570,20 +570,22 @@ pub fn startServer(host: []const u8, port: u16) !void {
         try srv.addPythonRoute(method, path_slice, i);
     }
 
-    // Set module_ref so each tardy thread creates its own sub-interpreter
-    if (module.getModuleRef(mod)) |ref| {
-        srv.setModuleRef(ref);
-    }
+    // Inject the Python handler function (wrapper adds py_ctx param)
+    srv.py_handler_fn = &pyHandlerBridge;
 
     global_server = &srv;
     installShutdownSignals();
     defer global_server = null;
 
-    // Release GIL while server runs — sub-interpreters create their own
+    // Release GIL while server runs
     const saved_state = gil.PyEval_SaveThread();
-    defer gil.PyEval_RestoreThread(saved_state);
 
-    try srv.run();
+    srv.run() catch |err| {
+        gil.PyEval_RestoreThread(saved_state);
+        return err;
+    };
+
+    gil.PyEval_RestoreThread(saved_state);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

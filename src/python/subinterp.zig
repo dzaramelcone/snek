@@ -64,7 +64,6 @@ fn createSubInterpreter() !*anyopaque {
     // Success: we are now on the new sub-interpreter's thread state.
     // Py_NewInterpreterFromConfig has detached us from the main interpreter.
     // Do NOT release main_gil_state — we're no longer on that interpreter.
-
     return tstate.?;
 }
 
@@ -89,17 +88,13 @@ pub const WorkerPyContext = struct {
         // Acquire the main interpreter's GIL to call Py_NewInterpreterFromConfig.
         // On success, the new sub-interpreter is attached and we hold ITS GIL.
         // On failure, we must release the main GIL.
-        const tstate = try createSubInterpreter();
+        const tstate = createSubInterpreter() catch |err| return err;
 
-        // Set up sys.path — sub-interpreters start with minimal path.
-        // Add cwd and import site to get venv packages.
-        const sys_path = c.PySys_GetObject("path") orelse return error.SubInterpreterImportFailed;
-        const cwd = try ffi.unicodeFromString(".");
-        defer ffi.decref(cwd);
-        if (c.PyList_Insert(sys_path, 0, cwd) != 0) return error.SubInterpreterImportFailed;
-        // Import site to activate venv site-packages
-        const site_mod = ffi.importModule("site") catch return error.SubInterpreterImportFailed;
-        ffi.decref(site_mod);
+        // Add cwd to sys.path so the user's module can be found
+        ffi.runString("import sys; sys.path.insert(0, '.')") catch {
+            std.log.err("sub-interpreter: failed to set sys.path", .{});
+            return error.SubInterpreterImportFailed;
+        };
 
         // Parse "module:attr" into module name and attr name
         const sep = std.mem.indexOfScalar(u8, module_ref, ':') orelse {
@@ -121,8 +116,8 @@ pub const WorkerPyContext = struct {
         defer ffi.decref(user_mod);
 
         // Get the _snek module — it was populated by the decorators
-        const snek_mod = ffi.importModule("snek._snek") catch {
-            std.log.err("sub-interpreter: failed to import snek._snek", .{});
+        const snek_mod = ffi.importModule("_snek") catch {
+            std.log.err("sub-interpreter: failed to import _snek", .{});
             return error.SubInterpreterImportFailed;
         };
 
