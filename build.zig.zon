@@ -3,7 +3,14 @@
     .version = "0.1.0",
     .fingerprint = 0xd86d1176a5b3db00,
     .minimum_zig_version = "0.15.2",
-    .dependencies = .{},
+    .dependencies = .{
+        .zio = .{
+            .path = "refs/zio",
+        },
+        .tardy = .{
+            .path = "refs/tardy",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

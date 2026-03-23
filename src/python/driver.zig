@@ -519,13 +519,73 @@ pub fn invokePythonHandler(
     };
 }
 
+fn pyHandlerBridge(
+    _: ?*anyopaque,
+    handler_id: u32,
+    parser: *const http1.Parser,
+    params: []const router_mod.PathParam,
+    buf: []u8,
+) response_mod.Response {
+    return invokePythonHandler(handler_id, parser, params, buf);
+}
+
 // ── Server startup ──────────────────────────────────────────────────
-// TODO: rewrite server from scratch using io_uring properly (tardy pattern)
+
+const server_mod = @import("../server.zig");
+const posix = std.posix;
+
+var global_server: ?*server_mod.Server = null;
+
+fn shutdownSignalHandler(_: c_int) callconv(.c) void {
+    // TODO: graceful shutdown via tardy runtime
+    if (global_server) |_| std.process.exit(0);
+}
+
+fn installShutdownSignals() void {
+    const act = posix.Sigaction{
+        .handler = .{ .handler = shutdownSignalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.INT, &act, null);
+}
 
 pub fn startServer(host: []const u8, port: u16) !void {
-    _ = host;
-    _ = port;
-    @panic("server deleted — rewrite in progress");
+    const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
+
+    var srv = server_mod.Server.init(std.heap.smp_allocator, .{
+        .host = host,
+        .port = port,
+    });
+    defer srv.deinit();
+
+    // Register Python routes
+    var i: u32 = 0;
+    while (i < module.getHandlerCount(mod)) : (i += 1) {
+        const entry = module.getRouteEntry(mod, i) orelse continue;
+        const method_slice = entry.method[0..entry.method_len];
+        const method = router_mod.Method.fromString(method_slice) orelse continue;
+        const path_slice = entry.path[0..entry.path_len];
+        try srv.addPythonRoute(method, path_slice, i);
+    }
+
+    // Inject the Python handler function (wrapper adds py_ctx param)
+    srv.py_handler_fn = &pyHandlerBridge;
+
+    global_server = &srv;
+    installShutdownSignals();
+    defer global_server = null;
+
+    // Release GIL while server runs
+    const saved_state = gil.PyEval_SaveThread();
+
+    srv.run() catch |err| {
+        gil.PyEval_RestoreThread(saved_state);
+        return err;
+    };
+
+    gil.PyEval_RestoreThread(saved_state);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

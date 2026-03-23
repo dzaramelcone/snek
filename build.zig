@@ -2,13 +2,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 fn linkPython(m: *std.Build.Module) void {
-    const os = m.resolved_target.?.result.os.tag;
-    if (os == .macos) {
+    const target = m.resolved_target.?.result;
+    if (target.os.tag == .macos) {
         m.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/include/python3.14" });
         m.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib" });
-    } else {
+    } else if (target.cpu.arch == .aarch64) {
         m.addIncludePath(.{ .cwd_relative = "sysroot/linux-aarch64/include/python3.14" });
         m.addLibraryPath(.{ .cwd_relative = "sysroot/linux-aarch64/lib" });
+    } else {
+        m.addIncludePath(.{ .cwd_relative = "sysroot/linux-x86_64/include/python3.14" });
+        m.addLibraryPath(.{ .cwd_relative = "sysroot/linux-x86_64/lib" });
     }
     m.linkSystemLibrary("python3.14", .{});
     m.link_libc = true;
@@ -46,6 +49,36 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // --- Benchmark servers (zio + tardy runtimes) ---
+    const zio_dep = b.dependency("zio", .{ .target = target, .optimize = optimize });
+    const tardy_dep = b.dependency("tardy", .{ .target = target, .optimize = optimize });
+
+    const bench_zio = b.addExecutable(.{
+        .name = "bench-zio",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/controls/zig-zio/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    b.installArtifact(bench_zio);
+
+    const bench_tardy = b.addExecutable(.{
+        .name = "bench-tardy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/controls/zig-tardy/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tardy", .module = tardy_dep.module("tardy") },
+            },
+        }),
+    });
+    b.installArtifact(bench_tardy);
 
     // --- Python extension shared library (_snek.so) ---
     const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
