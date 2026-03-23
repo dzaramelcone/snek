@@ -567,9 +567,6 @@ pub fn startServer(host: []const u8, port: u16) !void {
     }
 
     installShutdownSignals();
-
-    // Release main GIL. Each tardy thread creates its own sub-interpreter.
-    // srv.run() blocks until exit(0) from signal handler — no cleanup needed.
     _ = gil.PyEval_SaveThread();
     try srv.run();
 }
