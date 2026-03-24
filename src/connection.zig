@@ -23,6 +23,9 @@ pub const Provision = struct {
     state: State = .recv_headers,
     fd: std.posix.socket_t = undefined,
     task_id: io.TaskId = 0,
+    pool_index: usize = 0,
+    rt: io.Runtime = undefined,
+    provisions: *Pool(Provision) = undefined,
     recv_slice: []u8 = &.{},
     resp_buf: [8192]u8 = undefined,
     resp_len: usize = 0,
@@ -141,8 +144,8 @@ pub const Provision = struct {
 
     fn close(self: *Provision) ?io.AsyncSubmission {
         std.posix.close(self.fd);
-        // Runtime will see null return and the task stays idle.
-        // Acceptor is responsible for releasing via the pool.
+        self.rt.release(self.task_id);
+        self.provisions.release(self.pool_index);
         return null;
     }
 };

@@ -78,8 +78,10 @@ pub const Stackless = struct {
     fn runImpl(ptr: *anyopaque) !void {
         const s = cast(ptr);
 
+        // Initial submit to flush any jobs queued before run() (e.g. accept)
+        try s.aio.submit();
+
         while (s.running) {
-            try s.aio.submit();
             const completions = try s.aio.reap(true);
 
             for (completions) |c| {
@@ -96,6 +98,8 @@ pub const Stackless = struct {
                     try s.aio.queue_job(id, next_job);
                 }
             }
+
+            try s.aio.submit();
         }
     }
 

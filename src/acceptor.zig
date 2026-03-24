@@ -31,6 +31,9 @@ pub const Acceptor = struct {
         try prov.ensureInit(self.allocator);
         try prov.reset();
         prov.fd = fd;
+        prov.pool_index = idx;
+        prov.rt = self.rt;
+        prov.provisions = self.provisions;
 
         const task_id = try self.rt.register(@ptrCast(prov), Provision.step);
         prov.task_id = task_id;
