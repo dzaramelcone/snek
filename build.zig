@@ -20,37 +20,42 @@ fn linkPython(m: *std.Build.Module) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const is_cross = target.result.os.tag != builtin.os.tag or target.result.cpu.arch != builtin.cpu.arch;
 
-    // --- Library module ---
-    const mod = b.addModule("snek", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-    });
-    linkPython(mod);
+    // -Dpython: build Python extension and runner (default: true for native, false for cross)
+    const python = b.option(bool, "python", "Build Python extension and runner") orelse !is_cross;
 
-    // --- Executable ---
-    const exe = b.addExecutable(.{
-        .name = "snek",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+    // --- Standalone executable (native only) ---
+    if (!is_cross) {
+        const mod = b.addModule("snek", .{
+            .root_source_file = b.path("src/root.zig"),
             .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "snek", .module = mod },
-            },
-        }),
-    });
-    b.installArtifact(exe);
+        });
+        linkPython(mod);
 
-    const run_step = b.step("run", "Run the snek CLI");
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        const exe = b.addExecutable(.{
+            .name = "snek",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "snek", .module = mod },
+                },
+            }),
+        });
+        b.installArtifact(exe);
+
+        const run_step = b.step("run", "Run the snek CLI");
+        const run_cmd = b.addRunArtifact(exe);
+        run_step.dependOn(&run_cmd.step);
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
     }
 
-    // --- Benchmark servers (zio + tardy runtimes) ---
+    // --- Benchmark servers ---
     const zio_dep = b.dependency("zio", .{ .target = target, .optimize = optimize });
     const tardy_dep = b.dependency("tardy", .{ .target = target, .optimize = optimize });
 
@@ -80,55 +85,37 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench_tardy);
 
-    // --- Python extension shared library (_snek.so) ---
-    const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
-    const pyext = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "_snek",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    linkPython(pyext.root_module);
-    // Ad-hoc codesign after build (macOS requires valid signature for dlopen)
-    const codesign = b.addSystemCommand(&.{ "codesign", "-fs", "-" });
-    codesign.addFileArg(pyext.getEmittedBin());
-    codesign.step.dependOn(&pyext.step);
-    b.installArtifact(pyext);
-    pyext_step.dependOn(&codesign.step);
+    // --- Python targets (skipped when cross-compiling unless -Dpython=true) ---
+    if (python) {
+        // Python extension shared library (_snek.so / .dylib)
+        const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
+        const pyext = b.addLibrary(.{
+            .linkage = .dynamic,
+            .name = "_snek",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/lib.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        linkPython(pyext.root_module);
+        b.installArtifact(pyext);
+        if (target.result.os.tag == .macos) {
+            const codesign = b.addSystemCommand(&.{ "codesign", "-fs", "-" });
+            codesign.addFileArg(pyext.getEmittedBin());
+            codesign.step.dependOn(&pyext.step);
+            pyext_step.dependOn(&codesign.step);
+        } else {
+            pyext_step.dependOn(&pyext.step);
+        }
 
-    // --- Embedded runner (snek_runner) ---
-    const runner = b.addExecutable(.{
-        .name = "snek_runner",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/snek_runner.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    linkPython(runner.root_module);
-    b.installArtifact(runner);
+    }
 
-    // --- Tests ---
+    // --- Tests (native only) ---
+    if (is_cross) return;
+
     const test_step = b.step("test", "Run all unit tests");
 
-    // Library module tests
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
-    });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-    test_step.dependOn(&run_mod_tests.step);
-
-    // Executable module tests
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-    test_step.dependOn(&run_exe_tests.step);
-
-    // Individual module tests
     const test_sources = [_][]const u8{
         "src/core/kqueue.zig",
         "src/net/tcp.zig",
@@ -169,10 +156,8 @@ pub fn build(b: *std.Build) void {
         "src/config/toml.zig",
         "src/config/env.zig",
         "src/serve/static.zig",
-        // src/serve/client.zig uses cross-domain imports; tested via root module
         "src/cli/main.zig",
         "src/cli/commands.zig",
-        // src/testing/client.zig and fake_client.zig use cross-domain imports; tested via root module
         "src/testing/conformance.zig",
         "src/testing/simulation.zig",
     };
@@ -185,11 +170,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        const run_t = b.addRunArtifact(t);
-        test_step.dependOn(&run_t.step);
+        test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // Python FFI modules — need CPython include/lib paths
     const python_test_sources = [_][]const u8{
         "src/python/ffi.zig",
         "src/python/gil.zig",
@@ -210,7 +193,6 @@ pub fn build(b: *std.Build) void {
             }),
         });
         linkPython(t.root_module);
-        const run_t = b.addRunArtifact(t);
-        test_step.dependOn(&run_t.step);
+        test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }

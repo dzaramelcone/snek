@@ -199,6 +199,33 @@ pub fn getNone() *PyObject {
     return none;
 }
 
+// ── Bytes operations ────────────────────────────────────────────────
+
+/// Check if an object is bytes.
+pub fn isBytes(obj: *PyObject) bool {
+    return c.PyBytes_Check(obj) != 0;
+}
+
+/// Allocate a PyBytes with uninitialized buffer. Caller must decref.
+/// Pass null data to get writable memory via bytesAsSlice.
+pub fn bytesNew(len: isize) PythonError!*PyObject {
+    return c.PyBytes_FromStringAndSize(null, len) orelse return error.PythonError;
+}
+
+/// Get a mutable pointer to the PyBytes internal buffer.
+pub fn bytesAsSlice(obj: *PyObject, len: usize) [*]u8 {
+    const ptr: [*]u8 = @ptrCast(c.PyBytes_AS_STRING(obj));
+    _ = len;
+    return ptr;
+}
+
+/// Get PyBytes data as a const slice.
+pub fn bytesData(obj: *PyObject) []const u8 {
+    const ptr: [*]const u8 = @ptrCast(c.PyBytes_AS_STRING(obj));
+    const len: usize = @intCast(c.PyBytes_GET_SIZE(obj));
+    return ptr[0..len];
+}
+
 // ── Tuple operations ────────────────────────────────────────────────
 
 pub fn tupleNew(len: isize) PythonError!*PyObject {

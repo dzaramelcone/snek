@@ -1,111 +1,56 @@
-//! Stackless async runtime — implements io.Runtime.
+//! Event loop — submit IoOps, wait for completions, call task.step().
 //!
-//! Everything is a task driven by completions. No stack allocation.
-//! Uses tardy's Async for I/O and Pool for task management.
+//! No task registry. Tasks are long-lived structs (Connection, accept loop)
+//! whose pointers round-trip through the kernel via user_data/udata.
 
 const std = @import("std");
-const io = @import("io.zig");
-const aio_lib = @import("vendor/tardy/aio/lib.zig");
-const Async = aio_lib.Async;
-const tardy = @import("vendor/tardy/lib.zig");
-const Pool = tardy.Pool;
+const aio = @import("aio/lib.zig");
+const Task = @import("task.zig").Task;
 
-const Task = struct {
-    ctx: *anyopaque = undefined,
-    step: io.StepFn = undefined,
-};
+const log = std.log.scoped(.@"snek/runtime");
 
-pub const Stackless = struct {
-    aio: Async,
-    allocator: std.mem.Allocator,
-    tasks: Pool(Task),
+pub const Runtime = struct {
+    backend: aio.Backend,
     running: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator, aio: Async, initial_tasks: u32) !Stackless {
+    pub fn init(allocator: std.mem.Allocator, entries: u16) !Runtime {
         return .{
-            .aio = aio,
-            .allocator = allocator,
-            .tasks = try Pool(Task).init(allocator, initial_tasks, .grow),
+            .backend = try aio.Backend.init(allocator, entries),
         };
     }
 
-    pub fn deinit(self: *Stackless) void {
-        self.tasks.deinit();
+    pub fn deinit(self: *Runtime, allocator: std.mem.Allocator) void {
+        self.backend.deinit(allocator);
     }
 
-    pub fn runtime(self: *Stackless) io.Runtime {
-        return .{
-            .ptr = @ptrCast(self),
-            .vtable = .{
-                .register = &registerImpl,
-                .release = &releaseImpl,
-                .submit = &submitImpl,
-                .call_soon = &callSoonImpl,
-                .run = &runImpl,
-                .stop = &stopImpl,
-            },
-        };
+    pub fn queue(self: *Runtime, task: *Task, op: aio.IoOp) !void {
+        try self.backend.queue(task, op);
     }
 
-    fn cast(ptr: *anyopaque) *Stackless {
-        return @ptrCast(@alignCast(ptr));
-    }
+    pub fn run(self: *Runtime) !void {
+        while (self.running) {
+            // Block until at least 1 event
+            _ = try self.processCompletions(1);
 
-    fn registerImpl(ptr: *anyopaque, ctx: *anyopaque, step_fn: io.StepFn) !io.TaskId {
-        const s = cast(ptr);
-        const id = try s.tasks.borrow();
-        const task = s.tasks.get_ptr(id);
-        task.* = .{ .ctx = ctx, .step = step_fn };
-        return @intCast(id);
-    }
-
-    fn releaseImpl(ptr: *anyopaque, id: io.TaskId) void {
-        cast(ptr).tasks.release(id);
-    }
-
-    fn submitImpl(ptr: *anyopaque, id: io.TaskId, job: io.AsyncSubmission) !void {
-        try cast(ptr).aio.queue_job(id, job);
-    }
-
-    fn callSoonImpl(ptr: *anyopaque, ctx: *anyopaque, step_fn: io.StepFn) !void {
-        const s = cast(ptr);
-        const id = try s.tasks.borrow();
-        const task = s.tasks.get_ptr(id);
-        task.* = .{ .ctx = ctx, .step = step_fn };
-        try s.aio.queue_job(id, .{ .timer = .{ .seconds = 0, .nanos = 0 } });
-    }
-
-    fn runImpl(ptr: *anyopaque) !void {
-        const s = cast(ptr);
-
-        // Initial submit to flush any jobs queued before run() (e.g. accept)
-        try s.aio.submit();
-
-        while (s.running) {
-            const completions = try s.aio.reap(true);
-
-            for (completions) |c| {
-                if (c.result == .wake) {
-                    if (!s.running) return;
-                    continue;
-                }
-
-                const id: io.TaskId = @intCast(c.task);
-                if (!s.tasks.dirty.isSet(id)) continue;
-
-                const task = s.tasks.get_ptr(id);
-                if (task.step(task.ctx, id, c.result)) |next_job| {
-                    try s.aio.queue_job(id, next_job);
-                }
+            // Drain: keep processing ready events without blocking
+            while (true) {
+                const had_work = try self.processCompletions(0);
+                if (!had_work) break;
             }
-
-            try s.aio.submit();
         }
     }
 
-    fn stopImpl(ptr: *anyopaque) void {
-        const s = cast(ptr);
-        s.running = false;
-        s.aio.wake() catch {};
+    /// Submit pending ops, wait for completions, call step on each.
+    /// Returns true if any completions were processed.
+    fn processCompletions(self: *Runtime, wait_nr: u32) !bool {
+        const completions = try self.backend.submitAndWait(wait_nr);
+
+        for (completions.tasks, completions.results) |task, result| {
+            if (task.step(task, result)) |next_op| {
+                try self.backend.queue(task, next_op);
+            }
+        }
+
+        return completions.tasks.len > 0;
     }
 };

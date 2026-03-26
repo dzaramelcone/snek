@@ -41,39 +41,48 @@ class App:
         _snek.run(host, port, module_ref)
 
 
+def _encode_resp(*args: str) -> bytes:
+    """Encode a Redis command as RESP protocol bytes."""
+    parts = [b"*", str(len(args)).encode(), b"\r\n"]
+    for arg in args:
+        encoded = arg.encode() if isinstance(arg, str) else arg
+        parts.extend([b"$", str(len(encoded)).encode(), b"\r\n", encoded, b"\r\n"])
+    return b"".join(parts)
+
+
 class Redis:
     @types.coroutine
     def get(self, key: str):
-        return (yield ("redis", "GET", key))
+        return (yield ("redis", _encode_resp("GET", key)))
 
     @types.coroutine
     def set(self, key: str, value: str):
-        return (yield ("redis", "SET", key, value))
+        return (yield ("redis", _encode_resp("SET", key, value)))
 
     @types.coroutine
     def setex(self, key: str, seconds: int, value: str):
-        return (yield ("redis", "SETEX", key, str(seconds), value))
+        return (yield ("redis", _encode_resp("SETEX", key, str(seconds), value)))
 
     @types.coroutine
     def delete(self, *keys: str):
-        return (yield ("redis", "DEL", *keys))
+        return (yield ("redis", _encode_resp("DEL", *keys)))
 
     @types.coroutine
     def incr(self, key: str):
-        return (yield ("redis", "INCR", key))
+        return (yield ("redis", _encode_resp("INCR", key)))
 
     @types.coroutine
     def expire(self, key: str, seconds: int):
-        return (yield ("redis", "EXPIRE", key, str(seconds)))
+        return (yield ("redis", _encode_resp("EXPIRE", key, str(seconds))))
 
     @types.coroutine
     def ttl(self, key: str):
-        return (yield ("redis", "TTL", key))
+        return (yield ("redis", _encode_resp("TTL", key)))
 
     @types.coroutine
     def exists(self, *keys: str):
-        return (yield ("redis", "EXISTS", *keys))
+        return (yield ("redis", _encode_resp("EXISTS", *keys)))
 
     @types.coroutine
     def ping(self):
-        return (yield ("redis", "PING"))
+        return (yield ("redis", _encode_resp("PING")))

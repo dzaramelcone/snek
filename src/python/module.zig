@@ -13,7 +13,6 @@ const c = ffi.c;
 const PyObject = ffi.PyObject;
 const driver = @import("driver.zig");
 const server_mod = @import("../server.zig");
-const redis = @import("../redis/connection.zig");
 
 // ── Module state ────────────────────────────────────────────────────
 
@@ -405,58 +404,10 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 /// _snek.redis_command("GET", "key") or _snek.redis_command("SET", "key", "val")
 /// Uses the thread-local redis connection and tardy runtime for async I/O.
 /// Bulk string responses are received directly into PyBytes (zero-copy).
-fn pyRedisCommand(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
-    const tuple = args orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "redis_command requires arguments");
-        return null;
-    };
-    const tuple_size = if (ffi.isTuple(tuple)) ffi.tupleSize(tuple) else 0;
-    if (tuple_size < 1) {
-        c.PyErr_SetString(c.PyExc_TypeError, "redis_command requires at least 1 argument");
-        return null;
-    }
-
-    // Build args slice from Python tuple
-    var cmd_args: [16][*:0]const u8 = undefined;
-    var cmd_slices: [16][]const u8 = undefined;
-    var i: usize = 0;
-    while (i < tuple_size and i < 16) : (i += 1) {
-        const obj = ffi.tupleGetItem(tuple, @intCast(i)) orelse {
-            c.PyErr_SetString(c.PyExc_TypeError, "redis_command arguments must be strings");
-            return null;
-        };
-        cmd_args[i] = ffi.unicodeAsUTF8(obj) catch {
-            c.PyErr_SetString(c.PyExc_TypeError, "redis_command arguments must be strings");
-            return null;
-        };
-        cmd_slices[i] = std.mem.span(cmd_args[i]);
-    }
-
-    // Get thread-local context (has runtime + redis connection)
-    const ctx = server_mod.getThreadContext() orelse {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "redis_command: no thread context (not inside a request handler)");
-        return null;
-    };
-
-    // Lazy-connect redis on first use
-    if (ctx.redis_client == null) {
-        ctx.redis_client = redis.Client.connect(ctx.rt, "127.0.0.1", 6379) catch {
-            c.PyErr_SetString(c.PyExc_ConnectionError, "failed to connect to redis");
-            return null;
-        };
-    }
-    var client = &ctx.redis_client.?;
-
-    // Send command and read response — yields to tardy during I/O
-    client.sendCommand(ctx.rt, cmd_slices[0..i]) catch {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "redis send failed");
-        return null;
-    };
-    return client.readPythonResponse(ctx.rt) catch {
-        if (!ffi.errOccurred()) // readPythonResponse sets PyErr for '-' responses
-            c.PyErr_SetString(c.PyExc_RuntimeError, "redis read failed");
-        return null;
-    };
+fn pyRedisCommand(_: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
+    // TODO: async redis via Task context swap (RedisCtx)
+    c.PyErr_SetString(c.PyExc_RuntimeError, "redis_command: async path not yet implemented");
+    return null;
 }
 
 // ── Module definition (multi-phase init, PEP 489) ───────────────────

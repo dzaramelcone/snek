@@ -1,43 +1,49 @@
-//! Async Redis connection using tardy's Socket.
+//! Blocking Redis connection using posix sockets.
 //!
-//! Each tardy thread owns one connection. Commands yield to the tardy scheduler
-//! during I/O, allowing other coroutines to run. Bulk string responses are read
-//! directly into PyBytes objects (zero-copy from socket to Python).
+//! Each worker thread owns one connection. Commands block the calling thread
+//! during I/O — this is fine because the Python handler is already blocking.
+//! Bulk string responses are read directly into PyBytes objects (zero-copy
+//! from socket to Python).
 
 const std = @import("std");
-const tardy = @import("../vendor/tardy/lib.zig");
-const Socket = tardy.Socket;
-const Runtime = tardy.Runtime;
 const ffi = @import("../python/ffi.zig");
 const c = ffi.c;
-const protocol = @import("protocol.zig");
+
+const log = std.log.scoped(.@"snek/redis");
 
 pub const Client = struct {
-    socket: Socket,
+    fd: std.posix.socket_t,
 
-    pub fn connect(rt: *Runtime, host: []const u8, port: u16) !Client {
-        const sock = try Socket.init(.{ .tcp = .{ .host = host, .port = port } });
-        try sock.connect(rt);
-        return .{ .socket = sock };
+    pub fn connect(host: []const u8, port: u16) !Client {
+        const addr = try std.net.Address.resolveIp(host, port);
+        const fd = try std.posix.socket(addr.any.family, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+        errdefer std.posix.close(fd);
+        try std.posix.connect(fd, &addr.any, addr.getOsSockLen());
+        return .{ .fd = fd };
     }
 
     /// Send a RESP command encoded into a stack buffer. No heap allocation.
-    pub fn sendCommand(self: *Client, rt: *Runtime, args: []const []const u8) !void {
+    pub fn sendCommand(self: *Client, args: []const []const u8) !void {
         var buf: [4096]u8 = undefined;
         const len = encodeInto(&buf, args);
-        _ = try self.socket.send_all(rt, buf[0..len]);
+        var sent: usize = 0;
+        while (sent < len) {
+            const n = try std.posix.send(self.fd, buf[sent..len], 0);
+            if (n == 0) return error.ConnectionClosed;
+            sent += n;
+        }
     }
 
     /// Read a RESP response and return the value as a Python object.
     /// Bulk strings are received directly into PyBytes (zero-copy).
     /// Simple strings become PyUnicode, integers become PyLong, null becomes Py_None.
-    pub fn readPythonResponse(self: *Client, rt: *Runtime) !*ffi.PyObject {
+    pub fn readPythonResponse(self: *Client) !*ffi.PyObject {
         var frame_buf: [256]u8 = undefined;
         var frame_len: usize = 0;
 
         // Read at least the type byte and first \r\n
         while (true) {
-            const n = try self.socket.recv(rt, frame_buf[frame_len..]);
+            const n = try self.recv(frame_buf[frame_len..]);
             if (n == 0) return error.ConnectionClosed;
             frame_len += n;
             if (std.mem.indexOf(u8, frame_buf[0..frame_len], "\r\n") != null) break;
@@ -87,7 +93,7 @@ pub const Client = struct {
                 // Recv remaining payload directly into Python's buffer
                 var filled = already;
                 while (filled < payload_len) {
-                    const n = try self.socket.recv(rt, dest[filled..payload_len]);
+                    const n = try self.recv(dest[filled..payload_len]);
                     if (n == 0) return error.ConnectionClosed;
                     filled += n;
                 }
@@ -97,7 +103,7 @@ pub const Client = struct {
                 var trail_read = overshoot;
                 var trail_buf: [2]u8 = undefined;
                 while (trail_read < 2) {
-                    const n = try self.socket.recv(rt, trail_buf[trail_read..]);
+                    const n = try self.recv(trail_buf[trail_read..]);
                     trail_read += n;
                 }
 
@@ -114,7 +120,7 @@ pub const Client = struct {
                 errdefer c.Py_DECREF(py_list);
 
                 for (0..count) |i| {
-                    const item = try self.readPythonResponse(rt);
+                    const item = try self.readPythonResponse();
                     // PyList_SET_ITEM steals the reference
                     c.PyList_SET_ITEM(py_list, @intCast(i), item);
                 }
@@ -126,8 +132,12 @@ pub const Client = struct {
         }
     }
 
+    fn recv(self: *Client, buf: []u8) !usize {
+        return std.posix.recv(self.fd, buf, 0);
+    }
+
     pub fn close(self: *Client) void {
-        self.socket.close_blocking();
+        std.posix.close(self.fd);
     }
 };
 

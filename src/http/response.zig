@@ -95,44 +95,37 @@ pub const Response = struct {
     }
 
     /// Serialize to HTTP/1.1 response bytes.
+    /// Mirrors zzz's response writer: status line, Connection: keep-alive,
+    /// user headers, Content-Length, blank line, body.
     pub fn serialize(self: *const Response, buf: []u8) error{BufferTooSmall}!usize {
-        var pos: usize = 0;
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
 
         // Status line
-        const sl = statusLine(self.status);
-        if (pos + sl.len > buf.len) return error.BufferTooSmall;
-        @memcpy(buf[pos..][0..sl.len], sl);
-        pos += sl.len;
+        w.writeAll(statusLine(self.status)) catch return error.BufferTooSmall;
 
-        // Headers
+        // Connection: keep-alive (matches zzz behavior)
+        w.writeAll("Connection: keep-alive\r\n") catch return error.BufferTooSmall;
+
+        // User headers
         for (self.headers[0..self.header_count]) |h| {
-            const needed = h.name.len + 2 + h.value.len + 2;
-            if (pos + needed > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos..][0..h.name.len], h.name);
-            pos += h.name.len;
-            buf[pos] = ':';
-            buf[pos + 1] = ' ';
-            pos += 2;
-            @memcpy(buf[pos..][0..h.value.len], h.value);
-            pos += h.value.len;
-            buf[pos] = '\r';
-            buf[pos + 1] = '\n';
-            pos += 2;
+            w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.BufferTooSmall;
+        }
+
+        // Content-Length
+        if (self.body) |b| {
+            w.print("Content-Length: {d}\r\n", .{b.len}) catch return error.BufferTooSmall;
         }
 
         // End of headers
-        if (pos + 2 > buf.len) return error.BufferTooSmall;
-        buf[pos] = '\r';
-        buf[pos + 1] = '\n';
-        pos += 2;
+        w.writeAll("\r\n") catch return error.BufferTooSmall;
 
         // Body
         if (self.body) |b| {
-            if (pos + b.len > buf.len) return error.BufferTooSmall;
-            @memcpy(buf[pos..][0..b.len], b);
-            pos += b.len;
+            w.writeAll(b) catch return error.BufferTooSmall;
         }
-        return pos;
+
+        return fbs.pos;
     }
 };
 

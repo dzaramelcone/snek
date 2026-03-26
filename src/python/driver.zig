@@ -368,165 +368,146 @@ fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
 
 // ── Python handler invocation ───────────────────────────────────────
 
+/// Result of invoking a Python handler — either completed or needs async I/O.
+pub const InvokeResult = union(enum) {
+    /// Handler completed synchronously — response is ready.
+    response: response_mod.Response,
+    /// Handler yielded a redis sentinel — needs async I/O.
+    /// py_coro and py_cmd_bytes are incref'd; caller must manage lifetime.
+    redis_yield: RedisYield,
+
+    pub const RedisYield = struct {
+        py_coro: *PyObject,
+        py_cmd_bytes: *PyObject,
+        cmd_data: []const u8,
+    };
+
+    pub fn redis_yield_type() type {
+        return RedisYield;
+    }
+};
+
 /// Invoke a Python handler. Caller must hold the GIL and provide the _snek module.
+/// Returns InvokeResult — either a response or a redis yield requiring async I/O.
 pub fn invokePythonHandler(
     mod: *PyObject,
     handler_id: u32,
     req: *const http1.Request,
     params: []const router_mod.PathParam,
     resp_body_buf: []u8,
-) response_mod.Response {
+) InvokeResult {
     const handler = module.getHandler(mod, handler_id) orelse
-        return response_mod.Response.init(500);
+        return .{ .response = response_mod.Response.init(500) };
     const flags = module.getHandlerFlags(mod, handler_id);
 
     const call_result = if (flags.no_args) blk: {
         break :blk ffi.callObject(handler, null) catch {
             if (ffi.errOccurred()) ffi.errPrint();
-            return response_mod.Response.init(500);
+            return .{ .response = response_mod.Response.init(500) };
         };
     } else if (flags.needs_params) blk: {
-        const empty_args = ffi.tupleNew(0) catch return response_mod.Response.init(500);
+        const empty_args = ffi.tupleNew(0) catch return .{ .response = response_mod.Response.init(500) };
         defer ffi.decref(empty_args);
 
         if (params.len > 0) {
-            const kwargs = buildParamsKwargs(params) catch return response_mod.Response.init(500);
+            const kwargs = buildParamsKwargs(params) catch return .{ .response = response_mod.Response.init(500) };
             defer ffi.decref(kwargs);
             break :blk ffi.callObjectKwargs(handler, empty_args, kwargs) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
-                return response_mod.Response.init(500);
+                return .{ .response = response_mod.Response.init(500) };
             };
         } else {
             break :blk ffi.callObject(handler, empty_args) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
-                return response_mod.Response.init(500);
+                return .{ .response = response_mod.Response.init(500) };
             };
         }
     } else blk: {
-        const req_dict = buildRequestDict(req, params) catch return response_mod.Response.init(500);
+        const req_dict = buildRequestDict(req, params) catch return .{ .response = response_mod.Response.init(500) };
         defer ffi.decref(req_dict);
-        const call_args = ffi.tupleNew(1) catch return response_mod.Response.init(500);
+        const call_args = ffi.tupleNew(1) catch return .{ .response = response_mod.Response.init(500) };
         ffi.incref(req_dict);
         ffi.tupleSetItem(call_args, 0, req_dict) catch {
             ffi.decref(call_args);
-            return response_mod.Response.init(500);
+            return .{ .response = response_mod.Response.init(500) };
         };
         const result = ffi.callObject(handler, call_args) catch {
             ffi.decref(call_args);
             if (ffi.errOccurred()) ffi.errPrint();
-            return response_mod.Response.init(500);
+            return .{ .response = response_mod.Response.init(500) };
         };
         ffi.decref(call_args);
         break :blk result;
     };
 
-    // Drive coroutines (async def) to completion via sentinel loop.
-    // Each yield sends a sentinel tuple describing an I/O operation.
-    // Zig performs the I/O on tardy, then resumes the coroutine with the result.
-    const py_result = if (ffi.isCoroutine(call_result)) blk: {
-        defer ffi.decref(call_result);
-        var send_val: *PyObject = ffi.getNone();
+    // Drive coroutines (async def) — first yield may require async I/O.
+    if (ffi.isCoroutine(call_result)) {
+        // First send: coro.send(None)
+        if (ffi.callMethod1(call_result, "send", ffi.getNone())) |sentinel| {
+            defer ffi.decref(sentinel);
 
-        while (true) {
-            if (ffi.callMethod1(call_result, "send", send_val)) |sentinel| {
-                // Coroutine yielded a sentinel — handle the I/O operation
-                defer ffi.decref(sentinel);
-                ffi.decref(send_val);
-
-                send_val = handleSentinel(sentinel) orelse {
-                    if (ffi.errOccurred()) ffi.errPrint();
-                    return response_mod.Response.init(500);
-                };
-            } else |_| {
-                // StopIteration — coroutine completed
-                ffi.decref(send_val);
-                const exc = ffi.errFetch();
-                defer {
-                    if (exc.exc_type) |t| ffi.decref(t);
-                    if (exc.exc_tb) |tb| ffi.decref(tb);
-                }
-                if (exc.exc_value) |val| {
-                    const result = ffi.stopIterationValue(val) orelse val;
-                    if (result != val) ffi.decref(val);
-                    break :blk result;
-                }
-                return response_mod.Response.init(500);
+            // Check for redis sentinel: ("redis", b"RESP bytes")
+            if (checkRedisSentinel(sentinel)) |cmd_info| {
+                // Async path — return the coroutine and command to caller.
+                // Caller will set up RedisCtx and swap Task context.
+                // call_result (coroutine) ownership transfers to caller.
+                ffi.incref(cmd_info.py_cmd_bytes);
+                return .{ .redis_yield = .{
+                    .py_coro = call_result,
+                    .py_cmd_bytes = cmd_info.py_cmd_bytes,
+                    .cmd_data = cmd_info.cmd_data,
+                } };
             }
-        }
-    } else call_result;
-    defer ffi.decref(py_result);
 
-    return convertPythonResponse(py_result, resp_body_buf) catch response_mod.Response.init(500);
+            // Non-redis sentinel — error for now
+            ffi.decref(call_result);
+            if (ffi.errOccurred()) ffi.errPrint();
+            return .{ .response = response_mod.Response.init(500) };
+        } else |_| {
+            // StopIteration on first send — coroutine returned immediately
+            ffi.decref(call_result);
+            const exc = ffi.errFetch();
+            defer {
+                if (exc.exc_type) |t| ffi.decref(t);
+                if (exc.exc_tb) |tb| ffi.decref(tb);
+            }
+            if (exc.exc_value) |val| {
+                const result = ffi.stopIterationValue(val) orelse val;
+                if (result != val) ffi.decref(val);
+                defer ffi.decref(result);
+                return .{ .response = convertPythonResponse(result, resp_body_buf) catch response_mod.Response.init(500) };
+            }
+            return .{ .response = response_mod.Response.init(500) };
+        }
+    }
+
+    // Sync handler — not a coroutine
+    defer ffi.decref(call_result);
+    return .{ .response = convertPythonResponse(call_result, resp_body_buf) catch response_mod.Response.init(500) };
 }
 
-const server_mod = @import("../server.zig");
-const redis = @import("../redis/connection.zig");
-
-/// Interpret a sentinel yielded by a Python coroutine.
-/// Returns a new PyObject to send back to the coroutine, or null on error.
-fn handleSentinel(sentinel: *PyObject) ?*PyObject {
-    if (!ffi.isTuple(sentinel) or ffi.tupleSize(sentinel) < 1) {
-        c.PyErr_SetString(c.PyExc_TypeError, "coroutine yielded non-sentinel value");
-        return null;
-    }
+/// Check if a sentinel is a redis command: ("redis", b"RESP bytes").
+/// Returns the command bytes info if it is, null otherwise.
+pub fn checkRedisSentinel(sentinel: *PyObject) ?struct { py_cmd_bytes: *PyObject, cmd_data: []const u8 } {
+    if (!ffi.isTuple(sentinel) or ffi.tupleSize(sentinel) < 2) return null;
 
     const op_obj = ffi.tupleGetItem(sentinel, 0) orelse return null;
     if (!ffi.isString(op_obj)) return null;
     const op = std.mem.span(ffi.unicodeAsUTF8(op_obj) catch return null);
+    if (!std.mem.eql(u8, op, "redis")) return null;
 
-    const ctx = server_mod.getThreadContext() orelse {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "no thread context");
-        return null;
-    };
+    const bytes_obj = ffi.tupleGetItem(sentinel, 1) orelse return null;
+    if (!ffi.isBytes(bytes_obj)) return null;
 
-    if (std.mem.eql(u8, op, "redis")) {
-        return handleRedisSentinel(ctx, sentinel);
-    }
-
-    c.PyErr_SetString(c.PyExc_ValueError, "unknown sentinel operation");
-    return null;
-}
-
-fn handleRedisSentinel(ctx: *server_mod.ThreadContext, sentinel: *PyObject) ?*PyObject {
-    const size = ffi.tupleSize(sentinel);
-    if (size < 2) {
-        c.PyErr_SetString(c.PyExc_TypeError, "redis sentinel requires at least (\"redis\", command)");
-        return null;
-    }
-
-    // Build RESP command args from sentinel tuple: ("redis", "GET", "key") → ["GET", "key"]
-    var cmd_strs: [16][*:0]const u8 = undefined;
-    var cmd_slices: [16][]const u8 = undefined;
-    var i: usize = 1; // skip "redis" at index 0
-    while (i < @as(usize, @intCast(size)) and i < 17) : (i += 1) {
-        const obj = ffi.tupleGetItem(sentinel, @intCast(i)) orelse return null;
-        cmd_strs[i - 1] = ffi.unicodeAsUTF8(obj) catch return null;
-        cmd_slices[i - 1] = std.mem.span(cmd_strs[i - 1]);
-    }
-    const arg_count = i - 1;
-
-    // Lazy-connect redis on first use
-    if (ctx.redis_client == null) {
-        ctx.redis_client = redis.Client.connect(ctx.rt, "127.0.0.1", 6379) catch {
-            c.PyErr_SetString(c.PyExc_ConnectionError, "failed to connect to redis");
-            return null;
-        };
-    }
-    var client = &ctx.redis_client.?;
-
-    client.sendCommand(ctx.rt, cmd_slices[0..arg_count]) catch {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "redis send failed");
-        return null;
-    };
-    return client.readPythonResponse(ctx.rt) catch {
-        if (!ffi.errOccurred())
-            c.PyErr_SetString(c.PyExc_RuntimeError, "redis read failed");
-        return null;
+    return .{
+        .py_cmd_bytes = bytes_obj,
+        .cmd_data = ffi.bytesData(bytes_obj),
     };
 }
 
 // ── Server startup ──────────────────────────────────────────────────
 
+const server_mod = @import("../server.zig");
 const posix = std.posix;
 
 fn shutdownSignalHandler(_: c_int) callconv(.c) void {
@@ -544,14 +525,29 @@ fn installShutdownSignals() void {
     posix.sigaction(posix.SIG.INT, &act, null);
 }
 
+const drv_log = std.log.scoped(.@"snek/driver");
+
 pub fn startServer(host: []const u8, port: u16) !void {
-    _ = module.getCurrentModule() orelse return error.ModuleNotSet;
+    drv_log.info("startServer called host={s} port={d}", .{ host, port });
+    const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
+    const state = module.getState(mod) orelse return error.ModuleNotSet;
 
     installShutdownSignals();
-    _ = gil.PyEval_SaveThread();
 
-    const server2 = @import("../server2.zig");
-    try server2.run(std.heap.smp_allocator, host, port);
+    var server = server_mod.Server.init(std.heap.smp_allocator, host, port);
+    defer server.deinit();
+
+    if (module.getModuleRef(mod)) |ref| server.setModuleRef(ref);
+
+    var i: u32 = 0;
+    while (i < state.py_handler_count) : (i += 1) {
+        const entry = state.route_entries[i];
+        const method = router_mod.Method.fromString(entry.method[0..entry.method_len]) orelse continue;
+        server.addPythonRoute(method, entry.path[0..entry.path_len], i) catch continue;
+    }
+
+    _ = gil.PyEval_SaveThread();
+    try server_mod.run(std.heap.smp_allocator, &server);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

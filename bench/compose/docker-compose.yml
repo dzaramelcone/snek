@@ -1,0 +1,18 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  bench:
+    build: .
+    ports:
+      - "8080:8080"
+    working_dir: /bench
+    command: sleep infinity
+    depends_on:
+      - redis
+    volumes:
+      - ../../python:/bench/snek_root
+      - ../../zig-out/lib:/bench/snek_lib:ro
+      - ./snek_app.py:/bench/snek_app.py:ro
+      - ./snek_redis_app.py:/bench/snek_redis_app.py:ro

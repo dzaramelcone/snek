@@ -1,6 +1,13 @@
 //! Shared library entry point for _snek Python extension module.
 //! Exports PyInit__snek for Python to load.
 
+const std = @import("std");
+const snek_log = @import("log.zig");
+
+pub const std_options: std.Options = .{
+    .logFn = snek_log.logFn,
+};
+
 pub const python = struct {
     pub const ffi = @import("python/ffi.zig");
     pub const gil = @import("python/gil.zig");
