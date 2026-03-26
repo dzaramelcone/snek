@@ -37,8 +37,7 @@ pub const db = struct {
 
 pub const redis = struct {
     pub const protocol = @import("redis/protocol.zig");
-    pub const connection = @import("redis/connection.zig");
-    pub const pool = @import("redis/pool.zig");
+    pub const reader = @import("redis/reader.zig");
     pub const commands = @import("redis/commands.zig");
     pub const pubsub = @import("redis/pubsub.zig");
     pub const lua = @import("redis/lua.zig");
