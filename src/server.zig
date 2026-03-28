@@ -29,6 +29,7 @@ pub const Server = struct {
     py_handler_ids: [64]?u32,
     host: []const u8,
     port: u16,
+    num_threads: usize,
     module_ref: [256]u8,
     module_ref_len: u16,
 
@@ -40,6 +41,7 @@ pub const Server = struct {
             .py_handler_ids = .{null} ** 64,
             .host = host,
             .port = port,
+            .num_threads = 1,
             .module_ref = .{0} ** 256,
             .module_ref_len = 0,
         };
@@ -204,18 +206,38 @@ const pipeline_mod = @import("pipeline.zig");
 // ── Pipeline runtime (staged, no step functions) ──────────────────
 
 pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
-    log.info("pipeline: starting on {s}:{d}", .{ server.host, server.port });
+    const num_threads = server.num_threads;
+    log.info("pipeline: starting {d} threads on {s}:{d}", .{ num_threads, server.host, server.port });
 
+    var threads: std.ArrayListUnmanaged(std.Thread) = .{};
+    defer threads.deinit(allocator);
+
+    for (1..num_threads) |_| {
+        const t = try std.Thread.spawn(.{}, pipelineThreadMain, .{ allocator, server });
+        try threads.append(allocator, t);
+    }
+
+    try pipelineThreadMain(allocator, server);
+
+    for (threads.items) |t| t.join();
+}
+
+fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server) !void {
+    // Each thread gets its own socket (SO_REUSEPORT distributes connections)
     const listen_socket = try Socket.initTcp(server.host, server.port);
     try listen_socket.bind();
     try listen_socket.listen(128);
 
-    // Sub-interpreter setup
+    // Each thread gets its own sub-interpreter with its own GIL (PEP 734)
     if (server.module_ref_len > 0) {
         interp_mutex.lock();
         defer interp_mutex.unlock();
         const ref = server.module_ref[0..server.module_ref_len];
         tl_py = try subinterp.WorkerPyContext.init(ref);
+        tl_py.?.acquireGil();
+        const driver = @import("python/driver.zig");
+        try driver.initStringCache();
+        tl_py.?.releaseGil();
         tl_py_ctx = .{ .py = &tl_py.? };
         tl_ctx = .{ .py = tl_py.? };
     }
@@ -227,6 +249,7 @@ pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
         .py_ctx = if (tl_py_ctx) |*p| p else null,
     };
 
+    // Each thread gets its own pipeline + conn pool + io backend
     var conns = try Pool(pipeline_mod.Conn).init(allocator, 1024, .static);
     defer conns.deinit();
 
@@ -235,8 +258,21 @@ pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
     pl.* = try pipeline_mod.Pipeline.init(allocator, &conns, 1024);
 
     pl.req_ctx = if (tl_req_ctx) |*ctx| ctx else null;
+
+    // Redis connection (optional, one pipelined connection per thread)
+    if (tl_py != null) {
+        const redis_host = std.posix.getenv("REDIS_HOST") orelse "127.0.0.1";
+        const redis_fd = RedisReader.connectTcp(redis_host, 6379) catch |err| blk: {
+            log.info("redis not available at {s}: {}, redis commands will fail", .{ redis_host, err });
+            break :blk null;
+        };
+        if (redis_fd) |fd| {
+            pl.initRedis(fd);
+        }
+    }
+
     try pl.start(listen_socket.handle);
-    log.info("pipeline: event loop starting", .{});
+    log.info("pipeline: thread ready", .{});
 
     try pl.run();
 }

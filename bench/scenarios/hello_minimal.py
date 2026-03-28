@@ -3,7 +3,7 @@ import snek
 app = snek.App()
 
 @app.get("/")
-def hello():
+async def hello():
     return {"message": "hello"}
 
 if __name__ == "__main__":

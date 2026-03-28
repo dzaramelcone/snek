@@ -275,49 +275,48 @@ pub const RedisReader = struct {
         const conn = rctx.conn;
         const py_coro = rctx.py_coro;
 
-        if (ffi.callMethod1(py_coro, "send", result)) |sentinel| {
-            defer ffi.decref(sentinel);
-            // Coroutine yielded again — check for another redis command
-            if (driver.checkRedisSentinel(sentinel)) |cmd_info| {
-                ffi.incref(cmd_info.py_cmd_bytes);
-                self.enqueue(waiter, cmd_info.cmd_data);
-                return;
-            }
-            // Unknown sentinel — error
-            self.resumeWithError(rctx, waiter);
-        } else |_| {
-            // StopIteration — coroutine completed
-            const exc = ffi.errFetch();
-            defer {
-                if (exc.exc_type) |t| ffi.decref(t);
-                if (exc.exc_tb) |tb| ffi.decref(tb);
-            }
+        const send = ffi.iterSend(py_coro, result);
+        switch (send.status) {
+            .next => {
+                const sentinel = send.result.?;
+                defer ffi.decref(sentinel);
+                if (driver.checkRedisSentinel(sentinel)) |cmd_info| {
+                    // Re-enqueue: build RESP in send buffer from args
+                    var resp_buf: [512]u8 = undefined;
+                    const resp_len = writeRespLegacy(&resp_buf, cmd_info.args[0..cmd_info.arg_count]);
+                    if (resp_len > 0) {
+                        self.enqueue(waiter, resp_buf[0..resp_len]);
+                        return;
+                    }
+                }
+                self.resumeWithError(rctx, waiter);
+            },
+            .@"return" => {
+                const py_result = send.result orelse ffi.getNone();
+                defer ffi.decref(py_result);
 
-            var py_result: *ffi.PyObject = ffi.getNone();
-            if (exc.exc_value) |val| {
-                py_result = ffi.stopIterationValue(val) orelse val;
-                if (py_result != val) ffi.decref(val);
-            }
-            defer ffi.decref(py_result);
+                var py_body_buf: [4096]u8 = undefined;
+                const resp = driver.convertPythonResponse(py_result, &py_body_buf) catch
+                    response_mod.Response.init(500);
+                var resp_mut = resp;
+                conn.resp_len = resp_mut.serialize(&conn.resp_buf) catch blk: {
+                    const err = "HTTP/1.1 500\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    @memcpy(conn.resp_buf[0..err.len], err);
+                    break :blk err.len;
+                };
 
-            // Convert to HTTP response, serialize, re-queue connection for send
-            var py_body_buf: [4096]u8 = undefined;
-            const resp = driver.convertPythonResponse(py_result, &py_body_buf) catch
-                response_mod.Response.init(500);
-            var resp_mut = resp;
-            conn.resp_len = resp_mut.serialize(&conn.resp_buf) catch blk: {
-                const err = "HTTP/1.1 500\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                @memcpy(conn.resp_buf[0..err.len], err);
-                break :blk err.len;
-            };
-
-            ffi.decref(py_coro);
-            rctx.release();
-            waiter.setCtxAndStep(conn_mod.ConnCtx, conn, conn_mod.onSend);
-            self.rt.queue(waiter, IoOp{ .send = .{
-                .socket = conn.fd,
-                .buffer = conn.resp_buf[0..conn.resp_len],
-            } }) catch {};
+                ffi.decref(py_coro);
+                rctx.release();
+                waiter.setCtxAndStep(conn_mod.ConnCtx, conn, conn_mod.onSend);
+                self.rt.queue(waiter, IoOp{ .send = .{
+                    .socket = conn.fd,
+                    .buffer = conn.resp_buf[0..conn.resp_len],
+                } }) catch {};
+            },
+            .@"error" => {
+                if (ffi.errOccurred()) ffi.errPrint();
+                self.resumeWithError(rctx, waiter);
+            },
         }
     }
 
@@ -362,3 +361,27 @@ pub const RedisReader = struct {
         return h;
     }
 };
+
+/// Build RESP protocol into a buffer from command args (legacy path).
+fn writeRespLegacy(buf: []u8, args: []const []const u8) usize {
+    var pos: usize = 0;
+    if (pos >= buf.len) return 0;
+    buf[pos] = '*';
+    pos += 1;
+    const n_str = std.fmt.bufPrint(buf[pos..], "{d}\r\n", .{args.len}) catch return 0;
+    pos += n_str.len;
+    for (args) |arg| {
+        if (pos >= buf.len) return 0;
+        buf[pos] = '$';
+        pos += 1;
+        const l_str = std.fmt.bufPrint(buf[pos..], "{d}\r\n", .{arg.len}) catch return 0;
+        pos += l_str.len;
+        if (pos + arg.len + 2 > buf.len) return 0;
+        @memcpy(buf[pos..][0..arg.len], arg);
+        pos += arg.len;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+    }
+    return pos;
+}

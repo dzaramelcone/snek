@@ -128,32 +128,18 @@ pub fn errPrint() void {
     c.PyErr_Print();
 }
 
-/// Fetch and clear the current exception. Returns (type, value, traceback).
-/// Caller must decref all non-null returned objects.
-pub fn errFetch() struct { exc_type: ?*PyObject, exc_value: ?*PyObject, exc_tb: ?*PyObject } {
-    var t: ?*PyObject = null;
-    var v: ?*PyObject = null;
-    var tb: ?*PyObject = null;
-    c.PyErr_Fetch(&t, &v, &tb);
-    return .{ .exc_type = t, .exc_value = v, .exc_tb = tb };
-}
-
 /// Check if an object is a coroutine (from async def).
 pub fn isCoroutine(obj: *PyObject) bool {
     return c.PyCoro_CheckExact(obj) != 0;
 }
 
-/// Call a method by name on an object with one argument.
-/// Caller must decref the result.
-pub fn callMethod1(obj: *PyObject, method: [*:0]const u8, arg: *PyObject) PythonError!*PyObject {
-    return c.PyObject_CallMethod(obj, method, "O", arg) orelse {
-        return error.CallError;
-    };
-}
-
-/// Get the StopIteration exception's .value attribute.
-pub fn stopIterationValue(exc_value: *PyObject) ?*PyObject {
-    return c.PyObject_GetAttrString(exc_value, "value");
+/// Fast coroutine/generator send — bypasses method lookup, tuple creation,
+/// and StopIteration exception overhead. Uses the am_send slot directly.
+pub const SendResult = enum(c_int) { @"return" = 0, @"error" = -1, next = 1 };
+pub fn iterSend(iter: *PyObject, arg: *PyObject) struct { result: ?*PyObject, status: SendResult } {
+    var presult: ?*PyObject = null;
+    const status: SendResult = @enumFromInt(c.PyIter_Send(iter, arg, &presult));
+    return .{ .result = presult, .status = status };
 }
 
 // ── Object creation helpers ─────────────────────────────────────────
@@ -180,6 +166,12 @@ pub fn floatAsDouble(obj: *PyObject) PythonError!f64 {
 
 pub fn unicodeFromString(s: [*:0]const u8) PythonError!*PyObject {
     return c.PyUnicode_FromString(s) orelse return error.PythonError;
+}
+
+/// Create a Python str from a pointer + length. No null terminator needed.
+/// One copy: src buffer → Python heap. Python manages the result.
+pub fn unicodeFromSlice(ptr: [*]const u8, len: usize) PythonError!*PyObject {
+    return c.PyUnicode_DecodeUTF8(ptr, @intCast(len), null) orelse return error.PythonError;
 }
 
 pub fn unicodeAsUTF8(obj: *PyObject) PythonError![*:0]const u8 {

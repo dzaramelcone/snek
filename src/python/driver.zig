@@ -13,17 +13,130 @@ const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
 
+// ── Cached Python strings ────────────────────────────────────────────
+// Pre-created PyObject strings for dict keys and HTTP method values.
+// Created once per sub-interpreter (thread-local), reused for every request.
+// Eliminates repeated PyUnicode_FromString calls in the hot path.
+
+pub const StringCache = struct {
+    // Dict keys — used as PyDict_SetItem keys
+    key_method: *PyObject,
+    key_path: *PyObject,
+    key_headers: *PyObject,
+    key_body: *PyObject,
+    key_params: *PyObject,
+    // HTTP method values
+    val_GET: *PyObject,
+    val_POST: *PyObject,
+    val_PUT: *PyObject,
+    val_DELETE: *PyObject,
+    val_PATCH: *PyObject,
+    val_HEAD: *PyObject,
+    val_OPTIONS: *PyObject,
+    val_CONNECT: *PyObject,
+    val_TRACE: *PyObject,
+
+    pub fn init() ffi.PythonError!StringCache {
+        return .{
+            .key_method = try ffi.unicodeFromString("method"),
+            .key_path = try ffi.unicodeFromString("path"),
+            .key_headers = try ffi.unicodeFromString("headers"),
+            .key_body = try ffi.unicodeFromString("body"),
+            .key_params = try ffi.unicodeFromString("params"),
+            .val_GET = try ffi.unicodeFromString("GET"),
+            .val_POST = try ffi.unicodeFromString("POST"),
+            .val_PUT = try ffi.unicodeFromString("PUT"),
+            .val_DELETE = try ffi.unicodeFromString("DELETE"),
+            .val_PATCH = try ffi.unicodeFromString("PATCH"),
+            .val_HEAD = try ffi.unicodeFromString("HEAD"),
+            .val_OPTIONS = try ffi.unicodeFromString("OPTIONS"),
+            .val_CONNECT = try ffi.unicodeFromString("CONNECT"),
+            .val_TRACE = try ffi.unicodeFromString("TRACE"),
+        };
+    }
+
+    pub fn methodObj(self: *const StringCache, method: ?http1.Method) *PyObject {
+        return if (method) |m| switch (m) {
+            .GET => self.val_GET,
+            .POST => self.val_POST,
+            .PUT => self.val_PUT,
+            .DELETE => self.val_DELETE,
+            .PATCH => self.val_PATCH,
+            .HEAD => self.val_HEAD,
+            .OPTIONS => self.val_OPTIONS,
+            .CONNECT => self.val_CONNECT,
+            .TRACE => self.val_TRACE,
+        } else self.val_GET;
+    }
+};
+
+threadlocal var tl_string_cache: ?StringCache = null;
+
+/// Initialize the per-thread string cache. Must be called with GIL held.
+pub fn initStringCache() !void {
+    tl_string_cache = try StringCache.init();
+}
+
 // ── Request dict builder ────────────────────────────────────────────
 
 /// Build a Python dict representing the HTTP request.
 ///
 /// Returns a new dict: {"method": "GET", "path": "/", "headers": {...}, "body": "..."}
 /// Caller must decref the returned dict.
-/// Safe to call from any interpreter (main or sub-interpreter).
+/// Uses thread-local StringCache for dict keys and method values.
 pub fn buildRequestDict(req: *const http1.Request, params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
     const dict = try ffi.dictNew();
 
-    // Method
+    // Use cached strings if available, fall back to per-request allocation
+    if (tl_string_cache) |*sc| {
+        // Method — cached PyObject, no allocation
+        try ffi.dictSetItem(dict, sc.key_method, sc.methodObj(req.method));
+
+        // Path — recv buffer → Python heap, one copy, no intermediate buffer
+        const path = req.uri orelse "/";
+        const path_obj = try ffi.unicodeFromSlice(path.ptr, path.len);
+        defer ffi.decref(path_obj);
+        try ffi.dictSetItem(dict, sc.key_path, path_obj);
+
+        // Headers — each name/value goes straight from recv buffer to Python heap
+        const headers_dict = try ffi.dictNew();
+        defer ffi.decref(headers_dict);
+        for (req.headers[0..req.header_count]) |h| {
+            const name_obj = try ffi.unicodeFromSlice(h.name.ptr, h.name.len);
+            defer ffi.decref(name_obj);
+            const val_obj = try ffi.unicodeFromSlice(h.value.ptr, h.value.len);
+            defer ffi.decref(val_obj);
+            try ffi.dictSetItem(headers_dict, name_obj, val_obj);
+        }
+        try ffi.dictSetItem(dict, sc.key_headers, headers_dict);
+
+        // Body — straight from recv buffer if present
+        if (req.body) |body_slice| {
+            const body_obj = try ffi.unicodeFromSlice(body_slice.ptr, body_slice.len);
+            defer ffi.decref(body_obj);
+            try ffi.dictSetItem(dict, sc.key_body, body_obj);
+        } else {
+            const none = ffi.getNone();
+            defer ffi.decref(none);
+            try ffi.dictSetItem(dict, sc.key_body, none);
+        }
+
+        // Params
+        if (params.len > 0) {
+            const params_dict = try buildParamsKwargs(params);
+            defer ffi.decref(params_dict);
+            try ffi.dictSetItem(dict, sc.key_params, params_dict);
+        }
+
+        return dict;
+    }
+
+    // Fallback: no cache (e.g. main interpreter, tests)
+    return buildRequestDictUncached(dict, req, params);
+}
+
+/// Fallback dict builder without string cache.
+fn buildRequestDictUncached(dict: *PyObject, req: *const http1.Request, params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
     const method_str: [*:0]const u8 = if (req.method) |m| switch (m) {
         .GET => "GET",
         .POST => "POST",
@@ -39,46 +152,26 @@ pub fn buildRequestDict(req: *const http1.Request, params: []const router_mod.Pa
     defer ffi.decref(method_obj);
     try ffi.dictSetItemString(dict, "method", method_obj);
 
-    // Path
     const path = req.uri orelse "/";
-    var path_buf: [8192:0]u8 = undefined;
-    if (path.len >= path_buf.len) return error.PythonError;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const path_obj = try ffi.unicodeFromString(path_buf[0..path.len :0]);
+    const path_obj = try ffi.unicodeFromSlice(path.ptr, path.len);
     defer ffi.decref(path_obj);
     try ffi.dictSetItemString(dict, "path", path_obj);
 
-    // Headers dict
     const headers_dict = try ffi.dictNew();
     defer ffi.decref(headers_dict);
     for (req.headers[0..req.header_count]) |h| {
-        var name_buf: [256:0]u8 = undefined;
-        if (h.name.len >= name_buf.len) continue;
-        @memcpy(name_buf[0..h.name.len], h.name);
-        name_buf[h.name.len] = 0;
-
-        var val_buf: [4096:0]u8 = undefined;
-        if (h.value.len >= val_buf.len) continue;
-        @memcpy(val_buf[0..h.value.len], h.value);
-        val_buf[h.value.len] = 0;
-
-        const val_obj = try ffi.unicodeFromString(val_buf[0..h.value.len :0]);
+        const name_obj = try ffi.unicodeFromSlice(h.name.ptr, h.name.len);
+        defer ffi.decref(name_obj);
+        const val_obj = try ffi.unicodeFromSlice(h.value.ptr, h.value.len);
         defer ffi.decref(val_obj);
-        try ffi.dictSetItemString(headers_dict, name_buf[0..h.name.len :0], val_obj);
+        try ffi.dictSetItem(headers_dict, name_obj, val_obj);
     }
     try ffi.dictSetItemString(dict, "headers", headers_dict);
 
-    // Body (if present)
     if (req.body) |body_slice| {
-        var body_buf: [8192:0]u8 = undefined;
-        if (body_slice.len < body_buf.len) {
-            @memcpy(body_buf[0..body_slice.len], body_slice);
-            body_buf[body_slice.len] = 0;
-            const body_obj = try ffi.unicodeFromString(body_buf[0..body_slice.len :0]);
-            defer ffi.decref(body_obj);
-            try ffi.dictSetItemString(dict, "body", body_obj);
-        }
+        const body_obj = try ffi.unicodeFromSlice(body_slice.ptr, body_slice.len);
+        defer ffi.decref(body_obj);
+        try ffi.dictSetItemString(dict, "body", body_obj);
     } else {
         const none = ffi.getNone();
         defer ffi.decref(none);
@@ -99,19 +192,11 @@ pub fn buildRequestDict(req: *const http1.Request, params: []const router_mod.Pa
 pub fn buildParamsKwargs(params: []const router_mod.PathParam) ffi.PythonError!*PyObject {
     const kwargs = try ffi.dictNew();
     for (params) |p| {
-        var pname_buf: [256:0]u8 = undefined;
-        if (p.name.len >= pname_buf.len) continue;
-        @memcpy(pname_buf[0..p.name.len], p.name);
-        pname_buf[p.name.len] = 0;
-
-        var pval_buf: [1024:0]u8 = undefined;
-        if (p.value.len >= pval_buf.len) continue;
-        @memcpy(pval_buf[0..p.value.len], p.value);
-        pval_buf[p.value.len] = 0;
-
-        const pval_obj = try ffi.unicodeFromString(pval_buf[0..p.value.len :0]);
-        defer ffi.decref(pval_obj);
-        try ffi.dictSetItemString(kwargs, pname_buf[0..p.name.len :0], pval_obj);
+        const name_obj = try ffi.unicodeFromSlice(p.name.ptr, p.name.len);
+        defer ffi.decref(name_obj);
+        const val_obj = try ffi.unicodeFromSlice(p.value.ptr, p.value.len);
+        defer ffi.decref(val_obj);
+        try ffi.dictSetItem(kwargs, name_obj, val_obj);
     }
     return kwargs;
 }
@@ -373,13 +458,13 @@ pub const InvokeResult = union(enum) {
     /// Handler completed synchronously — response is ready.
     response: response_mod.Response,
     /// Handler yielded a redis sentinel — needs async I/O.
-    /// py_coro and py_cmd_bytes are incref'd; caller must manage lifetime.
+    /// py_coro is owned by caller. RESP is pre-built in Zig-owned memory.
     redis_yield: RedisYield,
 
     pub const RedisYield = struct {
         py_coro: *PyObject,
-        py_cmd_bytes: *PyObject,
-        cmd_data: []const u8,
+        resp: [256]u8,
+        resp_len: u8,
     };
 
     pub fn redis_yield_type() type {
@@ -441,43 +526,39 @@ pub fn invokePythonHandler(
     };
 
     // Drive coroutines (async def) — first yield may require async I/O.
+    // Uses PyIter_Send for fast path: no method lookup, no args tuple,
+    // no StopIteration exception on return.
     if (ffi.isCoroutine(call_result)) {
-        // First send: coro.send(None)
-        if (ffi.callMethod1(call_result, "send", ffi.getNone())) |sentinel| {
-            defer ffi.decref(sentinel);
+        const send = ffi.iterSend(call_result, ffi.getNone());
+        switch (send.status) {
+            .next => {
+                // Coroutine yielded — check for redis sentinel
+                const sentinel = send.result.?;
+                defer ffi.decref(sentinel);
 
-            // Check for redis sentinel: ("redis", b"RESP bytes")
-            if (checkRedisSentinel(sentinel)) |cmd_info| {
-                // Async path — return the coroutine and command to caller.
-                // Caller will set up RedisCtx and swap Task context.
-                // call_result (coroutine) ownership transfers to caller.
-                ffi.incref(cmd_info.py_cmd_bytes);
-                return .{ .redis_yield = .{
-                    .py_coro = call_result,
-                    .py_cmd_bytes = cmd_info.py_cmd_bytes,
-                    .cmd_data = cmd_info.cmd_data,
-                } };
-            }
-
-            // Non-redis sentinel — error for now
-            ffi.decref(call_result);
-            if (ffi.errOccurred()) ffi.errPrint();
-            return .{ .response = response_mod.Response.init(500) };
-        } else |_| {
-            // StopIteration on first send — coroutine returned immediately
-            ffi.decref(call_result);
-            const exc = ffi.errFetch();
-            defer {
-                if (exc.exc_type) |t| ffi.decref(t);
-                if (exc.exc_tb) |tb| ffi.decref(tb);
-            }
-            if (exc.exc_value) |val| {
-                const result = ffi.stopIterationValue(val) orelse val;
-                if (result != val) ffi.decref(val);
+                if (checkRedisSentinel(sentinel)) |cmd_info| {
+                    // Build RESP now while sentinel is alive — args point into its memory
+                    var ry = InvokeResult.RedisYield{ .py_coro = call_result, .resp = undefined, .resp_len = 0 };
+                    ry.resp_len = @intCast(writeResp(&ry.resp, cmd_info.args[0..cmd_info.arg_count]));
+                    if (ry.resp_len > 0) return .{ .redis_yield = ry };
+                    // RESP too large — fall through to error
+                }
+                // Unknown sentinel — error
+                ffi.decref(call_result);
+                return .{ .response = response_mod.Response.init(500) };
+            },
+            .@"return" => {
+                // Coroutine returned immediately (async def with no await)
+                ffi.decref(call_result);
+                const result = send.result orelse return .{ .response = response_mod.Response.init(500) };
                 defer ffi.decref(result);
                 return .{ .response = convertPythonResponse(result, resp_body_buf) catch response_mod.Response.init(500) };
-            }
-            return .{ .response = response_mod.Response.init(500) };
+            },
+            .@"error" => {
+                ffi.decref(call_result);
+                if (ffi.errOccurred()) ffi.errPrint();
+                return .{ .response = response_mod.Response.init(500) };
+            },
         }
     }
 
@@ -486,23 +567,58 @@ pub fn invokePythonHandler(
     return .{ .response = convertPythonResponse(call_result, resp_body_buf) catch response_mod.Response.init(500) };
 }
 
-/// Check if a sentinel is a redis command: ("redis", b"RESP bytes").
-/// Returns the command bytes info if it is, null otherwise.
-pub fn checkRedisSentinel(sentinel: *PyObject) ?struct { py_cmd_bytes: *PyObject, cmd_data: []const u8 } {
-    if (!ffi.isTuple(sentinel) or ffi.tupleSize(sentinel) < 2) return null;
+/// Check if a sentinel is a redis command: ("redis", "GET", "key", ...).
+/// Extracts command args as string slices (valid while GIL held).
+pub const RedisSentinel = struct {
+    args: [8][]const u8,
+    arg_count: u8,
+};
+
+pub fn checkRedisSentinel(sentinel: *PyObject) ?RedisSentinel {
+    if (!ffi.isTuple(sentinel)) return null;
+    const size = ffi.tupleSize(sentinel);
+    if (size < 2) return null;
 
     const op_obj = ffi.tupleGetItem(sentinel, 0) orelse return null;
     if (!ffi.isString(op_obj)) return null;
     const op = std.mem.span(ffi.unicodeAsUTF8(op_obj) catch return null);
     if (!std.mem.eql(u8, op, "redis")) return null;
 
-    const bytes_obj = ffi.tupleGetItem(sentinel, 1) orelse return null;
-    if (!ffi.isBytes(bytes_obj)) return null;
+    var result = RedisSentinel{ .args = undefined, .arg_count = 0 };
+    var i: isize = 1;
+    while (i < size and result.arg_count < 8) : (i += 1) {
+        const arg_obj = ffi.tupleGetItem(sentinel, i) orelse return null;
+        if (!ffi.isString(arg_obj)) return null;
+        const s = ffi.unicodeAsUTF8(arg_obj) catch return null;
+        result.args[result.arg_count] = std.mem.span(s);
+        result.arg_count += 1;
+    }
+    return result;
+}
 
-    return .{
-        .py_cmd_bytes = bytes_obj,
-        .cmd_data = ffi.bytesData(bytes_obj),
-    };
+/// Build RESP protocol into a buffer from command args.
+/// Returns bytes written, or 0 if buffer too small.
+pub fn writeResp(buf: []u8, args: []const []const u8) usize {
+    var pos: usize = 0;
+    if (pos >= buf.len) return 0;
+    buf[pos] = '*';
+    pos += 1;
+    const n_str = std.fmt.bufPrint(buf[pos..], "{d}\r\n", .{args.len}) catch return 0;
+    pos += n_str.len;
+    for (args) |arg| {
+        if (pos >= buf.len) return 0;
+        buf[pos] = '$';
+        pos += 1;
+        const l_str = std.fmt.bufPrint(buf[pos..], "{d}\r\n", .{arg.len}) catch return 0;
+        pos += l_str.len;
+        if (pos + arg.len + 2 > buf.len) return 0;
+        @memcpy(buf[pos..][0..arg.len], arg);
+        pos += arg.len;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+    }
+    return pos;
 }
 
 // ── Server startup ──────────────────────────────────────────────────
@@ -536,6 +652,11 @@ pub fn startServer(host: []const u8, port: u16) !void {
 
     var server = server_mod.Server.init(std.heap.smp_allocator, host, port);
     defer server.deinit();
+
+    // SNEK_THREADS env var controls worker count (default: 1)
+    if (std.posix.getenv("SNEK_THREADS")) |threads_str| {
+        server.num_threads = std.fmt.parseInt(usize, threads_str, 10) catch 1;
+    }
 
     if (module.getModuleRef(mod)) |ref| server.setModuleRef(ref);
 
