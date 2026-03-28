@@ -79,6 +79,16 @@ pub const Kqueue = struct {
                 };
                 self.change_count += 1;
             },
+            .sendv => |inner| {
+                self.changes[self.change_count] = .{
+                    .ident = @intCast(inner.socket),
+                    .filter = system.EVFILT.WRITE,
+                    .flags = system.EV.ADD | system.EV.ONESHOT,
+                    .fflags = 0, .data = 0,
+                    .udata = @intFromPtr(task),
+                };
+                self.change_count += 1;
+            },
             .connect => |inner| {
                 self.changes[self.change_count] = .{
                     .ident = @intCast(inner.socket),
@@ -141,6 +151,10 @@ pub const Kqueue = struct {
             },
             .send => |inner| {
                 const rc = system.sendto(inner.socket, inner.buffer.ptr, inner.buffer.len, 0, null, 0);
+                return @intCast(rc);
+            },
+            .sendv => |inner| {
+                const rc = system.writev(inner.socket, inner.iovecs.ptr, @intCast(inner.iovecs.len));
                 return @intCast(rc);
             },
             .connect => return 0,

@@ -18,6 +18,10 @@ pub const IoOp = union(enum) {
         socket: std.posix.socket_t,
         buffer: []const u8,
     },
+    sendv: struct {
+        socket: std.posix.socket_t,
+        iovecs: []const std.posix.iovec_const,
+    },
     close: std.posix.socket_t,
     timer: struct {
         seconds: u63,

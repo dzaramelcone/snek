@@ -56,7 +56,7 @@ pub const Request = struct {
     /// All returned slices point into `bytes`.
     pub fn parse(bytes: []const u8) ParseError!Request {
         var req = Request{};
-        var lines = LineIterator{ .data = bytes };
+        var lines = std.mem.splitSequence(u8, bytes, "\r\n");
 
         // Request line: METHOD SP URI SP VERSION
         const request_line = lines.next() orelse return error.MalformedRequest;
@@ -103,9 +103,9 @@ pub const Request = struct {
         }
 
         // Body: everything after headers in the input
-        const header_end = lines.pos;
-        if (header_end < bytes.len) {
-            req.body = bytes[header_end..];
+        const rest = lines.rest();
+        if (rest.len > 0) {
+            req.body = rest;
         }
 
         return req;
@@ -122,25 +122,6 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-/// Iterates over \r\n-delimited lines in a byte slice.
-const LineIterator = struct {
-    data: []const u8,
-    pos: usize = 0,
-
-    fn next(self: *LineIterator) ?[]const u8 {
-        if (self.pos >= self.data.len) return null;
-        const remaining = self.data[self.pos..];
-        if (std.mem.indexOf(u8, remaining, "\r\n")) |crlf| {
-            const line = remaining[0..crlf];
-            self.pos += crlf + 2;
-            return line;
-        }
-        // Last line without trailing \r\n
-        const line = remaining;
-        self.pos = self.data.len;
-        return line;
-    }
-};
 
 // --- Response ---
 

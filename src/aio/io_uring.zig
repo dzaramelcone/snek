@@ -17,7 +17,7 @@ pub const IoUring = struct {
     capacity: usize,
 
     pub fn init(allocator: std.mem.Allocator, entries: u16) !IoUring {
-        const flags: u32 = linux.IORING_SETUP_COOP_TASKRUN;
+        const flags: u32 = 0;
         const ring = try linux.IoUring.init(entries, flags);
 
         return .{
@@ -46,6 +46,9 @@ pub const IoUring = struct {
             },
             .send => |inner| {
                 _ = try self.ring.send(udata, inner.socket, inner.buffer, 0);
+            },
+            .sendv => |inner| {
+                _ = try self.ring.writev(udata, inner.socket, inner.iovecs, 0);
             },
             .connect => |inner| {
                 var addr = inner.addr;

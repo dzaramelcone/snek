@@ -35,6 +35,59 @@ pub const HandleResult = union(enum) {
     redis_yield: driver.InvokeResult.redis_yield_type(),
 };
 
+/// Result for pipeline — Response object (not serialized) or redis yield.
+pub const RawResult = union(enum) {
+    response: response_mod.Response,
+    redis_yield: driver.InvokeResult.redis_yield_type(),
+};
+
+/// Handle request, return structured Response (not serialized).
+/// body_buf is where Python response body text is copied into.
+pub fn handleRequestRaw(
+    req: *const http1.Request,
+    ctx: *const RequestContext,
+    body_buf: []u8,
+) RawResult {
+    const method_str = if (req.method) |m| @tagName(m) else "GET";
+    const method = router_mod.Method.fromString(method_str) orelse .GET;
+    const path = req.uri orelse "/";
+
+    switch (ctx.router.match(method, path)) {
+        .found => |found| {
+            if (ctx.py_handler_ids[found.handler_id]) |py_id| {
+                if (ctx.py_ctx) |py| {
+                    py.py.acquireGil();
+                    const invoke_result = driver.invokePythonHandler(
+                        py.py.snek_module, py_id, req,
+                        found.params[0..found.param_count], body_buf,
+                    );
+                    switch (invoke_result) {
+                        .response => |py_resp| {
+                            py.py.releaseGil();
+                            return .{ .response = py_resp };
+                        },
+                        .redis_yield => |ry| {
+                            py.py.releaseGil();
+                            return .{ .redis_yield = ry };
+                        },
+                    }
+                }
+                return .{ .response = response_mod.Response.init(503) };
+            }
+            if (ctx.handlers[found.handler_id]) |handler| {
+                return .{ .response = handler(req) };
+            }
+            return .{ .response = response_mod.Response.init(500) };
+        },
+        .not_found => return .{ .response = response_mod.Response.notFound() },
+        .method_not_allowed => {
+            var r = response_mod.Response.init(405);
+            r.body = "Method Not Allowed";
+            return .{ .response = r };
+        },
+    }
+}
+
 /// Handle a parsed HTTP request: route, invoke handler, serialize response.
 /// Returns HandleResult — either response bytes or async redis yield.
 pub fn handleRequest(

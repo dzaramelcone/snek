@@ -199,3 +199,44 @@ fn threadMain(allocator: std.mem.Allocator, server: *const Server) !void {
 }
 
 const IoOp = @import("aio/io_op.zig").IoOp;
+const pipeline_mod = @import("pipeline.zig");
+
+// ── Pipeline runtime (staged, no step functions) ──────────────────
+
+pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
+    log.info("pipeline: starting on {s}:{d}", .{ server.host, server.port });
+
+    const listen_socket = try Socket.initTcp(server.host, server.port);
+    try listen_socket.bind();
+    try listen_socket.listen(128);
+
+    // Sub-interpreter setup
+    if (server.module_ref_len > 0) {
+        interp_mutex.lock();
+        defer interp_mutex.unlock();
+        const ref = server.module_ref[0..server.module_ref_len];
+        tl_py = try subinterp.WorkerPyContext.init(ref);
+        tl_py_ctx = .{ .py = &tl_py.? };
+        tl_ctx = .{ .py = tl_py.? };
+    }
+
+    tl_req_ctx = .{
+        .router = &server.router,
+        .handlers = &server.handlers,
+        .py_handler_ids = &server.py_handler_ids,
+        .py_ctx = if (tl_py_ctx) |*p| p else null,
+    };
+
+    var conns = try Pool(pipeline_mod.Conn).init(allocator, 1024, .static);
+    defer conns.deinit();
+
+    const pl = try allocator.create(pipeline_mod.Pipeline);
+    defer allocator.destroy(pl);
+    pl.* = try pipeline_mod.Pipeline.init(allocator, &conns, 1024);
+
+    pl.req_ctx = if (tl_req_ctx) |*ctx| ctx else null;
+    try pl.start(listen_socket.handle);
+    log.info("pipeline: event loop starting", .{});
+
+    try pl.run();
+}
