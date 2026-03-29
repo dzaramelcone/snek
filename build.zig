@@ -33,7 +33,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     linkPython(pyext.root_module);
-    b.installArtifact(pyext);
+    const pyext_step = b.step("pyext", "Build _snek Python extension (.so/.dylib)");
+    const install_pyext = b.addInstallArtifact(pyext, .{});
+    if (target.result.os.tag == .macos) {
+        const codesign = b.addSystemCommand(&.{ "codesign", "-fs", "-" });
+        codesign.addFileArg(pyext.getEmittedBin());
+        codesign.step.dependOn(&pyext.step);
+        install_pyext.step.dependOn(&codesign.step);
+    } else {
+        install_pyext.step.dependOn(&pyext.step);
+    }
+    pyext_step.dependOn(&install_pyext.step);
 
     // ── Benchmarks ──────────────────────────────────────────────────
     if (!is_cross) {

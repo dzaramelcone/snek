@@ -5,6 +5,7 @@ zig-out/
 *.so
 *.dylib
 *.pyd
+.DS_Store
 __pycache__/
 *.pyc
 .env
@@ -12,6 +13,12 @@ __pycache__/
 dist/
 build/
 .venv/
+bench/.venv-eventloop/
+tests/conformance/*/results/
+bench/results/eventloop_*/
+bench/results/eventloop_latest
+bench/results/eventloop_logs/
+bench/results/eventloop_echo_logs/
 dump.rdb
 
 # Benchmark binaries
