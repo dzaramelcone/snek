@@ -12,6 +12,9 @@ const module = @import("module.zig");
 const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
+const stmt_cache_mod = @import("../db/stmt_cache.zig");
+const StmtCache = stmt_cache_mod.StmtCache;
+const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
 
 // ── Cached Python strings ────────────────────────────────────────────
 // Pre-created PyObject strings for dict keys and HTTP method values.
@@ -473,6 +476,7 @@ pub const InvokeResult = union(enum) {
         py_coro: *PyObject,
         bytes_written: usize,
         cmd: PgCmd,
+        stmt_idx: u16,
     };
 };
 
@@ -487,6 +491,8 @@ pub fn invokePythonHandler(
     resp_body_buf: []u8,
     redis_send_buf: ?[]u8,
     pg_send_buf: ?[]u8,
+    pg_stmt_cache: ?*StmtCache,
+    pg_conn_prepared: ?*[MAX_PG_STMTS]bool,
 ) !InvokeResult {
     const handler = module.getHandler(mod, handler_id) orelse
         return .{ .response = response_mod.Response.init(500) };
@@ -543,7 +549,7 @@ pub fn invokePythonHandler(
                 const sentinel = send.result.?;
                 defer ffi.decref(sentinel);
 
-                const yield = try classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf);
+                const yield = try classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf, pg_stmt_cache, pg_conn_prepared);
                 return switch (yield) {
                     .redis => |ry| .{ .redis_yield = ry },
                     .pg => |pg| .{ .pg_yield = pg },
@@ -602,6 +608,8 @@ pub fn classifySentinel(
     py_coro: *PyObject,
     redis_buf: ?[]u8,
     pg_buf: ?[]u8,
+    pg_stmt_cache: ?*StmtCache,
+    pg_conn_prepared: ?*[MAX_PG_STMTS]bool,
 ) !SentinelYield {
     if (!ffi.isTuple(sentinel)) return error.SentinelNotTuple;
     const size = ffi.tupleSize(sentinel);
@@ -623,6 +631,7 @@ pub fn classifySentinel(
     // Postgres: command IDs 100-102
     if (id >= 100 and id <= 102) {
         const buf = pg_buf orelse return error.NoPgBuffer;
+        const cache = pg_stmt_cache orelse return error.NoPgStmtCache;
         const cmd: PgCmd = @enumFromInt(@as(u8, @intCast(id)));
         if (size < 2) return error.SentinelMissingSql;
         const sql_obj = ffi.tupleGetItem(sentinel, 1) orelse return error.SentinelMissingSql;
@@ -630,9 +639,9 @@ pub fn classifySentinel(
         const sql_str = try ffi.unicodeAsUTF8(sql_obj);
         const sql = std.mem.span(sql_str);
 
-        const wire = @import("../db/wire.zig");
-        const msg = wire.encodeQuery(buf, sql);
-        return .{ .pg = .{ .py_coro = py_coro, .bytes_written = msg.len, .cmd = cmd } };
+        const prepared = pg_conn_prepared orelse return error.NoPgConnPrepared;
+        const result = try cache.encodeExtended(buf, sql, prepared);
+        return .{ .pg = .{ .py_coro = py_coro, .bytes_written = result.bytes_written, .cmd = cmd, .stmt_idx = result.stmt_idx } };
     }
 
     return error.UnknownSentinelId;

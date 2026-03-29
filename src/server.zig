@@ -290,21 +290,23 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
         }
     }
 
-    // Postgres connection (optional, one pipelined connection per thread)
+    // Postgres connection pool (optional, N pipelined connections per thread)
     if (tl_py != null) {
-        const pg_host = std.posix.getenv("PG_HOST") orelse "127.0.0.1";
-        const pg_port_str = std.posix.getenv("PG_PORT") orelse "5432";
+        const pg_host = posix.getenv("PG_HOST") orelse "127.0.0.1";
+        const pg_port_str = posix.getenv("PG_PORT") orelse "5432";
         const pg_port = std.fmt.parseInt(u16, pg_port_str, 10) catch 5432;
-        const pg_user = std.posix.getenv("PG_USER") orelse "postgres";
-        const pg_pass = std.posix.getenv("PG_PASS") orelse "";
-        const pg_db = std.posix.getenv("PG_DB") orelse "postgres";
+        const pg_user = posix.getenv("PG_USER") orelse "postgres";
+        const pg_pass = posix.getenv("PG_PASS") orelse "";
+        const pg_db = posix.getenv("PG_DB") orelse "postgres";
+        const pg_pool_str = posix.getenv("PG_POOL_SIZE") orelse "1";
+        const pg_pool_size = std.fmt.parseInt(u8, pg_pool_str, 10) catch 1;
         const query_mod = @import("db/query.zig");
-        var pg_client = query_mod.Client.connect(allocator, pg_host, pg_port, pg_user, pg_db, pg_pass) catch |err| blk: {
-            log.info("postgres not available at {s}:{d}: {}, db commands will fail", .{ pg_host, pg_port, err });
-            break :blk null;
-        };
-        if (pg_client) |*client| {
-            pl.initPostgres(client.fd);
+        for (0..pg_pool_size) |_| {
+            const pg_client = query_mod.Client.connect(allocator, pg_host, pg_port, pg_user, pg_db, pg_pass) catch |err| {
+                log.info("postgres not available at {s}:{d}: {}, stopping pool init", .{ pg_host, pg_port, err });
+                break;
+            };
+            pl.addPgConn(pg_client.fd) catch break;
         }
     }
 

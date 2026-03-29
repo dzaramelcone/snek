@@ -329,6 +329,106 @@ pub fn encodeTerminate(buf: []u8) []const u8 {
     return buf[0..5];
 }
 
+// ─── Extended query protocol ─────────────────────────────────────────
+
+/// Encode a Parse message ('P'): prepare a named statement.
+/// Format: tag('P') + length + stmt_name\0 + sql\0 + param_count(u16)
+pub fn encodeParse(buf: []u8, stmt_name: []const u8, sql: []const u8) []const u8 {
+    const length: u32 = @intCast(4 + stmt_name.len + 1 + sql.len + 1 + 2);
+    var pos: usize = 0;
+
+    buf[pos] = Tag.parse;
+    pos += 1;
+    @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
+    pos += 4;
+    @memcpy(buf[pos..][0..stmt_name.len], stmt_name);
+    pos += stmt_name.len;
+    buf[pos] = 0;
+    pos += 1;
+    @memcpy(buf[pos..][0..sql.len], sql);
+    pos += sql.len;
+    buf[pos] = 0;
+    pos += 1;
+    // 0 parameter types
+    @memcpy(buf[pos..][0..2], &mem.toBytes(mem.nativeTo(u16, @as(u16, 0), .big)));
+    pos += 2;
+
+    return buf[0..pos];
+}
+
+/// Encode a Describe message ('D'): request description of a statement or portal.
+/// Format: tag('D') + length + kind('S' or 'P') + name\0
+pub fn encodeDescribe(buf: []u8, kind: u8, name: []const u8) []const u8 {
+    const length: u32 = @intCast(4 + 1 + name.len + 1);
+    var pos: usize = 0;
+
+    buf[pos] = Tag.describe;
+    pos += 1;
+    @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
+    pos += 4;
+    buf[pos] = kind;
+    pos += 1;
+    @memcpy(buf[pos..][0..name.len], name);
+    pos += name.len;
+    buf[pos] = 0;
+    pos += 1;
+
+    return buf[0..pos];
+}
+
+/// Encode a Bind message ('B'): bind a prepared statement to a portal.
+/// Format: tag('B') + length + portal\0 + stmt\0 + 0(u16 format codes) + 0(u16 params) + 0(u16 result formats)
+pub fn encodeBind(buf: []u8, stmt_name: []const u8) []const u8 {
+    const length: u32 = @intCast(4 + 1 + stmt_name.len + 1 + 2 + 2 + 2);
+    var pos: usize = 0;
+
+    buf[pos] = Tag.bind;
+    pos += 1;
+    @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
+    pos += 4;
+    // Empty portal name
+    buf[pos] = 0;
+    pos += 1;
+    // Statement name
+    @memcpy(buf[pos..][0..stmt_name.len], stmt_name);
+    pos += stmt_name.len;
+    buf[pos] = 0;
+    pos += 1;
+    // 0 format codes, 0 parameters, 0 result format codes
+    @memset(buf[pos..][0..6], 0);
+    pos += 6;
+
+    return buf[0..pos];
+}
+
+/// Encode an Execute message ('E'): execute a portal.
+/// Format: tag('E') + length + portal\0 + max_rows(u32)
+pub fn encodeExecute(buf: []u8) []const u8 {
+    const length: u32 = 4 + 1 + 4; // length + empty portal + max_rows
+    var pos: usize = 0;
+
+    buf[pos] = Tag.execute;
+    pos += 1;
+    @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
+    pos += 4;
+    // Empty portal name
+    buf[pos] = 0;
+    pos += 1;
+    // max_rows = 0 (unlimited)
+    @memset(buf[pos..][0..4], 0);
+    pos += 4;
+
+    return buf[0..pos];
+}
+
+/// Encode a Sync message ('S'): marks end of an extended query cycle.
+/// Format: tag('S') + length(4) = 5 bytes total
+pub fn encodeSync(buf: []u8) []const u8 {
+    buf[0] = Tag.sync;
+    @memcpy(buf[1..5], &mem.toBytes(mem.nativeTo(u32, @as(u32, 4), .big)));
+    return buf[0..5];
+}
+
 // ─── Decoding: Backend → Frontend ────────────────────────────────────
 
 /// Read a message header (5 bytes): 1 byte tag + 4 byte length.
