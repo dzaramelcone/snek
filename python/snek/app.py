@@ -95,16 +95,16 @@ class _DbCmd(IntEnum):
 
 
 class Db:
-    """Yield (cmd_id, sql). Zig builds postgres wire messages and pipelines them."""
+    """Yield (cmd_id, sql, *params). Zig builds postgres wire messages and pipelines them."""
 
     @types.coroutine
-    def fetch_one(self, sql: str):
-        return (yield (_DbCmd.FETCH_ONE, sql))
+    def fetch_one(self, sql: str, *params):
+        return (yield (_DbCmd.FETCH_ONE, sql, *params))
 
     @types.coroutine
-    def fetch_all(self, sql: str):
-        return (yield (_DbCmd.FETCH_ALL, sql))
+    def fetch_all(self, sql: str, *params):
+        return (yield (_DbCmd.FETCH_ALL, sql, *params))
 
     @types.coroutine
-    def execute(self, sql: str):
-        return (yield (_DbCmd.EXECUTE, sql))
+    def execute(self, sql: str, *params):
+        return (yield (_DbCmd.EXECUTE, sql, *params))

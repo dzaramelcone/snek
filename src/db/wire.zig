@@ -376,27 +376,67 @@ pub fn encodeDescribe(buf: []u8, kind: u8, name: []const u8) []const u8 {
     return buf[0..pos];
 }
 
-/// Encode a Bind message ('B'): bind a prepared statement to a portal.
+/// Encode a Bind message ('B'): bind a prepared statement to a portal (no params).
 /// Format: tag('B') + length + portal\0 + stmt\0 + 0(u16 format codes) + 0(u16 params) + 0(u16 result formats)
 pub fn encodeBind(buf: []u8, stmt_name: []const u8) []const u8 {
-    const length: u32 = @intCast(4 + 1 + stmt_name.len + 1 + 2 + 2 + 2);
+    return encodeBindWithParams(buf, stmt_name, &.{});
+}
+
+/// Encode a Bind message with text-format parameters.
+/// Each param is a byte slice (text value) or null for SQL NULL.
+pub fn encodeBindWithParams(buf: []u8, stmt_name: []const u8, params: []const ?[]const u8) []const u8 {
     var pos: usize = 0;
 
+    // Tag
     buf[pos] = Tag.bind;
     pos += 1;
-    @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
+
+    // Skip length for now, fill in at the end
+    const length_pos = pos;
     pos += 4;
+
     // Empty portal name
     buf[pos] = 0;
     pos += 1;
+
     // Statement name
     @memcpy(buf[pos..][0..stmt_name.len], stmt_name);
     pos += stmt_name.len;
     buf[pos] = 0;
     pos += 1;
-    // 0 format codes, 0 parameters, 0 result format codes
-    @memset(buf[pos..][0..6], 0);
-    pos += 6;
+
+    // Format codes: 0 = all text
+    @memcpy(buf[pos..][0..2], &mem.toBytes(mem.nativeTo(u16, 0, .big)));
+    pos += 2;
+
+    // Number of parameters
+    const num_params: u16 = @intCast(params.len);
+    @memcpy(buf[pos..][0..2], &mem.toBytes(mem.nativeTo(u16, num_params, .big)));
+    pos += 2;
+
+    // Parameter values
+    for (params) |param| {
+        if (param) |val| {
+            // Length + data
+            const len: i32 = @intCast(val.len);
+            @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(i32, len, .big)));
+            pos += 4;
+            @memcpy(buf[pos..][0..val.len], val);
+            pos += val.len;
+        } else {
+            // NULL: length = -1
+            @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(i32, -1, .big)));
+            pos += 4;
+        }
+    }
+
+    // Result format codes: 0 = all text
+    @memcpy(buf[pos..][0..2], &mem.toBytes(mem.nativeTo(u16, 0, .big)));
+    pos += 2;
+
+    // Fill in length (excludes tag byte)
+    const length: u32 = @intCast(pos - 1);
+    @memcpy(buf[length_pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
 
     return buf[0..pos];
 }

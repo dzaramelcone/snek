@@ -486,7 +486,7 @@ class TestEmitQueries:
             returns_table="users",
         )]
         code = emit_queries(queries, tables, "models")
-        assert "async def get_user(self, *, id: str) -> User | None:" in code
+        assert "def get_user(self, *, id: str) -> User | None:" in code
 
     def test_many_method(self):
         tables = {"t": Table("t", [Column("id", "text", "str")])}
@@ -577,11 +577,12 @@ class TestEndToEnd:
         assert "Optional" not in models
 
         # Db methods
-        assert "async def get_idea(self, *, id: str) -> Idea | None:" in db
-        assert "async def list_ideas(self) -> list[Idea]:" in db
-        assert "async def create_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in db
-        assert "async def delete_idea(self, *, id: str) -> None:" in db
-        assert "async def upsert_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in db
+        assert "def get_idea(self, *, id: str) -> Idea | None:" in db
+        assert "def list_ideas(self) -> list[Idea]:" in db
+        assert "def create_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in db
+        assert "def delete_idea(self, *, id: str) -> None:" in db
+        assert "def upsert_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in db
+        assert "@types.coroutine" in db
 
         # SQL constants
         assert "$1" in db

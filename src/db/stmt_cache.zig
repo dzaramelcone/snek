@@ -57,7 +57,19 @@ pub const StmtCache = struct {
     /// If uncached, writes Parse+Describe+Bind+Execute+Sync and inserts into cache.
     /// Encode extended protocol messages. `conn_prepared` is a per-connection
     /// bitset tracking which statements have been prepared on that connection.
+    pub const MAX_PARAMS = 16;
+
     pub fn encodeExtended(self: *StmtCache, buf: []u8, sql: []const u8, conn_prepared: *[MAX_STMTS]bool) !struct { bytes_written: usize, stmt_idx: u16 } {
+        return self.encodeExtendedWithParams(buf, sql, conn_prepared, &.{});
+    }
+
+    pub fn encodeExtendedWithParams(
+        self: *StmtCache,
+        buf: []u8,
+        sql: []const u8,
+        conn_prepared: *[MAX_STMTS]bool,
+        params: []const ?[]const u8,
+    ) !struct { bytes_written: usize, stmt_idx: u16 } {
         const sql_hash = std.hash.Wyhash.hash(0, sql);
         var pos: usize = 0;
         var name_buf: [8]u8 = undefined;
@@ -77,7 +89,7 @@ pub const StmtCache = struct {
         }
 
         // Always: Bind + Execute + Sync
-        const bind = wire.encodeBind(buf[pos..], name);
+        const bind = wire.encodeBindWithParams(buf[pos..], name, params);
         pos += bind.len;
         const exec = wire.encodeExecute(buf[pos..]);
         pos += exec.len;

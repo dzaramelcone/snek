@@ -223,6 +223,11 @@ pub fn none() *PyObject {
     return @ptrCast(&c._Py_NoneStruct);
 }
 
+/// Check if an object is None.
+pub fn isNone(obj: *PyObject) bool {
+    return obj == none();
+}
+
 /// New reference to None — caller must decref.
 pub fn getNone() *PyObject {
     const n = none();

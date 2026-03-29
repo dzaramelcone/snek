@@ -29,22 +29,22 @@ class TestBasicCrud:
         self.models, self.db, self.queries = _gen("queries_basic.sql")
 
     def test_get_one(self):
-        assert "async def get_idea(self, *, id: str) -> Idea | None:" in self.db
+        assert "def get_idea(self, *, id: str) -> Idea | None:" in self.db
 
     def test_list_many(self):
-        assert "async def list_ideas(self) -> list[Idea]:" in self.db
+        assert "def list_ideas(self) -> list[Idea]:" in self.db
 
     def test_create_returning(self):
-        assert "async def create_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in self.db
+        assert "def create_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in self.db
 
     def test_update_returning(self):
-        assert "async def update_description(self, *, description: str, id: str) -> Idea | None:" in self.db
+        assert "def update_description(self, *, description: str, id: str) -> Idea | None:" in self.db
 
     def test_delete_exec(self):
-        assert "async def delete_idea(self, *, id: str) -> None:" in self.db
+        assert "def delete_idea(self, *, id: str) -> None:" in self.db
 
     def test_delete_execrows(self):
-        assert "async def delete_old_ideas(self, *, before: datetime) -> int:" in self.db
+        assert "def delete_old_ideas(self, *, before: datetime) -> int:" in self.db
 
     def test_model_fields(self):
         assert "class Idea(Model):" in self.models
@@ -62,6 +62,9 @@ class TestBasicCrud:
         assert "Optional" not in self.models
         assert "Optional" not in self.db
 
+    def test_uses_coroutine_decorator(self):
+        assert "@types.coroutine" in self.db
+
 
 # ---------------------------------------------------------------------------
 # Upsert
@@ -72,7 +75,7 @@ class TestUpsert:
         self.models, self.db, self.queries = _gen("queries_upsert.sql")
 
     def test_upsert_idea(self):
-        assert "async def upsert_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in self.db
+        assert "def upsert_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in self.db
 
     def test_upsert_sql_has_on_conflict(self):
         assert "ON CONFLICT" in self.db

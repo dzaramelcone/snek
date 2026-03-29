@@ -619,6 +619,7 @@ pub fn classifySentinel(
     }
 
     // Postgres: command IDs 100-102
+    // Sentinel format: (cmd_id, sql_string, param1, param2, ...)
     if (id >= 100 and id <= 102) {
         const buf = pg_buf orelse return error.NoPgBuffer;
         const cache = pg_stmt_cache orelse return error.NoPgStmtCache;
@@ -629,8 +630,36 @@ pub fn classifySentinel(
         const sql_str = try ffi.unicodeAsUTF8(sql_obj);
         const sql = std.mem.span(sql_str);
 
+        // Extract params from tuple indices 2..size
+        const num_params: usize = @intCast(size - 2);
+        var param_bufs: [StmtCache.MAX_PARAMS]?[]const u8 = .{null} ** StmtCache.MAX_PARAMS;
+        // Backing storage for str() conversions of non-string params
+        var str_bufs: [StmtCache.MAX_PARAMS][64]u8 = undefined;
+
+        for (0..num_params) |pi| {
+            const param_obj = ffi.tupleGetItem(sentinel, @intCast(pi + 2)) orelse continue;
+            if (ffi.isNone(param_obj)) {
+                param_bufs[pi] = null; // SQL NULL
+            } else if (ffi.isString(param_obj)) {
+                const s = try ffi.unicodeAsUTF8(param_obj);
+                param_bufs[pi] = std.mem.span(s);
+            } else {
+                // Convert non-string params (int, float, bool) to text via Python str()
+                const str_obj = ffi.objectStr(param_obj) catch return error.ParamConvertFailed;
+                defer ffi.decref(str_obj);
+                const s = try ffi.unicodeAsUTF8(str_obj);
+                const span = std.mem.span(s);
+                if (span.len <= str_bufs[pi].len) {
+                    @memcpy(str_bufs[pi][0..span.len], span);
+                    param_bufs[pi] = str_bufs[pi][0..span.len];
+                } else {
+                    return error.ParamTooLong;
+                }
+            }
+        }
+
         const prepared = pg_conn_prepared orelse return error.NoPgConnPrepared;
-        const result = try cache.encodeExtended(buf, sql, prepared);
+        const result = try cache.encodeExtendedWithParams(buf, sql, prepared, param_bufs[0..num_params]);
         return .{ .pg = .{ .py_coro = py_coro, .bytes_written = result.bytes_written, .cmd = cmd, .stmt_idx = result.stmt_idx } };
     }
 
