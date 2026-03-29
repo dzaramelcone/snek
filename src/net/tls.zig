@@ -191,16 +191,16 @@ test "plain stream read/write" {
     defer s1.close();
 
     // Write on s0, read on s1.
-    const sent = s0.write("hello tls") catch unreachable;
+    const sent = try s0.write("hello tls");
     try std.testing.expectEqual(@as(usize, 9), sent);
 
     var buf: [64]u8 = undefined;
-    const n = s1.read(&buf) catch unreachable;
+    const n = try s1.read(&buf);
     try std.testing.expectEqualStrings("hello tls", buf[0..n]);
 
     // Reverse direction.
-    _ = s1.write("pong") catch unreachable;
-    const n2 = s0.read(&buf) catch unreachable;
+    _ = try s1.write("pong");
+    const n2 = try s0.read(&buf);
     try std.testing.expectEqualStrings("pong", buf[0..n2]);
 }
 
@@ -229,7 +229,7 @@ test "tls context init/deinit" {
         .key_path = "/tmp/key.pem",
         .min_version = .tls13,
     };
-    var ctx = TlsContext.init(cfg) catch unreachable;
+    var ctx = try TlsContext.init(cfg);
     try std.testing.expect(ctx.initialized);
     try std.testing.expectEqualStrings("/tmp/cert.pem", ctx.config.cert_path);
     try std.testing.expectEqualStrings("/tmp/key.pem", ctx.config.key_path);

@@ -137,10 +137,10 @@ pub const Client = struct {
     }
 
     /// Send Terminate and close the socket.
-    pub fn close(self: *Client) void {
+    pub fn close(self: *Client) !void {
         var term_buf: [8]u8 = undefined;
         const msg = wire.encodeTerminate(&term_buf);
-        _ = posix.write(self.fd, msg) catch unreachable;
+        _ = try posix.write(self.fd, msg);
         posix.close(self.fd);
     }
 
@@ -512,7 +512,7 @@ test "connect to postgres" {
         if (err == error.ConnectionRefused or err == error.ServerError or err == error.AuthenticationFailed) return error.SkipZigTest;
         return err;
     };
-    defer client.close();
+    defer client.close() catch {};
 
     var result = try client.query(allocator, "SELECT 1 AS num");
     defer result.deinit();
@@ -529,7 +529,7 @@ test "query multiple rows" {
         if (err == error.ConnectionRefused or err == error.ServerError or err == error.AuthenticationFailed) return error.SkipZigTest;
         return err;
     };
-    defer client.close();
+    defer client.close() catch {};
 
     var result = try client.query(allocator, "SELECT generate_series(1, 3) AS n");
     defer result.deinit();
@@ -546,7 +546,7 @@ test "query with nulls" {
         if (err == error.ConnectionRefused or err == error.ServerError or err == error.AuthenticationFailed) return error.SkipZigTest;
         return err;
     };
-    defer client.close();
+    defer client.close() catch {};
 
     var result = try client.query(allocator, "SELECT NULL AS empty");
     defer result.deinit();
@@ -561,7 +561,7 @@ test "query multiple columns" {
         if (err == error.ConnectionRefused or err == error.ServerError or err == error.AuthenticationFailed) return error.SkipZigTest;
         return err;
     };
-    defer client.close();
+    defer client.close() catch {};
 
     var result = try client.query(allocator, "SELECT 42 AS id, 'hello' AS name, NULL AS note");
     defer result.deinit();
@@ -583,7 +583,7 @@ test "command tag" {
         if (err == error.ConnectionRefused or err == error.ServerError or err == error.AuthenticationFailed) return error.SkipZigTest;
         return err;
     };
-    defer client.close();
+    defer client.close() catch {};
 
     var result = try client.query(allocator, "SELECT 1");
     defer result.deinit();

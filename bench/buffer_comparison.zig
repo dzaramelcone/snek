@@ -38,10 +38,10 @@ const BufferPool = struct {
     backing: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize, buffer_size: usize) !BufferPool {
-        const buffers = @as([]Buffer, allocator.alloc(Buffer, capacity) catch unreachable);
+        const buffers = try @as([]Buffer, allocator.alloc(Buffer, capacity));
         for (buffers, 0..) |*buf, i| {
             buf.* = .{
-                .data = allocator.alloc(u8, buffer_size) catch unreachable,
+                .data = try allocator.alloc(u8, buffer_size),
                 .ref_count = std.atomic.Value(u32).init(0),
                 .pool_index = @intCast(i),
             };
@@ -90,7 +90,7 @@ const BURST_COUNT = 100;
 
 // ── BufferPool benchmarks ────────────────────────────────────────────
 
-fn benchPoolSequential(pool: *BufferPool) u64 {
+fn benchPoolSequential(pool: *BufferPool) !u64 {
     // Warmup
     for (0..WARMUP) |_| {
         const buf = pool.acquire().?;
@@ -99,7 +99,7 @@ fn benchPoolSequential(pool: *BufferPool) u64 {
         pool.releaseBuffer(buf);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     for (0..SEQ_ITERS) |_| {
         const buf = pool.acquire().?;
         @memset(buf.data[0..64], 0xAB);
@@ -109,7 +109,7 @@ fn benchPoolSequential(pool: *BufferPool) u64 {
     return timer.read();
 }
 
-fn benchPoolMulti(pool: *BufferPool) u64 {
+fn benchPoolMulti(pool: *BufferPool) !u64 {
     var bufs: [MULTI_COUNT]*Buffer = undefined;
 
     // Warmup
@@ -121,7 +121,7 @@ fn benchPoolMulti(pool: *BufferPool) u64 {
         for (0..MULTI_COUNT) |i| pool.releaseBuffer(bufs[i]);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     for (0..MULTI_ITERS) |_| {
         for (0..MULTI_COUNT) |i| {
             bufs[i] = pool.acquire().?;
@@ -133,7 +133,7 @@ fn benchPoolMulti(pool: *BufferPool) u64 {
     return timer.read();
 }
 
-fn benchPoolBurst(pool: *BufferPool) u64 {
+fn benchPoolBurst(pool: *BufferPool) !u64 {
     var bufs: [BURST_COUNT]*Buffer = undefined;
 
     // Warmup
@@ -145,7 +145,7 @@ fn benchPoolBurst(pool: *BufferPool) u64 {
         for (0..BURST_COUNT) |i| pool.releaseBuffer(bufs[i]);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     for (0..BURST_ITERS) |_| {
         for (0..BURST_COUNT) |i| {
             bufs[i] = pool.acquire().?;
@@ -159,22 +159,22 @@ fn benchPoolBurst(pool: *BufferPool) u64 {
 
 // ── Arena benchmarks ─────────────────────────────────────────────────
 
-fn benchArenaSequential(buffer_size: usize) u64 {
+fn benchArenaSequential(buffer_size: usize) !u64 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     // Warmup
     for (0..WARMUP) |_| {
-        const data = allocator.alloc(u8, buffer_size) catch unreachable;
+        const data = try allocator.alloc(u8, buffer_size);
         @memset(data[0..64], 0xAB);
         std.mem.doNotOptimizeAway(data.ptr);
         _ = arena.reset(.retain_capacity);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     for (0..SEQ_ITERS) |_| {
-        const data = allocator.alloc(u8, buffer_size) catch unreachable;
+        const data = try allocator.alloc(u8, buffer_size);
         @memset(data[0..64], 0xAB);
         std.mem.doNotOptimizeAway(data.ptr);
         _ = arena.reset(.retain_capacity);
@@ -182,7 +182,7 @@ fn benchArenaSequential(buffer_size: usize) u64 {
     return timer.read();
 }
 
-fn benchArenaMulti(buffer_size: usize) u64 {
+fn benchArenaMulti(buffer_size: usize) !u64 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -190,16 +190,16 @@ fn benchArenaMulti(buffer_size: usize) u64 {
     // Warmup
     for (0..WARMUP / MULTI_COUNT) |_| {
         for (0..MULTI_COUNT) |_| {
-            const data = allocator.alloc(u8, buffer_size) catch unreachable;
+            const data = try allocator.alloc(u8, buffer_size);
             @memset(data[0..64], 0xAB);
         }
         _ = arena.reset(.retain_capacity);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     for (0..MULTI_ITERS) |_| {
         for (0..MULTI_COUNT) |_| {
-            const data = allocator.alloc(u8, buffer_size) catch unreachable;
+            const data = try allocator.alloc(u8, buffer_size);
             @memset(data[0..64], 0xAB);
             std.mem.doNotOptimizeAway(data.ptr);
         }
@@ -208,7 +208,7 @@ fn benchArenaMulti(buffer_size: usize) u64 {
     return timer.read();
 }
 
-fn benchArenaBurst(buffer_size: usize) u64 {
+fn benchArenaBurst(buffer_size: usize) !u64 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -216,16 +216,16 @@ fn benchArenaBurst(buffer_size: usize) u64 {
     // Warmup
     for (0..WARMUP / BURST_COUNT) |_| {
         for (0..BURST_COUNT) |_| {
-            const data = allocator.alloc(u8, buffer_size) catch unreachable;
+            const data = try allocator.alloc(u8, buffer_size);
             @memset(data[0..64], 0xAB);
         }
         _ = arena.reset(.retain_capacity);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
     for (0..BURST_ITERS) |_| {
         for (0..BURST_COUNT) |_| {
-            const data = allocator.alloc(u8, buffer_size) catch unreachable;
+            const data = try allocator.alloc(u8, buffer_size);
             @memset(data[0..64], 0xAB);
             std.mem.doNotOptimizeAway(data.ptr);
         }
@@ -236,16 +236,16 @@ fn benchArenaBurst(buffer_size: usize) u64 {
 
 // ── Run all scenarios for a given buffer size ────────────────────────
 
-fn runSuite(buffer_size: usize) void {
+fn runSuite(buffer_size: usize) !void {
     std.debug.print("\n── buffer_size = {d} bytes ──\n", .{buffer_size});
 
     // Pool needs enough capacity for burst scenario
-    var pool = BufferPool.init(std.heap.page_allocator, BURST_COUNT, buffer_size) catch unreachable;
+    var pool = try BufferPool.init(std.heap.page_allocator, BURST_COUNT, buffer_size);
     defer pool.deinit();
 
     // Scenario 1: Sequential
-    const pool_seq = benchPoolSequential(&pool);
-    const arena_seq = benchArenaSequential(buffer_size);
+    const pool_seq = try benchPoolSequential(&pool);
+    const arena_seq = try benchArenaSequential(buffer_size);
     const seq_ratio = @as(f64, @floatFromInt(pool_seq)) / @as(f64, @floatFromInt(arena_seq));
 
     std.debug.print("\n  Scenario 1: Sequential acquire/release ({d} cycles)\n", .{SEQ_ITERS});
@@ -258,8 +258,8 @@ fn runSuite(buffer_size: usize) void {
     std.debug.print("    Ratio (Pool/Arena): {d:.2}x\n", .{seq_ratio});
 
     // Scenario 2: Multiple outstanding
-    const pool_multi = benchPoolMulti(&pool);
-    const arena_multi = benchArenaMulti(buffer_size);
+    const pool_multi = try benchPoolMulti(&pool);
+    const arena_multi = try benchArenaMulti(buffer_size);
     const multi_ops = MULTI_ITERS * MULTI_COUNT;
     const multi_ratio = @as(f64, @floatFromInt(pool_multi)) / @as(f64, @floatFromInt(arena_multi));
 
@@ -273,8 +273,8 @@ fn runSuite(buffer_size: usize) void {
     std.debug.print("    Ratio (Pool/Arena): {d:.2}x\n", .{multi_ratio});
 
     // Scenario 3: Burst
-    const pool_burst = benchPoolBurst(&pool);
-    const arena_burst = benchArenaBurst(buffer_size);
+    const pool_burst = try benchPoolBurst(&pool);
+    const arena_burst = try benchArenaBurst(buffer_size);
     const burst_ops = BURST_ITERS * BURST_COUNT;
     const burst_ratio = @as(f64, @floatFromInt(pool_burst)) / @as(f64, @floatFromInt(arena_burst));
 
@@ -300,12 +300,12 @@ pub fn main() !void {
     std.debug.print("\n============================================================\n", .{});
     std.debug.print("  4 KB buffers (typical read buffer)\n", .{});
     std.debug.print("============================================================\n", .{});
-    runSuite(4096);
+    try runSuite(4096);
 
     std.debug.print("\n============================================================\n", .{});
     std.debug.print("  16 KB buffers (larger response buffer)\n", .{});
     std.debug.print("============================================================\n", .{});
-    runSuite(16384);
+    try runSuite(16384);
 
     // Overall verdict
     std.debug.print("\n============================================================\n", .{});

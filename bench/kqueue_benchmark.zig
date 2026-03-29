@@ -136,34 +136,34 @@ const Kqueue = struct {
         for (self.pending.items) |op| {
             switch (op.op_type) {
                 .read, .recv, .accept => {
-                    changelist.append(self.allocator, .{
+                    try changelist.append(self.allocator, .{
                         .ident = @intCast(op.fd),
                         .filter = std.c.EVFILT.READ,
                         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                         .fflags = 0,
                         .data = 0,
                         .udata = @intCast(op.user_data),
-                    }) catch unreachable;
+                    });
                 },
                 .write, .send, .connect => {
-                    changelist.append(self.allocator, .{
+                    try changelist.append(self.allocator, .{
                         .ident = @intCast(op.fd),
                         .filter = std.c.EVFILT.WRITE,
                         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                         .fflags = 0,
                         .data = 0,
                         .udata = @intCast(op.user_data),
-                    }) catch unreachable;
+                    });
                 },
                 .timeout => {
-                    changelist.append(self.allocator, .{
+                    try changelist.append(self.allocator, .{
                         .ident = op.user_data,
                         .filter = std.c.EVFILT.TIMER,
                         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                         .fflags = std.c.NOTE.NSECONDS,
                         .data = @intCast(op.timeout_ns),
                         .udata = @intCast(op.user_data),
-                    }) catch unreachable;
+                    });
                 },
                 .close, .cancel => {},
             }
@@ -248,7 +248,7 @@ const Kqueue = struct {
 const SCENARIO_0_ITERS = 100_000;
 const WARMUP = 1_000;
 
-fn benchRawSocketpair() u64 {
+fn benchRawSocketpair() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
@@ -257,16 +257,16 @@ fn benchRawSocketpair() u64 {
 
     // Warmup
     for (0..WARMUP) |_| {
-        _ = posix.send(@intCast(pair[0]), msg, 0) catch unreachable;
-        const n = posix.recv(@intCast(pair[1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.send(@intCast(pair[0]), msg, 0);
+        const n = try posix.recv(@intCast(pair[1]), &recv_buf, 0);
         std.mem.doNotOptimizeAway(&n);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_0_ITERS) |_| {
-        _ = posix.send(@intCast(pair[0]), msg, 0) catch unreachable;
-        const n = posix.recv(@intCast(pair[1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.send(@intCast(pair[0]), msg, 0);
+        const n = try posix.recv(@intCast(pair[1]), &recv_buf, 0);
         std.mem.doNotOptimizeAway(&n);
     }
 
@@ -277,7 +277,7 @@ fn benchRawSocketpair() u64 {
 
 const SCENARIO_1_ITERS = 100_000;
 
-fn benchKqueueAdapter() u64 {
+fn benchKqueueAdapter() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
@@ -285,43 +285,43 @@ fn benchKqueueAdapter() u64 {
     var recv_buf: [64]u8 = undefined;
     var events: [16]CompletionEntry = undefined;
 
-    var kq = Kqueue.init(std.heap.page_allocator) catch unreachable;
+    var kq = try Kqueue.init(std.heap.page_allocator);
     defer kq.deinit();
 
     // Warmup
     for (0..WARMUP) |i| {
-        kq.submitSend(pair[0], msg, i * 2) catch unreachable;
+        try kq.submitSend(pair[0], msg, i * 2);
         var count: u32 = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
-        kq.submitRecv(pair[1], &recv_buf, i * 2 + 1) catch unreachable;
+        try kq.submitRecv(pair[1], &recv_buf, i * 2 + 1);
         count = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_1_ITERS) |i| {
         const base = (WARMUP + i) * 2;
-        kq.submitSend(pair[0], msg, base) catch unreachable;
+        try kq.submitSend(pair[0], msg, base);
         var count: u32 = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
-        kq.submitRecv(pair[1], &recv_buf, base + 1) catch unreachable;
+        try kq.submitRecv(pair[1], &recv_buf, base + 1);
         count = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
     }
 
     return timer.read();
 }
 
-fn benchRawKevent() u64 {
+fn benchRawKevent() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
@@ -348,7 +348,7 @@ fn benchRawKevent() u64 {
         var result_events: [1]std.c.Kevent = undefined;
         var n = std.c.kevent(kq, &changelist, 1, &result_events, 1, null);
         std.debug.assert(n == 1);
-        _ = posix.send(@intCast(pair[0]), msg, 0) catch unreachable;
+        _ = try posix.send(@intCast(pair[0]), msg, 0);
 
         changelist[0] = .{
             .ident = @intCast(pair[1]),
@@ -360,11 +360,11 @@ fn benchRawKevent() u64 {
         };
         n = std.c.kevent(kq, &changelist, 1, &result_events, 1, null);
         std.debug.assert(n == 1);
-        const nr = posix.recv(@intCast(pair[1]), &recv_buf, 0) catch unreachable;
+        const nr = try posix.recv(@intCast(pair[1]), &recv_buf, 0);
         std.mem.doNotOptimizeAway(&nr);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_1_ITERS) |_| {
         // Register write readiness, wait, then send
@@ -379,7 +379,7 @@ fn benchRawKevent() u64 {
         var result_events: [1]std.c.Kevent = undefined;
         var n = std.c.kevent(kq, &changelist, 1, &result_events, 1, null);
         std.debug.assert(n == 1);
-        _ = posix.send(@intCast(pair[0]), msg, 0) catch unreachable;
+        _ = try posix.send(@intCast(pair[0]), msg, 0);
 
         // Register read readiness, wait, then recv
         changelist[0] = .{
@@ -392,7 +392,7 @@ fn benchRawKevent() u64 {
         };
         n = std.c.kevent(kq, &changelist, 1, &result_events, 1, null);
         std.debug.assert(n == 1);
-        const nr = posix.recv(@intCast(pair[1]), &recv_buf, 0) catch unreachable;
+        const nr = try posix.recv(@intCast(pair[1]), &recv_buf, 0);
         std.mem.doNotOptimizeAway(&nr);
     }
 
@@ -401,7 +401,7 @@ fn benchRawKevent() u64 {
 
 // ── Scenario 2: Throughput scaling with batch size ────────────────────
 
-fn benchBatchThroughput(comptime batch_size: u32) u64 {
+fn benchBatchThroughput(comptime batch_size: u32) !u64 {
     // Create batch_size socket pairs
     var pairs: [batch_size][2]posix.fd_t = undefined;
     for (0..batch_size) |i| {
@@ -413,7 +413,7 @@ fn benchBatchThroughput(comptime batch_size: u32) u64 {
         }
     }
 
-    var kq = Kqueue.init(std.heap.page_allocator) catch unreachable;
+    var kq = try Kqueue.init(std.heap.page_allocator);
     defer kq.deinit();
 
     const msg = "batch test!";
@@ -421,34 +421,34 @@ fn benchBatchThroughput(comptime batch_size: u32) u64 {
 
     // Warmup: one full batch cycle
     for (0..batch_size) |i| {
-        kq.submitSend(pairs[i][0], msg, @intCast(i)) catch unreachable;
+        try kq.submitSend(pairs[i][0], msg, @intCast(i));
     }
     var events: [512]CompletionEntry = undefined;
     var completed: u32 = 0;
     while (completed < batch_size) {
-        completed += kq.pollCompletions(events[0..]) catch unreachable;
+        completed += try kq.pollCompletions(events[0..]);
     }
     // Recv all
     var recv_buf: [64]u8 = undefined;
     for (0..batch_size) |i| {
-        _ = posix.recv(@intCast(pairs[i][1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.recv(@intCast(pairs[i][1]), &recv_buf, 0);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..iterations) |iter| {
         // Submit batch_size sends
         for (0..batch_size) |i| {
-            kq.submitSend(pairs[i][0], msg, @intCast(iter * batch_size + i)) catch unreachable;
+            try kq.submitSend(pairs[i][0], msg, @intCast(iter * batch_size + i));
         }
         // Poll all completions
         completed = 0;
         while (completed < batch_size) {
-            completed += kq.pollCompletions(events[0..]) catch unreachable;
+            completed += try kq.pollCompletions(events[0..]);
         }
         // Drain recv side so buffers don't fill
         for (0..batch_size) |i| {
-            _ = posix.recv(@intCast(pairs[i][1]), &recv_buf, 0) catch unreachable;
+            _ = try posix.recv(@intCast(pairs[i][1]), &recv_buf, 0);
         }
     }
 
@@ -461,21 +461,21 @@ fn benchBatchThroughput(comptime batch_size: u32) u64 {
 const TIMEOUT_ITERS = 1_000;
 const TARGET_TIMEOUT_NS: u64 = 1_000_000; // 1ms
 
-fn benchTimeoutPrecision() struct { median_ns: u64, p99_ns: u64 } {
-    var kq = Kqueue.init(std.heap.page_allocator) catch unreachable;
+fn benchTimeoutPrecision() !struct { median_ns: u64, p99_ns: u64 } {
+    var kq = try Kqueue.init(std.heap.page_allocator);
     defer kq.deinit();
 
     var latencies: [TIMEOUT_ITERS]u64 = undefined;
     var events: [16]CompletionEntry = undefined;
 
     for (0..TIMEOUT_ITERS) |i| {
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = try std.time.Timer.start();
 
-        kq.submitTimeout(TARGET_TIMEOUT_NS, @intCast(i)) catch unreachable;
+        try kq.submitTimeout(TARGET_TIMEOUT_NS, @intCast(i));
 
         var count: u32 = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
 
         latencies[i] = timer.read();
@@ -528,41 +528,41 @@ pub fn main() !void {
 
         // Scenario 0
         std.debug.print("  Scenario 0: Raw socketpair send/recv ({d} iters)\n", .{SCENARIO_0_ITERS});
-        const raw_ns = benchRawSocketpair();
+        const raw_ns = try benchRawSocketpair();
         std.debug.print("    Raw send/recv:              {d:>8.1} ns/op\n", .{nsPerOp(raw_ns, SCENARIO_0_ITERS)});
         best.raw_socketpair_ns = @min(best.raw_socketpair_ns, raw_ns);
 
         // Scenario 1
         std.debug.print("  Scenario 1: Adapter overhead ({d} iters)\n", .{SCENARIO_1_ITERS});
-        const adapter_ns = benchKqueueAdapter();
+        const adapter_ns = try benchKqueueAdapter();
         std.debug.print("    Kqueue adapter (submit+poll): {d:>8.1} ns/op\n", .{nsPerOp(adapter_ns, SCENARIO_1_ITERS)});
         best.adapter_ns = @min(best.adapter_ns, adapter_ns);
 
-        const raw_kev_ns = benchRawKevent();
+        const raw_kev_ns = try benchRawKevent();
         std.debug.print("    Raw kevent:                   {d:>8.1} ns/op\n", .{nsPerOp(raw_kev_ns, SCENARIO_1_ITERS)});
         best.raw_kevent_ns = @min(best.raw_kevent_ns, raw_kev_ns);
 
         // Scenario 2
         std.debug.print("  Scenario 2: Batch throughput scaling\n", .{});
-        const b10 = benchBatchThroughput(10);
+        const b10 = try benchBatchThroughput(10);
         std.debug.print("    N=10:   {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b10))});
         best.batch_10_ns = @min(best.batch_10_ns, b10);
 
-        const b50 = benchBatchThroughput(50);
+        const b50 = try benchBatchThroughput(50);
         std.debug.print("    N=50:   {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b50))});
         best.batch_50_ns = @min(best.batch_50_ns, b50);
 
-        const b100 = benchBatchThroughput(100);
+        const b100 = try benchBatchThroughput(100);
         std.debug.print("    N=100:  {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b100))});
         best.batch_100_ns = @min(best.batch_100_ns, b100);
 
-        const b500 = benchBatchThroughput(500);
+        const b500 = try benchBatchThroughput(500);
         std.debug.print("    N=500:  {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b500))});
         best.batch_500_ns = @min(best.batch_500_ns, b500);
 
         // Scenario 3
         std.debug.print("  Scenario 3: Timeout precision (1ms target, {d} iters)\n", .{TIMEOUT_ITERS});
-        const timeout = benchTimeoutPrecision();
+        const timeout = try benchTimeoutPrecision();
         std.debug.print("    Median: {d:>8.1} us (target: 1000.0 us)\n", .{@as(f64, @floatFromInt(timeout.median_ns)) / 1000.0});
         std.debug.print("    P99:    {d:>8.1} us\n", .{@as(f64, @floatFromInt(timeout.p99_ns)) / 1000.0});
         best.timeout_median_ns = @min(best.timeout_median_ns, timeout.median_ns);

@@ -138,34 +138,34 @@ const Kqueue = struct {
         for (self.pending.items) |op| {
             switch (op.op_type) {
                 .read, .recv, .accept => {
-                    changelist.append(self.allocator, .{
+                    try changelist.append(self.allocator, .{
                         .ident = @intCast(op.fd),
                         .filter = std.c.EVFILT.READ,
                         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                         .fflags = 0,
                         .data = 0,
                         .udata = @intCast(op.user_data),
-                    }) catch unreachable;
+                    });
                 },
                 .write, .send, .connect => {
-                    changelist.append(self.allocator, .{
+                    try changelist.append(self.allocator, .{
                         .ident = @intCast(op.fd),
                         .filter = std.c.EVFILT.WRITE,
                         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                         .fflags = 0,
                         .data = 0,
                         .udata = @intCast(op.user_data),
-                    }) catch unreachable;
+                    });
                 },
                 .timeout => {
-                    changelist.append(self.allocator, .{
+                    try changelist.append(self.allocator, .{
                         .ident = op.user_data,
                         .filter = std.c.EVFILT.TIMER,
                         .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
                         .fflags = std.c.NOTE.NSECONDS,
                         .data = @intCast(op.timeout_ns),
                         .udata = @intCast(op.user_data),
-                    }) catch unreachable;
+                    });
                 },
                 .close, .cancel => {},
             }
@@ -360,7 +360,7 @@ const FakeIO = struct {
 const SCENARIO_1_ITERS = 100_000;
 const WARMUP = 1_000;
 
-fn benchKqueueCycle() u64 {
+fn benchKqueueCycle() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
@@ -368,43 +368,43 @@ fn benchKqueueCycle() u64 {
     var recv_buf: [64]u8 = undefined;
     var events: [16]CompletionEntry = undefined;
 
-    var kq = Kqueue.init(std.heap.page_allocator) catch unreachable;
+    var kq = try Kqueue.init(std.heap.page_allocator);
     defer kq.deinit();
 
     // Warmup
     for (0..WARMUP) |i| {
-        kq.submitSend(pair[0], msg, i * 2) catch unreachable;
+        try kq.submitSend(pair[0], msg, i * 2);
         var count: u32 = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
-        kq.submitRecv(pair[1], &recv_buf, i * 2 + 1) catch unreachable;
+        try kq.submitRecv(pair[1], &recv_buf, i * 2 + 1);
         count = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_1_ITERS) |i| {
         const base = (WARMUP + i) * 2;
-        kq.submitSend(pair[0], msg, base) catch unreachable;
+        try kq.submitSend(pair[0], msg, base);
         var count: u32 = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
-        kq.submitRecv(pair[1], &recv_buf, base + 1) catch unreachable;
+        try kq.submitRecv(pair[1], &recv_buf, base + 1);
         count = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
     }
 
     return timer.read();
 }
 
-fn benchFakeIOCycle() u64 {
+fn benchFakeIOCycle() !u64 {
     const msg = "hello snek!";
     var recv_buf: [64]u8 = undefined;
     var events: [16]CompletionEntry = undefined;
@@ -414,20 +414,20 @@ fn benchFakeIOCycle() u64 {
 
     // Warmup
     for (0..WARMUP) |i| {
-        fio.submitSend(100, msg, i * 2) catch unreachable;
-        _ = fio.pollCompletions(&events) catch unreachable;
-        fio.submitRecv(101, &recv_buf, i * 2 + 1) catch unreachable;
-        _ = fio.pollCompletions(&events) catch unreachable;
+        try fio.submitSend(100, msg, i * 2);
+        _ = try fio.pollCompletions(&events);
+        try fio.submitRecv(101, &recv_buf, i * 2 + 1);
+        _ = try fio.pollCompletions(&events);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_1_ITERS) |i| {
         const base = (WARMUP + i) * 2;
-        fio.submitSend(100, msg, base) catch unreachable;
-        _ = fio.pollCompletions(&events) catch unreachable;
-        fio.submitRecv(101, &recv_buf, base + 1) catch unreachable;
-        _ = fio.pollCompletions(&events) catch unreachable;
+        try fio.submitSend(100, msg, base);
+        _ = try fio.pollCompletions(&events);
+        try fio.submitRecv(101, &recv_buf, base + 1);
+        _ = try fio.pollCompletions(&events);
     }
 
     return timer.read();
@@ -438,7 +438,7 @@ fn benchFakeIOCycle() u64 {
 const SCENARIO_2_OPS = 10;
 const SCENARIO_2_ITERS = 10_000;
 
-fn benchKqueueMultiple() u64 {
+fn benchKqueueMultiple() !u64 {
     // Create SCENARIO_2_OPS socket pairs
     var pairs: [SCENARIO_2_OPS][2]posix.fd_t = undefined;
     for (0..SCENARIO_2_OPS) |i| {
@@ -454,43 +454,43 @@ fn benchKqueueMultiple() u64 {
     var recv_buf: [64]u8 = undefined;
     var events: [64]CompletionEntry = undefined;
 
-    var kq = Kqueue.init(std.heap.page_allocator) catch unreachable;
+    var kq = try Kqueue.init(std.heap.page_allocator);
     defer kq.deinit();
 
     // Warmup
     for (0..SCENARIO_2_OPS) |i| {
-        kq.submitSend(pairs[i][0], msg, @intCast(i)) catch unreachable;
+        try kq.submitSend(pairs[i][0], msg, @intCast(i));
     }
     var completed: u32 = 0;
     while (completed < SCENARIO_2_OPS) {
-        completed += kq.pollCompletions(events[0..]) catch unreachable;
+        completed += try kq.pollCompletions(events[0..]);
     }
     for (0..SCENARIO_2_OPS) |i| {
-        _ = posix.recv(@intCast(pairs[i][1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.recv(@intCast(pairs[i][1]), &recv_buf, 0);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_2_ITERS) |iter| {
         // Submit SCENARIO_2_OPS sends
         for (0..SCENARIO_2_OPS) |i| {
-            kq.submitSend(pairs[i][0], msg, @intCast(iter * SCENARIO_2_OPS + i + 1000)) catch unreachable;
+            try kq.submitSend(pairs[i][0], msg, @intCast(iter * SCENARIO_2_OPS + i + 1000));
         }
         // Poll all completions
         completed = 0;
         while (completed < SCENARIO_2_OPS) {
-            completed += kq.pollCompletions(events[0..]) catch unreachable;
+            completed += try kq.pollCompletions(events[0..]);
         }
         // Drain recv side
         for (0..SCENARIO_2_OPS) |i| {
-            _ = posix.recv(@intCast(pairs[i][1]), &recv_buf, 0) catch unreachable;
+            _ = try posix.recv(@intCast(pairs[i][1]), &recv_buf, 0);
         }
     }
 
     return timer.read();
 }
 
-fn benchFakeIOMultiple() u64 {
+fn benchFakeIOMultiple() !u64 {
     const msg = "batch ops!";
     var recv_buf: [64]u8 = undefined;
     var events: [64]CompletionEntry = undefined;
@@ -500,23 +500,23 @@ fn benchFakeIOMultiple() u64 {
 
     // Warmup
     for (0..SCENARIO_2_OPS) |i| {
-        fio.submitSend(100, msg, @intCast(i)) catch unreachable;
+        try fio.submitSend(100, msg, @intCast(i));
     }
-    _ = fio.pollCompletions(events[0..]) catch unreachable;
+    _ = try fio.pollCompletions(events[0..]);
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_2_ITERS) |iter| {
         for (0..SCENARIO_2_OPS) |i| {
-            fio.submitSend(@intCast(100 + i), msg, @intCast(iter * SCENARIO_2_OPS + i + 1000)) catch unreachable;
+            try fio.submitSend(@intCast(100 + i), msg, @intCast(iter * SCENARIO_2_OPS + i + 1000));
         }
         // Also submit recvs to match the kqueue workload shape
         for (0..SCENARIO_2_OPS) |i| {
-            fio.submitRecv(@intCast(200 + i), &recv_buf, @intCast(iter * SCENARIO_2_OPS + i + 2000)) catch unreachable;
+            try fio.submitRecv(@intCast(200 + i), &recv_buf, @intCast(iter * SCENARIO_2_OPS + i + 2000));
         }
         var completed: u32 = 0;
         while (completed < SCENARIO_2_OPS * 2) {
-            completed += fio.pollCompletions(events[0..]) catch unreachable;
+            completed += try fio.pollCompletions(events[0..]);
         }
     }
 
@@ -528,37 +528,37 @@ fn benchFakeIOMultiple() u64 {
 const SCENARIO_3_ITERS = 10_000;
 const TIMEOUT_NS: u64 = 1_000_000; // 1ms
 
-fn benchKqueueTimeout() u64 {
-    var kq = Kqueue.init(std.heap.page_allocator) catch unreachable;
+fn benchKqueueTimeout() !u64 {
+    var kq = try Kqueue.init(std.heap.page_allocator);
     defer kq.deinit();
 
     var events: [16]CompletionEntry = undefined;
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_3_ITERS) |i| {
-        kq.submitTimeout(TIMEOUT_NS, @intCast(i)) catch unreachable;
+        try kq.submitTimeout(TIMEOUT_NS, @intCast(i));
         var count: u32 = 0;
         while (count == 0) {
-            count = kq.pollCompletions(&events) catch unreachable;
+            count = try kq.pollCompletions(&events);
         }
     }
 
     return timer.read();
 }
 
-fn benchFakeIOTimeout() u64 {
+fn benchFakeIOTimeout() !u64 {
     var fio = FakeIO.init(std.heap.page_allocator, 42);
     defer fio.deinit();
 
     var events: [16]CompletionEntry = undefined;
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_3_ITERS) |i| {
-        fio.submitTimeout(TIMEOUT_NS, @intCast(i)) catch unreachable;
+        try fio.submitTimeout(TIMEOUT_NS, @intCast(i));
         fio.advanceTime(TIMEOUT_NS);
-        _ = fio.pollCompletions(&events) catch unreachable;
+        _ = try fio.pollCompletions(&events);
     }
 
     return timer.read();
@@ -599,31 +599,31 @@ pub fn main() !void {
 
         // Scenario 1
         std.debug.print("  Scenario 1: Submit+poll cycle ({d} send/recv round-trips)\n", .{SCENARIO_1_ITERS});
-        const kq_cycle = benchKqueueCycle();
+        const kq_cycle = try benchKqueueCycle();
         std.debug.print("    Kqueue adapter:  {d:>8.1} ns/op\n", .{nsPerOp(kq_cycle, SCENARIO_1_ITERS)});
         best.kq_cycle_ns = @min(best.kq_cycle_ns, kq_cycle);
 
-        const fake_cycle = benchFakeIOCycle();
+        const fake_cycle = try benchFakeIOCycle();
         std.debug.print("    FakeIO:          {d:>8.1} ns/op\n", .{nsPerOp(fake_cycle, SCENARIO_1_ITERS)});
         best.fake_cycle_ns = @min(best.fake_cycle_ns, fake_cycle);
 
         // Scenario 2
         std.debug.print("  Scenario 2: Multiple outstanding ops ({d} ops x {d} iters)\n", .{ SCENARIO_2_OPS, SCENARIO_2_ITERS });
-        const kq_multi = benchKqueueMultiple();
+        const kq_multi = try benchKqueueMultiple();
         std.debug.print("    Kqueue adapter:  {d:>8.1} ns/op\n", .{nsPerOp(kq_multi, SCENARIO_2_ITERS)});
         best.kq_multi_ns = @min(best.kq_multi_ns, kq_multi);
 
-        const fake_multi = benchFakeIOMultiple();
+        const fake_multi = try benchFakeIOMultiple();
         std.debug.print("    FakeIO:          {d:>8.1} ns/op\n", .{nsPerOp(fake_multi, SCENARIO_2_ITERS)});
         best.fake_multi_ns = @min(best.fake_multi_ns, fake_multi);
 
         // Scenario 3
         std.debug.print("  Scenario 3: Timeout submit+poll ({d} iters, 1ms each)\n", .{SCENARIO_3_ITERS});
-        const kq_timeout = benchKqueueTimeout();
+        const kq_timeout = try benchKqueueTimeout();
         std.debug.print("    Kqueue adapter:  {d:>8.1} ns/op\n", .{nsPerOp(kq_timeout, SCENARIO_3_ITERS)});
         best.kq_timeout_ns = @min(best.kq_timeout_ns, kq_timeout);
 
-        const fake_timeout = benchFakeIOTimeout();
+        const fake_timeout = try benchFakeIOTimeout();
         std.debug.print("    FakeIO:          {d:>8.1} ns/op\n", .{nsPerOp(fake_timeout, SCENARIO_3_ITERS)});
         best.fake_timeout_ns = @min(best.fake_timeout_ns, fake_timeout);
 

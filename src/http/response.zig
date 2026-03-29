@@ -190,7 +190,7 @@ test "fluent API chaining" {
 test "serialize to bytes" {
     const r = Response.text("hi");
     var buf: [4096]u8 = undefined;
-    const n = r.serialize(&buf) catch unreachable;
+    const n = try r.serialize(&buf);
     const out = buf[0..n];
     try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, out, "Content-Type: text/plain\r\n") != null);

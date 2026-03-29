@@ -29,7 +29,7 @@ fn closeSocketPair(pair: [2]posix.fd_t) void {
 }
 
 fn makePipe() [2]posix.fd_t {
-    return posix.pipe() catch unreachable;
+    try return posix.pipe();
 }
 
 fn closePipe(pair: [2]posix.fd_t) void {
@@ -143,7 +143,7 @@ const LinuxIoUring = struct {
 const SCENARIO_0_ITERS = 100_000;
 const WARMUP = 1_000;
 
-fn benchRawSocketpair() u64 {
+fn benchRawSocketpair() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
@@ -152,16 +152,16 @@ fn benchRawSocketpair() u64 {
 
     // Warmup
     for (0..WARMUP) |_| {
-        _ = posix.send(@intCast(pair[0]), msg, 0) catch unreachable;
-        const n = posix.recv(@intCast(pair[1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.send(@intCast(pair[0]), msg, 0);
+        const n = try posix.recv(@intCast(pair[1]), &recv_buf, 0);
         std.mem.doNotOptimizeAway(&n);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_0_ITERS) |_| {
-        _ = posix.send(@intCast(pair[0]), msg, 0) catch unreachable;
-        const n = posix.recv(@intCast(pair[1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.send(@intCast(pair[0]), msg, 0);
+        const n = try posix.recv(@intCast(pair[1]), &recv_buf, 0);
         std.mem.doNotOptimizeAway(&n);
     }
 
@@ -172,42 +172,42 @@ fn benchRawSocketpair() u64 {
 
 const SCENARIO_1_ITERS = 100_000;
 
-fn benchRawStdlibIoUring() u64 {
+fn benchRawStdlibIoUring() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
     const msg = "hello snek!";
     var recv_buf: [64]u8 = undefined;
 
-    var ring = linux.IoUring.init(256, 0) catch unreachable;
+    var ring = try linux.IoUring.init(256, 0);
     defer ring.deinit();
 
     // Warmup
     for (0..WARMUP) |_| {
         // Prep send
-        _ = ring.send(0, pair[0], msg, 0) catch unreachable;
-        _ = ring.submit_and_wait(1) catch unreachable;
+        _ = try ring.send(0, pair[0], msg, 0);
+        _ = try ring.submit_and_wait(1);
         var cqe_buf: [4]linux.io_uring_cqe = undefined;
-        _ = ring.copy_cqes(&cqe_buf, 0) catch unreachable;
+        _ = try ring.copy_cqes(&cqe_buf, 0);
 
         // Prep recv
-        _ = ring.recv(1, pair[1], .{ .buffer = &recv_buf }, 0) catch unreachable;
-        _ = ring.submit_and_wait(1) catch unreachable;
-        const n = ring.copy_cqes(&cqe_buf, 0) catch unreachable;
+        _ = try ring.recv(1, pair[1], .{ .buffer = &recv_buf }, 0);
+        _ = try ring.submit_and_wait(1);
+        const n = try ring.copy_cqes(&cqe_buf, 0);
         std.mem.doNotOptimizeAway(&n);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_1_ITERS) |_| {
-        _ = ring.send(0, pair[0], msg, 0) catch unreachable;
-        _ = ring.submit_and_wait(1) catch unreachable;
+        _ = try ring.send(0, pair[0], msg, 0);
+        _ = try ring.submit_and_wait(1);
         var cqe_buf: [4]linux.io_uring_cqe = undefined;
-        _ = ring.copy_cqes(&cqe_buf, 0) catch unreachable;
+        _ = try ring.copy_cqes(&cqe_buf, 0);
 
-        _ = ring.recv(1, pair[1], .{ .buffer = &recv_buf }, 0) catch unreachable;
-        _ = ring.submit_and_wait(1) catch unreachable;
-        const n = ring.copy_cqes(&cqe_buf, 0) catch unreachable;
+        _ = try ring.recv(1, pair[1], .{ .buffer = &recv_buf }, 0);
+        _ = try ring.submit_and_wait(1);
+        const n = try ring.copy_cqes(&cqe_buf, 0);
         std.mem.doNotOptimizeAway(&n);
     }
 
@@ -218,7 +218,7 @@ fn benchRawStdlibIoUring() u64 {
 
 const SCENARIO_2_ITERS = 100_000;
 
-fn benchIoUringAdapter() u64 {
+fn benchIoUringAdapter() !u64 {
     const pair = makeSocketPair();
     defer closeSocketPair(pair);
 
@@ -226,36 +226,36 @@ fn benchIoUringAdapter() u64 {
     var recv_buf: [64]u8 = undefined;
     var events: [16]CompletionEntry = undefined;
 
-    var ring = LinuxIoUring.init(256) catch unreachable;
+    var ring = try LinuxIoUring.init(256);
     defer ring.deinit();
 
     // Warmup
     for (0..WARMUP) |i| {
-        ring.submitSend(pair[0], msg, i * 2) catch unreachable;
+        try ring.submitSend(pair[0], msg, i * 2);
         var count: u32 = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
-        ring.submitRecv(pair[1], &recv_buf, i * 2 + 1) catch unreachable;
+        try ring.submitRecv(pair[1], &recv_buf, i * 2 + 1);
         count = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_2_ITERS) |i| {
         const base = (WARMUP + i) * 2;
-        ring.submitSend(pair[0], msg, base) catch unreachable;
+        try ring.submitSend(pair[0], msg, base);
         var count: u32 = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
-        ring.submitRecv(pair[1], &recv_buf, base + 1) catch unreachable;
+        try ring.submitRecv(pair[1], &recv_buf, base + 1);
         count = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
     }
 
@@ -264,7 +264,7 @@ fn benchIoUringAdapter() u64 {
 
 // ── Scenario 3: Batch submission ─────────────────────────────────────
 
-fn benchBatchSubmission(comptime batch_size: u32) u64 {
+fn benchBatchSubmission(comptime batch_size: u32) !u64 {
     var pairs: [batch_size][2]posix.fd_t = undefined;
     for (0..batch_size) |i| {
         pairs[i] = makeSocketPair();
@@ -275,7 +275,7 @@ fn benchBatchSubmission(comptime batch_size: u32) u64 {
         }
     }
 
-    var ring = LinuxIoUring.init(256) catch unreachable;
+    var ring = try LinuxIoUring.init(256);
     defer ring.deinit();
 
     const msg = "batch test!";
@@ -283,31 +283,31 @@ fn benchBatchSubmission(comptime batch_size: u32) u64 {
 
     // Warmup: one full batch cycle
     for (0..batch_size) |i| {
-        ring.submitSend(pairs[i][0], msg, @intCast(i)) catch unreachable;
+        try ring.submitSend(pairs[i][0], msg, @intCast(i));
     }
     var events: [512]CompletionEntry = undefined;
     var completed: u32 = 0;
     while (completed < batch_size) {
-        completed += ring.submitAndWait(events[0..], batch_size - completed) catch unreachable;
+        completed += try ring.submitAndWait(events[0..], batch_size - completed);
     }
     // Drain recv side
     var recv_buf: [64]u8 = undefined;
     for (0..batch_size) |i| {
-        _ = posix.recv(@intCast(pairs[i][1]), &recv_buf, 0) catch unreachable;
+        _ = try posix.recv(@intCast(pairs[i][1]), &recv_buf, 0);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..iterations) |iter| {
         for (0..batch_size) |i| {
-            ring.submitSend(pairs[i][0], msg, @intCast(iter * batch_size + i)) catch unreachable;
+            try ring.submitSend(pairs[i][0], msg, @intCast(iter * batch_size + i));
         }
         completed = 0;
         while (completed < batch_size) {
-            completed += ring.submitAndWait(events[0..], batch_size - completed) catch unreachable;
+            completed += try ring.submitAndWait(events[0..], batch_size - completed);
         }
         for (0..batch_size) |i| {
-            _ = posix.recv(@intCast(pairs[i][1]), &recv_buf, 0) catch unreachable;
+            _ = try posix.recv(@intCast(pairs[i][1]), &recv_buf, 0);
         }
     }
 
@@ -319,7 +319,7 @@ fn benchBatchSubmission(comptime batch_size: u32) u64 {
 
 const SCENARIO_4_ITERS = 100_000;
 
-fn benchRawPipeReadWrite() u64 {
+fn benchRawPipeReadWrite() !u64 {
     const pipe = makePipe();
     defer closePipe(pipe);
 
@@ -328,60 +328,60 @@ fn benchRawPipeReadWrite() u64 {
 
     // Warmup
     for (0..WARMUP) |_| {
-        _ = posix.write(pipe[1], msg) catch unreachable;
-        const n = posix.read(pipe[0], &recv_buf) catch unreachable;
+        _ = try posix.write(pipe[1], msg);
+        const n = try posix.read(pipe[0], &recv_buf);
         std.mem.doNotOptimizeAway(&n);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_4_ITERS) |_| {
-        _ = posix.write(pipe[1], msg) catch unreachable;
-        const n = posix.read(pipe[0], &recv_buf) catch unreachable;
+        _ = try posix.write(pipe[1], msg);
+        const n = try posix.read(pipe[0], &recv_buf);
         std.mem.doNotOptimizeAway(&n);
     }
 
     return timer.read();
 }
 
-fn benchIoUringPipeReadWrite() u64 {
+fn benchIoUringPipeReadWrite() !u64 {
     const pipe = makePipe();
     defer closePipe(pipe);
 
     const msg = "hello snek!";
     var recv_buf: [64]u8 = undefined;
 
-    var ring = LinuxIoUring.init(256) catch unreachable;
+    var ring = try LinuxIoUring.init(256);
     defer ring.deinit();
 
     var events: [16]CompletionEntry = undefined;
 
     // Warmup
     for (0..WARMUP) |_| {
-        ring.submitWrite(pipe[1], msg, 0, 0) catch unreachable;
+        try ring.submitWrite(pipe[1], msg, 0, 0);
         var count: u32 = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
-        ring.submitRead(pipe[0], &recv_buf, 0, 1) catch unreachable;
+        try ring.submitRead(pipe[0], &recv_buf, 0, 1);
         count = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..SCENARIO_4_ITERS) |_| {
-        ring.submitWrite(pipe[1], msg, 0, 0) catch unreachable;
+        try ring.submitWrite(pipe[1], msg, 0, 0);
         var count: u32 = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
-        ring.submitRead(pipe[0], &recv_buf, 0, 1) catch unreachable;
+        try ring.submitRead(pipe[0], &recv_buf, 0, 1);
         count = 0;
         while (count == 0) {
-            count = ring.submitAndWait(&events, 1) catch unreachable;
+            count = try ring.submitAndWait(&events, 1);
         }
     }
 
@@ -424,43 +424,43 @@ pub fn main() !void {
 
         // Scenario 0
         std.debug.print("  Scenario 0: Raw socketpair send/recv ({d} iters)\n", .{SCENARIO_0_ITERS});
-        const raw_ns = benchRawSocketpair();
+        const raw_ns = try benchRawSocketpair();
         std.debug.print("    Raw send/recv:              {d:>8.1} ns/op\n", .{nsPerOp(raw_ns, SCENARIO_0_ITERS)});
         best.raw_socketpair_ns = @min(best.raw_socketpair_ns, raw_ns);
 
         // Scenario 1
         std.debug.print("  Scenario 1: Raw stdlib IoUring ({d} iters)\n", .{SCENARIO_1_ITERS});
-        const stdlib_ns = benchRawStdlibIoUring();
+        const stdlib_ns = try benchRawStdlibIoUring();
         std.debug.print("    Stdlib io_uring:            {d:>8.1} ns/op\n", .{nsPerOp(stdlib_ns, SCENARIO_1_ITERS)});
         best.raw_stdlib_uring_ns = @min(best.raw_stdlib_uring_ns, stdlib_ns);
 
         // Scenario 2
         std.debug.print("  Scenario 2: Our IoUring adapter ({d} iters)\n", .{SCENARIO_2_ITERS});
-        const adapter_ns = benchIoUringAdapter();
+        const adapter_ns = try benchIoUringAdapter();
         std.debug.print("    Adapter (submit+poll):      {d:>8.1} ns/op\n", .{nsPerOp(adapter_ns, SCENARIO_2_ITERS)});
         best.adapter_ns = @min(best.adapter_ns, adapter_ns);
 
         // Scenario 3
         std.debug.print("  Scenario 3: Batch submission scaling\n", .{});
-        const b10 = benchBatchSubmission(10);
+        const b10 = try benchBatchSubmission(10);
         std.debug.print("    N=10:   {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b10))});
         best.batch_10_ns = @min(best.batch_10_ns, b10);
 
-        const b50 = benchBatchSubmission(50);
+        const b50 = try benchBatchSubmission(50);
         std.debug.print("    N=50:   {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b50))});
         best.batch_50_ns = @min(best.batch_50_ns, b50);
 
-        const b100 = benchBatchSubmission(100);
+        const b100 = try benchBatchSubmission(100);
         std.debug.print("    N=100:  {d:>10.1} ns/batch\n", .{@as(f64, @floatFromInt(b100))});
         best.batch_100_ns = @min(best.batch_100_ns, b100);
 
         // Scenario 4
         std.debug.print("  Scenario 4: io_uring vs raw syscalls (pipe read/write, {d} iters)\n", .{SCENARIO_4_ITERS});
-        const raw_pipe_ns = benchRawPipeReadWrite();
+        const raw_pipe_ns = try benchRawPipeReadWrite();
         std.debug.print("    Raw pipe read/write:        {d:>8.1} ns/op\n", .{nsPerOp(raw_pipe_ns, SCENARIO_4_ITERS)});
         best.raw_pipe_ns = @min(best.raw_pipe_ns, raw_pipe_ns);
 
-        const uring_pipe_ns = benchIoUringPipeReadWrite();
+        const uring_pipe_ns = try benchIoUringPipeReadWrite();
         std.debug.print("    io_uring pipe read/write:   {d:>8.1} ns/op\n", .{nsPerOp(uring_pipe_ns, SCENARIO_4_ITERS)});
         best.uring_pipe_ns = @min(best.uring_pipe_ns, uring_pipe_ns);
 

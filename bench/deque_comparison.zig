@@ -21,7 +21,7 @@ fn ChaseLevDeque(comptime T: type) type {
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             std.debug.assert(capacity > 0 and (capacity & (capacity - 1)) == 0);
-            const buffer = allocator.alloc(T, capacity) catch unreachable;
+            const buffer = try allocator.alloc(T, capacity);
             return Self{
                 .top = std.atomic.Value(usize).init(0),
                 .bottom = std.atomic.Value(usize).init(0),
@@ -89,7 +89,7 @@ fn MutexDeque(comptime T: type) type {
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             std.debug.assert(capacity > 0 and (capacity & (capacity - 1)) == 0);
-            const buffer = allocator.alloc(T, capacity) catch unreachable;
+            const buffer = try allocator.alloc(T, capacity);
             return Self{
                 .buffer = buffer,
                 .mask = capacity - 1,
@@ -143,7 +143,7 @@ fn SpscQueue(comptime T: type) type {
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             std.debug.assert(capacity > 0 and (capacity & (capacity - 1)) == 0);
-            const buffer = allocator.alloc(T, capacity) catch unreachable;
+            const buffer = try allocator.alloc(T, capacity);
             return Self{
                 .buffer = buffer,
                 .mask = capacity - 1,
@@ -195,9 +195,9 @@ const WARMUP = 10_000;
 
 // ── Scenario 1: Single-threaded push/pop (owner-only) ────────────────
 
-fn benchSingleThread(comptime name: []const u8, comptime DequeType: type) u64 {
+fn benchSingleThread(comptime name: []const u8, comptime DequeType: type) !u64 {
     const allocator = std.heap.page_allocator;
-    var d = DequeType.init(allocator, CAPACITY) catch unreachable;
+    var d = try DequeType.init(allocator, CAPACITY);
     defer d.deinit();
 
     // Warmup
@@ -206,7 +206,7 @@ fn benchSingleThread(comptime name: []const u8, comptime DequeType: type) u64 {
         std.mem.doNotOptimizeAway(d.pop());
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..OPS) |i| {
         d.push(@as(u64, @intCast(i)));
@@ -221,9 +221,9 @@ fn benchSingleThread(comptime name: []const u8, comptime DequeType: type) u64 {
 
 // ── Scenario 2: Producer-consumer (1 pusher, 1 stealer) ──────────────
 
-fn benchProducerConsumer(comptime name: []const u8, comptime DequeType: type) u64 {
+fn benchProducerConsumer(comptime name: []const u8, comptime DequeType: type) !u64 {
     const allocator = std.heap.page_allocator;
-    var d = DequeType.init(allocator, CAPACITY) catch unreachable;
+    var d = try DequeType.init(allocator, CAPACITY);
     defer d.deinit();
 
     var stolen_count = std.atomic.Value(usize).init(0);
@@ -247,9 +247,9 @@ fn benchProducerConsumer(comptime name: []const u8, comptime DequeType: type) u6
         }
     };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
-    var thief = std.Thread.spawn(.{}, Stealer.run, .{ &d, &stolen_count, &done }) catch unreachable;
+    var thief = try std.Thread.spawn(.{}, Stealer.run, .{ &d, &stolen_count, &done });
 
     // Producer pushes OPS items, throttling to avoid overflowing the buffer
     var pushed: usize = 0;
@@ -274,9 +274,9 @@ fn benchProducerConsumer(comptime name: []const u8, comptime DequeType: type) u6
 
 // ── Scenario 3: Contended stealing (1 pusher, 3 stealers) ────────────
 
-fn benchContended(comptime name: []const u8, comptime DequeType: type) u64 {
+fn benchContended(comptime name: []const u8, comptime DequeType: type) !u64 {
     const allocator = std.heap.page_allocator;
-    var d = DequeType.init(allocator, CAPACITY) catch unreachable;
+    var d = try DequeType.init(allocator, CAPACITY);
     defer d.deinit();
 
     const NUM_THIEVES = 3;
@@ -303,11 +303,11 @@ fn benchContended(comptime name: []const u8, comptime DequeType: type) u64 {
         }
     };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     var threads: [NUM_THIEVES]std.Thread = undefined;
     for (0..NUM_THIEVES) |i| {
-        threads[i] = std.Thread.spawn(.{}, Stealer.run, .{ &d, &stolen_counts[i], &done }) catch unreachable;
+        threads[i] = try std.Thread.spawn(.{}, Stealer.run, .{ &d, &stolen_counts[i], &done });
     }
 
     var pushed: usize = 0;
@@ -336,9 +336,9 @@ fn benchContended(comptime name: []const u8, comptime DequeType: type) u64 {
 
 // ── Scenario 4: Mixed push/pop with occasional steal ─────────────────
 
-fn benchMixed(comptime name: []const u8, comptime DequeType: type) u64 {
+fn benchMixed(comptime name: []const u8, comptime DequeType: type) !u64 {
     const allocator = std.heap.page_allocator;
-    var d = DequeType.init(allocator, CAPACITY) catch unreachable;
+    var d = try DequeType.init(allocator, CAPACITY);
     defer d.deinit();
 
     var stolen_count = std.atomic.Value(usize).init(0);
@@ -362,9 +362,9 @@ fn benchMixed(comptime name: []const u8, comptime DequeType: type) u64 {
         }
     };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
-    var thief = std.Thread.spawn(.{}, Stealer.run, .{ &d, &stolen_count, &done }) catch unreachable;
+    var thief = try std.Thread.spawn(.{}, Stealer.run, .{ &d, &stolen_count, &done });
 
     // Owner does 90% push/pop, 10% just push (leaving items for stealer)
     for (0..OPS) |i| {
@@ -404,25 +404,25 @@ pub fn main() !void {
         std.debug.print("--- Run {d} ---\n", .{run + 1});
 
         std.debug.print("  Scenario 1: Single-threaded push/pop (1M cycles)\n", .{});
-        best_cl[0] = @min(best_cl[0], benchSingleThread("Chase-Lev", CL));
-        best_mx[0] = @min(best_mx[0], benchSingleThread("Mutex+Deque", MX));
-        best_sp[0] = @min(best_sp[0], benchSingleThread("SPSC Queue", SP));
+        best_cl[0] = @min(best_cl[0], try benchSingleThread("Chase-Lev", CL));
+        best_mx[0] = @min(best_mx[0], try benchSingleThread("Mutex+Deque", MX));
+        best_sp[0] = @min(best_sp[0], try benchSingleThread("SPSC Queue", SP));
 
         std.debug.print("  Scenario 2: Producer-consumer (1 push, 1 steal)\n", .{});
-        best_cl[1] = @min(best_cl[1], benchProducerConsumer("Chase-Lev", CL));
-        best_mx[1] = @min(best_mx[1], benchProducerConsumer("Mutex+Deque", MX));
-        best_sp[1] = @min(best_sp[1], benchProducerConsumer("SPSC Queue", SP));
+        best_cl[1] = @min(best_cl[1], try benchProducerConsumer("Chase-Lev", CL));
+        best_mx[1] = @min(best_mx[1], try benchProducerConsumer("Mutex+Deque", MX));
+        best_sp[1] = @min(best_sp[1], try benchProducerConsumer("SPSC Queue", SP));
 
         std.debug.print("  Scenario 3: Contended (1 push, 3 steal)\n", .{});
-        best_cl[2] = @min(best_cl[2], benchContended("Chase-Lev", CL));
-        best_mx[2] = @min(best_mx[2], benchContended("Mutex+Deque", MX));
+        best_cl[2] = @min(best_cl[2], try benchContended("Chase-Lev", CL));
+        best_mx[2] = @min(best_mx[2], try benchContended("Mutex+Deque", MX));
         // SPSC can't do multi-consumer, skip
         std.debug.print("    {s:<30} {s:>8}        (N/A: single-consumer only)\n", .{ "SPSC Queue", "---" });
 
         std.debug.print("  Scenario 4: Mixed (90% local, 10% stolen)\n", .{});
-        best_cl[3] = @min(best_cl[3], benchMixed("Chase-Lev", CL));
-        best_mx[3] = @min(best_mx[3], benchMixed("Mutex+Deque", MX));
-        best_sp[3] = @min(best_sp[3], benchMixed("SPSC Queue", SP));
+        best_cl[3] = @min(best_cl[3], try benchMixed("Chase-Lev", CL));
+        best_mx[3] = @min(best_mx[3], try benchMixed("Mutex+Deque", MX));
+        best_sp[3] = @min(best_sp[3], try benchMixed("SPSC Queue", SP));
 
         std.debug.print("\n", .{});
     }

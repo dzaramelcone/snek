@@ -105,7 +105,7 @@ const CAPACITY = 4096;
 const ITERATIONS = 1_000_000;
 const WARMUP = 10_000;
 
-fn benchHiveArray() u64 {
+fn benchHiveArray() !u64 {
     var p = HiveArray(ConnectionContext, CAPACITY).init();
     var items: [CAPACITY]*ConnectionContext = undefined;
 
@@ -116,7 +116,7 @@ fn benchHiveArray() u64 {
         p.put(item);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     // Scenario 1: Sequential acquire/release (hot path — single connection accept/close)
     for (0..ITERATIONS) |i| {
@@ -184,7 +184,7 @@ fn benchHiveArray() u64 {
     return seq_ns + churn_ns + exhaust_ns;
 }
 
-fn benchFreeList() u64 {
+fn benchFreeList() !u64 {
     var p: FreeList(ConnectionContext, CAPACITY) = undefined;
     p.initInPlace();
     var items: [CAPACITY]*ConnectionContext = undefined;
@@ -196,7 +196,7 @@ fn benchFreeList() u64 {
         p.put(item);
     }
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     // Scenario 1: Sequential acquire/release
     for (0..ITERATIONS) |i| {
@@ -276,16 +276,16 @@ pub fn main() !void {
     var best_free: u64 = std.math.maxInt(u64);
 
     std.debug.print("\n--- Run 1 ---", .{});
-    best_hive = @min(best_hive, benchHiveArray());
-    best_free = @min(best_free, benchFreeList());
+    best_hive = @min(best_hive, try benchHiveArray());
+    best_free = @min(best_free, try benchFreeList());
 
     std.debug.print("\n--- Run 2 ---", .{});
-    best_hive = @min(best_hive, benchHiveArray());
-    best_free = @min(best_free, benchFreeList());
+    best_hive = @min(best_hive, try benchHiveArray());
+    best_free = @min(best_free, try benchFreeList());
 
     std.debug.print("\n--- Run 3 ---", .{});
-    best_hive = @min(best_hive, benchHiveArray());
-    best_free = @min(best_free, benchFreeList());
+    best_hive = @min(best_hive, try benchHiveArray());
+    best_free = @min(best_free, try benchFreeList());
 
     std.debug.print("\n\n=== VERDICT ===\n", .{});
     const ratio = @as(f64, @floatFromInt(best_hive)) / @as(f64, @floatFromInt(best_free));

@@ -50,7 +50,7 @@ fn buildGetCmd(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
 
 fn benchAccumulate(sock: posix.socket_t, get_cmd: []const u8, iterations: usize) !u64 {
     const allocator = std.heap.smp_allocator;
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..iterations) |_| {
         try sendAll(sock, get_cmd);
@@ -90,7 +90,7 @@ fn benchAccumulate(sock: posix.socket_t, get_cmd: []const u8, iterations: usize)
 // Pre-allocate Python bytes object, recv payload directly into its buffer.
 
 fn benchStream(sock: posix.socket_t, get_cmd: []const u8, iterations: usize) !u64 {
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = try std.time.Timer.start();
 
     for (0..iterations) |_| {
         try sendAll(sock, get_cmd);

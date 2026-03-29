@@ -202,76 +202,76 @@ const FakeIO = struct {
 
 test "tcp listener bind and listen" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
-    std.testing.expect(listener.socket.fd >= 0) catch unreachable;
-    std.testing.expect(listener.getPort() != 0) catch unreachable;
+    try std.testing.expect(listener.socket.fd >= 0);
+    try std.testing.expect(listener.getPort() != 0);
 }
 
 test "tcp accept connection" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
     // Client connects
-    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(client_fd);
-    posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    try posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in));
 
     // Accept
-    var conn = listener.accept(std.testing.allocator) catch unreachable;
+    var conn = try listener.accept(std.testing.allocator);
     defer conn.close();
 
-    std.testing.expect(conn.socket.fd >= 0) catch unreachable;
+    try std.testing.expect(conn.socket.fd >= 0);
 }
 
 test "tcp connection socket options" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
-    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(client_fd);
-    posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    try posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in));
 
-    var conn = listener.accept(std.testing.allocator) catch unreachable;
+    var conn = try listener.accept(std.testing.allocator);
     defer conn.close();
 
     // These should not error on a valid socket
-    conn.setNodelay(true) catch unreachable;
-    conn.setKeepalive(true) catch unreachable;
-    conn.setNodelay(false) catch unreachable;
-    conn.setKeepalive(false) catch unreachable;
+    try conn.setNodelay(true);
+    try conn.setKeepalive(true);
+    try conn.setNodelay(false);
+    try conn.setKeepalive(false);
 }
 
 test "tcp send and recv" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
-    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(client_fd);
-    posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    try posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in));
 
-    var conn = listener.accept(std.testing.allocator) catch unreachable;
+    var conn = try listener.accept(std.testing.allocator);
     defer conn.close();
 
     // Client sends, server recvs
-    _ = posix.send(client_fd, "hello", 0) catch unreachable;
+    _ = try posix.send(client_fd, "hello", 0);
     var buf: [64]u8 = undefined;
-    const n = conn.recv(&buf) catch unreachable;
+    const n = try conn.recv(&buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
 
     // Server sends, client recvs
-    _ = conn.send("world") catch unreachable;
-    const n2 = posix.recv(client_fd, &buf, 0) catch unreachable;
+    _ = try conn.send("world");
+    const n2 = try posix.recv(client_fd, &buf, 0);
     try std.testing.expectEqualStrings("world", buf[0..n2]);
 }
 
 test "tcp listener close" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     const fd = listener.socket.fd;
     try std.testing.expect(fd >= 0);
     listener.close();
@@ -283,25 +283,25 @@ test "tcp listener close" {
 test "tcp so_reuseport" {
     var io = FakeIO{};
     // Listen with reuseport=true (default)
-    var l1 = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{ .reuseport = true }) catch unreachable;
+    var l1 = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{ .reuseport = true });
     defer l1.close();
 
     // Disable reuseport on the same listener
-    l1.setReuseport(false) catch unreachable;
+    try l1.setReuseport(false);
     // Re-enable
-    l1.setReuseport(true) catch unreachable;
+    try l1.setReuseport(true);
 }
 
 test "tcp two-timeout model" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
-    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(client_fd);
-    posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    try posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in));
 
-    var conn = listener.accept(std.testing.allocator) catch unreachable;
+    var conn = try listener.accept(std.testing.allocator);
     defer conn.close();
 
     // Initial state: request, count=0
@@ -325,50 +325,50 @@ test "tcp two-timeout model" {
 
 test "tcp connection arena reset" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
-    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(client_fd);
-    posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    try posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in));
 
-    var conn = listener.accept(std.testing.allocator) catch unreachable;
+    var conn = try listener.accept(std.testing.allocator);
     defer conn.close();
 
     // Allocate from req_arena
     const alloc = conn.req_arena.allocator();
-    const slice = alloc.alloc(u8, 128) catch unreachable;
+    const slice = try alloc.alloc(u8, 128);
     @memset(slice, 0xAA);
 
     // Reset
     conn.resetRequestArena();
 
     // Allocate again — should succeed (arena reuses memory)
-    const slice2 = alloc.alloc(u8, 128) catch unreachable;
+    const slice2 = try alloc.alloc(u8, 128);
     _ = slice2;
 
     // conn_arena should be independent
     const conn_alloc = conn.conn_arena.allocator();
-    const conn_slice = conn_alloc.alloc(u8, 64) catch unreachable;
+    const conn_slice = try conn_alloc.alloc(u8, 64);
     _ = conn_slice;
 }
 
 test "tcp keepalive multiple requests" {
     var io = FakeIO{};
-    var listener = Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{}) catch unreachable;
+    var listener = try Listener(FakeIO).listen(&io, "127.0.0.1", 0, .{});
     defer listener.close();
 
-    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch unreachable;
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(client_fd);
-    posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in)) catch unreachable;
+    try posix.connect(client_fd, @ptrCast(&listener.bound_addr), @sizeOf(posix.sockaddr.in));
 
-    var conn = listener.accept(std.testing.allocator) catch unreachable;
+    var conn = try listener.accept(std.testing.allocator);
     defer conn.close();
 
     // First request
-    _ = posix.send(client_fd, "GET /1", 0) catch unreachable;
+    _ = try posix.send(client_fd, "GET /1", 0);
     var buf: [64]u8 = undefined;
-    const n1 = conn.recv(&buf) catch unreachable;
+    const n1 = try conn.recv(&buf);
     try std.testing.expectEqualStrings("GET /1", buf[0..n1]);
 
     // Transition: request done -> keepalive -> new request
@@ -377,8 +377,8 @@ test "tcp keepalive multiple requests" {
     conn.transitionToRequest();
 
     // Second request on same connection
-    _ = posix.send(client_fd, "GET /2", 0) catch unreachable;
-    const n2 = conn.recv(&buf) catch unreachable;
+    _ = try posix.send(client_fd, "GET /2", 0);
+    const n2 = try conn.recv(&buf);
     try std.testing.expectEqualStrings("GET /2", buf[0..n2]);
 
     try std.testing.expectEqual(@as(u32, 1), conn.request_count);

@@ -561,7 +561,7 @@ test "module registers and imports" {
     const result = try ffi.callObject(func, null);
     defer ffi.decref(result);
     const count = try ffi.longAsLong(result);
-    std.testing.expectEqual(@as(c_long, 0), count) catch unreachable;
+    try std.testing.expectEqual(@as(c_long, 0), count);
 }
 
 test "add_route stores handler" {
@@ -581,13 +581,13 @@ test "add_route stores handler" {
 
     // Verify handler count via module state
     const state = getState(mod).?;
-    std.testing.expectEqual(@as(u32, 1), state.py_handler_count) catch unreachable;
-    std.testing.expect(state.py_handlers[0] != null) catch unreachable;
+    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
+    try std.testing.expect(state.py_handlers[0] != null);
 
     // Verify route metadata
     const entry = state.route_entries[0];
-    std.testing.expect(std.mem.eql(u8, entry.method[0..entry.method_len], "GET")) catch unreachable;
-    std.testing.expect(std.mem.eql(u8, entry.path[0..entry.path_len], "/test")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, entry.method[0..entry.method_len], "GET"));
+    try std.testing.expect(std.mem.eql(u8, entry.path[0..entry.path_len], "/test"));
 }
 
 test "add_route rejects non-callable" {
@@ -604,7 +604,7 @@ test "add_route rejects non-callable" {
         \\import _snek
         \\_snek.add_route("GET", "/bad", "not a callable")
     );
-    std.testing.expectError(error.PythonError, err) catch unreachable;
+    try std.testing.expectError(error.PythonError, err);
 }
 
 test "add_route multiple routes" {
@@ -624,20 +624,20 @@ test "add_route multiple routes" {
     );
 
     const state = getState(mod).?;
-    std.testing.expectEqual(@as(u32, 3), state.py_handler_count) catch unreachable;
+    try std.testing.expectEqual(@as(u32, 3), state.py_handler_count);
 
     // Check each route entry
     const e0 = state.route_entries[0];
-    std.testing.expect(std.mem.eql(u8, e0.method[0..e0.method_len], "GET")) catch unreachable;
-    std.testing.expect(std.mem.eql(u8, e0.path[0..e0.path_len], "/")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, e0.method[0..e0.method_len], "GET"));
+    try std.testing.expect(std.mem.eql(u8, e0.path[0..e0.path_len], "/"));
 
     const e1 = state.route_entries[1];
-    std.testing.expect(std.mem.eql(u8, e1.method[0..e1.method_len], "POST")) catch unreachable;
-    std.testing.expect(std.mem.eql(u8, e1.path[0..e1.path_len], "/users")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, e1.method[0..e1.method_len], "POST"));
+    try std.testing.expect(std.mem.eql(u8, e1.path[0..e1.path_len], "/users"));
 
     const e2 = state.route_entries[2];
-    std.testing.expect(std.mem.eql(u8, e2.method[0..e2.method_len], "GET")) catch unreachable;
-    std.testing.expect(std.mem.eql(u8, e2.path[0..e2.path_len], "/users/{id}")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, e2.method[0..e2.method_len], "GET"));
+    try std.testing.expect(std.mem.eql(u8, e2.path[0..e2.path_len], "/users/{id}"));
 }
 
 test "call stored handler" {
@@ -674,9 +674,9 @@ test "call stored handler" {
     ffi.decref(call_args);
 
     // Verify result is a dict with "message" key
-    std.testing.expect(ffi.isDict(result)) catch unreachable;
+    try std.testing.expect(ffi.isDict(result));
     const msg = ffi.dictGetItemString(result, "message"); // borrowed
-    std.testing.expect(msg != null) catch unreachable;
+    try std.testing.expect(msg != null);
     const msg_str = try ffi.unicodeAsUTF8(msg.?);
-    std.testing.expect(std.mem.eql(u8, std.mem.span(msg_str), "hello from python")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, std.mem.span(msg_str), "hello from python"));
 }

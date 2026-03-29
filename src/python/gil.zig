@@ -169,10 +169,10 @@ test "gil releaseForIo and reacquire" {
 
 test "gil hold warning threshold" {
     // Verify the constant is set correctly (100ms)
-    std.testing.expectEqual(
+    try std.testing.expectEqual(
         @as(i128, 100 * std.time.ns_per_ms),
         GilGuard.HOLD_WARNING_NS,
-    ) catch unreachable;
+    );
 }
 
 test "free-threaded mode detection" {

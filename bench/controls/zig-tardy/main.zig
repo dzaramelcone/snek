@@ -60,7 +60,7 @@ pub fn main() !void {
     const port_str = args.next() orelse "8080";
     const port = std.fmt.parseInt(u16, port_str, 10) catch 8080;
 
-    const addr = std.net.Address.parseIp4("0.0.0.0", port) catch unreachable;
+    const addr = try std.net.Address.parseIp4("0.0.0.0", port);
     const listen_socket = try Socket.init_with_address(.tcp, addr);
     try listen_socket.bind();
     try listen_socket.listen(128);

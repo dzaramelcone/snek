@@ -117,7 +117,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests");
 
     const test_sources = [_][]const u8{
-        "src/core/kqueue.zig",
         "src/net/tcp.zig",
         "src/net/tls.zig",
         "src/net/http1.zig",
@@ -132,11 +131,6 @@ pub fn build(b: *std.Build) void {
         "src/db/pipeline.zig",
         "src/db/notify.zig",
         "src/redis/protocol.zig",
-        "src/redis/connection.zig",
-        "src/redis/pool.zig",
-        "src/redis/commands.zig",
-        "src/redis/pubsub.zig",
-        "src/redis/lua.zig",
         "src/http/request.zig",
         "src/http/response.zig",
         "src/http/router.zig",
@@ -173,21 +167,32 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
+    // Python tests that can compile standalone (no ../  imports)
     const python_test_sources = [_][]const u8{
         "src/python/ffi.zig",
         "src/python/gil.zig",
-        "src/python/driver.zig",
         "src/python/coerce.zig",
         "src/python/context.zig",
         "src/python/inject.zig",
-        "src/python/module.zig",
-        "src/python/subinterp.zig",
     };
 
     for (python_test_sources) |source| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        linkPython(t.root_module);
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // driver.zig and module.zig import across src/ — test via lib root
+    {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/lib.zig"),
                 .target = target,
                 .optimize = optimize,
             }),

@@ -464,7 +464,7 @@ fn makeSocketPair() [2]posix.fd_t {
 
 test "init kqueue" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     try std.testing.expect(kq.kq >= 0);
@@ -472,18 +472,18 @@ test "init kqueue" {
 
 test "submit and poll timeout" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     // Submit a 1ms timeout
-    kq.submitTimeout(1_000_000, 42) catch unreachable;
+    try kq.submitTimeout(1_000_000, 42);
 
     var events: [16]CompletionEntry = undefined;
     // Poll — may need a couple tries for the timer to fire
     var count: u32 = 0;
     var attempts: u32 = 0;
     while (count == 0 and attempts < 10) : (attempts += 1) {
-        count = kq.pollCompletions(&events) catch unreachable;
+        count = try kq.pollCompletions(&events);
     }
 
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -493,7 +493,7 @@ test "submit and poll timeout" {
 
 test "socket pair send/recv" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -503,13 +503,13 @@ test "socket pair send/recv" {
     const msg = "hello kqueue";
 
     // Send on pair[0]
-    kq.submitSend(pair[0], msg, 10) catch unreachable;
+    try kq.submitSend(pair[0], msg, 10);
 
     var events: [16]CompletionEntry = undefined;
     var count: u32 = 0;
     var attempts: u32 = 0;
     while (count == 0 and attempts < 10) : (attempts += 1) {
-        count = kq.pollCompletions(&events) catch unreachable;
+        count = try kq.pollCompletions(&events);
     }
     try std.testing.expectEqual(@as(u32, 1), count);
     try std.testing.expectEqual(@as(u64, 10), events[0].user_data);
@@ -517,12 +517,12 @@ test "socket pair send/recv" {
 
     // Recv on pair[1]
     var buf: [64]u8 = undefined;
-    kq.submitRecv(pair[1], &buf, 20) catch unreachable;
+    try kq.submitRecv(pair[1], &buf, 20);
 
     count = 0;
     attempts = 0;
     while (count == 0 and attempts < 10) : (attempts += 1) {
-        count = kq.pollCompletions(&events) catch unreachable;
+        count = try kq.pollCompletions(&events);
     }
     try std.testing.expectEqual(@as(u32, 1), count);
     try std.testing.expectEqual(@as(u64, 20), events[0].user_data);
@@ -532,7 +532,7 @@ test "socket pair send/recv" {
 
 test "close generates completion" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     // Create a socket to close
@@ -540,10 +540,10 @@ test "close generates completion" {
     // We'll close pair[0] via kqueue, close pair[1] directly
     defer posix.close(pair[1]);
 
-    kq.submitClose(pair[0], 99) catch unreachable;
+    try kq.submitClose(pair[0], 99);
 
     var events: [16]CompletionEntry = undefined;
-    const count = kq.pollCompletions(&events) catch unreachable;
+    const count = try kq.pollCompletions(&events);
 
     // Close is immediate
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -559,15 +559,15 @@ test "kqueue satisfies IO interface" {
 
 test "cancel removes pending op" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     // Submit a long timeout, then cancel it
-    kq.submitTimeout(999_000_000_000, 50) catch unreachable;
-    kq.submitCancel(50, 51) catch unreachable;
+    try kq.submitTimeout(999_000_000_000, 50);
+    try kq.submitCancel(50, 51);
 
     var events: [16]CompletionEntry = undefined;
-    const count = kq.pollCompletions(&events) catch unreachable;
+    const count = try kq.pollCompletions(&events);
 
     // Should get the cancel completion immediately
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -581,17 +581,17 @@ test "cancel removes pending op" {
 
 test "edge: pollCompletions with no pending ops returns 0" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     var events: [16]CompletionEntry = undefined;
-    const count = kq.pollCompletions(&events) catch unreachable;
+    const count = try kq.pollCompletions(&events);
     try std.testing.expectEqual(@as(u32, 0), count);
 }
 
 test "edge: poll with events buffer of size 1 returns 1 at a time" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     // Submit 3 immediate ops (close generates immediate completions)
@@ -601,9 +601,9 @@ test "edge: poll with events buffer of size 1 returns 1 at a time" {
         makeSocketPair(),
     };
     // Close one end of each pair via kqueue
-    kq.submitClose(pairs[0][0], 1) catch unreachable;
-    kq.submitClose(pairs[1][0], 2) catch unreachable;
-    kq.submitClose(pairs[2][0], 3) catch unreachable;
+    try kq.submitClose(pairs[0][0], 1);
+    try kq.submitClose(pairs[1][0], 2);
+    try kq.submitClose(pairs[2][0], 3);
     defer posix.close(pairs[0][1]);
     defer posix.close(pairs[1][1]);
     defer posix.close(pairs[2][1]);
@@ -612,7 +612,7 @@ test "edge: poll with events buffer of size 1 returns 1 at a time" {
     var events: [1]CompletionEntry = undefined;
     var total: u32 = 0;
     for (0..3) |_| {
-        const count = kq.pollCompletions(&events) catch unreachable;
+        const count = try kq.pollCompletions(&events);
         try std.testing.expectEqual(@as(u32, 1), count);
         total += count;
     }
@@ -621,7 +621,7 @@ test "edge: poll with events buffer of size 1 returns 1 at a time" {
 
 test "edge: two reads on same fd" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -630,19 +630,19 @@ test "edge: two reads on same fd" {
 
     // Write data so reads will be ready
     const msg = "hello";
-    _ = posix.write(@intCast(pair[0]), msg) catch unreachable;
+    _ = try posix.write(@intCast(pair[0]), msg);
 
     // Submit two reads on the same fd with different user_data
     var buf1: [64]u8 = undefined;
     var buf2: [64]u8 = undefined;
-    kq.submitRecv(pair[1], &buf1, 10) catch unreachable;
-    kq.submitRecv(pair[1], &buf2, 11) catch unreachable;
+    try kq.submitRecv(pair[1], &buf1, 10);
+    try kq.submitRecv(pair[1], &buf2, 11);
 
     var events: [16]CompletionEntry = undefined;
     var count: u32 = 0;
     var attempts: u32 = 0;
     while (count < 1 and attempts < 10) : (attempts += 1) {
-        count += kq.pollCompletions(events[count..]) catch unreachable;
+        count += try kq.pollCompletions(events[count..]);
     }
 
     // At least the first read should succeed
@@ -652,7 +652,7 @@ test "edge: two reads on same fd" {
 
 test "edge: partial read — send more data than recv buffer" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -662,17 +662,17 @@ test "edge: partial read — send more data than recv buffer" {
     // Send 100 bytes
     var big_msg: [100]u8 = undefined;
     @memset(&big_msg, 'A');
-    _ = posix.send(@intCast(pair[0]), &big_msg, 0) catch unreachable;
+    _ = try posix.send(@intCast(pair[0]), &big_msg, 0);
 
     // Recv with only a 10-byte buffer
     var small_buf: [10]u8 = undefined;
-    kq.submitRecv(pair[1], &small_buf, 20) catch unreachable;
+    try kq.submitRecv(pair[1], &small_buf, 20);
 
     var events: [16]CompletionEntry = undefined;
     var count: u32 = 0;
     var attempts: u32 = 0;
     while (count == 0 and attempts < 10) : (attempts += 1) {
-        count = kq.pollCompletions(&events) catch unreachable;
+        count = try kq.pollCompletions(&events);
     }
 
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -682,7 +682,7 @@ test "edge: partial read — send more data than recv buffer" {
 
 test "edge: closed peer — EOF on recv" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -693,13 +693,13 @@ test "edge: closed peer — EOF on recv" {
 
     // Try to recv on the read end — should get EOF (0 bytes)
     var buf: [64]u8 = undefined;
-    kq.submitRecv(pair[1], &buf, 30) catch unreachable;
+    try kq.submitRecv(pair[1], &buf, 30);
 
     var events: [16]CompletionEntry = undefined;
     var count: u32 = 0;
     var attempts: u32 = 0;
     while (count == 0 and attempts < 10) : (attempts += 1) {
-        count = kq.pollCompletions(&events) catch unreachable;
+        count = try kq.pollCompletions(&events);
     }
 
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -709,14 +709,14 @@ test "edge: closed peer — EOF on recv" {
 
 test "edge: cancel an op that does not exist — no crash" {
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     // Cancel a non-existent user_data
-    kq.submitCancel(9999, 100) catch unreachable;
+    try kq.submitCancel(9999, 100);
 
     var events: [16]CompletionEntry = undefined;
-    const count = kq.pollCompletions(&events) catch unreachable;
+    const count = try kq.pollCompletions(&events);
 
     // Should still get the cancel completion
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -729,7 +729,7 @@ test "edge: changelist append propagates allocation errors" {
     // The current implementation uses `catch {}` which swallows OOM.
     // This test verifies the bug exists by using a failing allocator.
     const alloc = std.testing.allocator;
-    var kq = Kqueue.init(.{ .allocator = alloc }) catch unreachable;
+    var kq = try Kqueue.init(.{ .allocator = alloc });
     defer kq.deinit();
 
     const pair = makeSocketPair();
@@ -740,16 +740,16 @@ test "edge: changelist append propagates allocation errors" {
     // which silently drops the kevent registration on OOM.
     // For now, just verify the operation works normally.
     var buf: [64]u8 = undefined;
-    kq.submitRecv(pair[1], &buf, 1) catch unreachable;
+    try kq.submitRecv(pair[1], &buf, 1);
 
     // Write data so the recv can complete
-    _ = posix.send(@intCast(pair[0]), "test", 0) catch unreachable;
+    _ = try posix.send(@intCast(pair[0]), "test", 0);
 
     var events: [16]CompletionEntry = undefined;
     var count: u32 = 0;
     var attempts: u32 = 0;
     while (count == 0 and attempts < 10) : (attempts += 1) {
-        count = kq.pollCompletions(&events) catch unreachable;
+        count = try kq.pollCompletions(&events);
     }
     try std.testing.expect(count >= 1);
 }
