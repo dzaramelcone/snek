@@ -85,6 +85,28 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench_tardy);
 
+    const bench_json = b.addExecutable(.{
+        .name = "bench-json-escape",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/json_escape.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "serialize", .module = b.createModule(.{
+                    .root_source_file = b.path("src/json/serialize.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }) },
+            },
+        }),
+    });
+    b.installArtifact(bench_json);
+
+    const bench_json_step = b.step("bench-json", "Run JSON escape benchmark");
+    const bench_json_run = b.addRunArtifact(bench_json);
+    bench_json_step.dependOn(&bench_json_run.step);
+    bench_json_run.step.dependOn(b.getInstallStep());
+
     // --- Python targets (skipped when cross-compiling unless -Dpython=true) ---
     if (python) {
         // Python extension shared library (_snek.so / .dylib)

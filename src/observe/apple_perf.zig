@@ -402,7 +402,7 @@ test "init on supported platform" {
     defer pe.deinit();
 
     // Verify counters increase between reads
-    const before = try pe.start();
+    const before = try pe.read();
     // Do some work to burn cycles
     var sum: u64 = 0;
     for (0..10_000) |i| {
