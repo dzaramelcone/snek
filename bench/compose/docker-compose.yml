@@ -9,6 +9,7 @@ services:
       - "8080:8080"
     working_dir: /bench
     command: sleep infinity
+    privileged: true
     depends_on:
       - redis
     volumes:

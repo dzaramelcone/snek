@@ -12,3 +12,12 @@ RUN pip install --no-cache-dir granian uvloop
 
 WORKDIR /bench
 COPY app.py /bench/app.py
+
+# Export Python headers + lib for cross-compile sysroot
+# After building, extract with:
+#   docker compose run --rm bench tar czf - -C / usr/local/include/python3.14 usr/local/lib/libpython3.14.so | \
+#     tar xzf - -C sysroot/linux-aarch64 --strip-components=2
+RUN mkdir -p /sysroot/include /sysroot/lib && \
+    cp -r /usr/local/include/python3.14 /sysroot/include/ && \
+    cp /usr/local/lib/libpython3.14.so /sysroot/lib/ 2>/dev/null || \
+    cp /usr/local/lib/libpython3.so /sysroot/lib/ 2>/dev/null || true

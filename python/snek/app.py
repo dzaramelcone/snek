@@ -35,13 +35,13 @@ class App:
 
         return decorator
 
-    def run(self, host="0.0.0.0", port=8080, threads=1, module_ref=""):
+    def run(self, host="0.0.0.0", port=8080, threads=1, module_ref="", backlog=2048):
         print(f"\n  snek listening on http://{host}:{port}/ ({threads} threads)")
         print(f"  {len(self._routes)} routes registered\n")
         for method, path, _ in self._routes:
             print(f"    {method} {path}")
         print()
-        _snek.run(host, port, threads, module_ref)
+        _snek.run(host, port, threads, module_ref, backlog)
 
 
 class _Cmd(IntEnum):

@@ -31,6 +31,7 @@ pub const Server = struct {
     host: []const u8,
     port: u16,
     num_threads: usize,
+    backlog: u31,
     module_ref: [256]u8,
     module_ref_len: u16,
 
@@ -43,6 +44,7 @@ pub const Server = struct {
             .host = host,
             .port = port,
             .num_threads = 1,
+            .backlog = 2048,
             .module_ref = .{0} ** 256,
             .module_ref_len = 0,
         };
@@ -134,7 +136,7 @@ fn threadMain(allocator: std.mem.Allocator, server: *const Server) !void {
 
     const listen_socket = try Socket.initTcp(server.host, server.port);
     try listen_socket.bind();
-    try listen_socket.listen(128);
+    try listen_socket.listen(server.backlog);
 
     // Set up sub-interpreter for this thread
     if (server.module_ref_len > 0) {
@@ -220,7 +222,7 @@ pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
         else => return err,
     };
     if (num_threads > 1) try first_socket.enableReusePort();
-    try first_socket.listen(128);
+    try first_socket.listen(server.backlog);
 
     log.info("pipeline: starting {d} threads on {s}:{d}", .{ num_threads, server.host, server.port });
 
@@ -243,7 +245,7 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
         const s = try Socket.initTcp(server.host, server.port);
         try s.enableReusePort();
         try s.bind();
-        try s.listen(128);
+        try s.listen(server.backlog);
         break :blk s;
     };
 

@@ -716,8 +716,8 @@ fn installShutdownSignals() void {
 
 const drv_log = std.log.scoped(.@"snek/driver");
 
-pub fn startServer(host: []const u8, port: u16, threads: usize) !void {
-    drv_log.info("startServer called host={s} port={d} threads={d}", .{ host, port, threads });
+pub fn startServer(host: []const u8, port: u16, threads: usize, backlog: u16) !void {
+    drv_log.info("startServer called host={s} port={d} threads={d} backlog={d}", .{ host, port, threads, backlog });
     const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
     const state = module.getState(mod) orelse return error.ModuleNotSet;
 
@@ -726,6 +726,7 @@ pub fn startServer(host: []const u8, port: u16, threads: usize) !void {
     var server = server_mod.Server.init(std.heap.smp_allocator, host, port);
     defer server.deinit();
     server.num_threads = threads;
+    server.backlog = @intCast(backlog);
 
     if (module.getModuleRef(mod)) |ref| server.setModuleRef(ref);
 
