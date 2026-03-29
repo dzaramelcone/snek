@@ -4,20 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from asyncio import format_helpers
 from snek import _snek
 
 
 class _SnekHandle:
-    __slots__ = ("_loop", "_slot", "_cancelled", "_repr_fragment", "_callback", "_args", "_context", "__weakref__")
+    __slots__ = ("_loop", "_slot", "_cancelled", "_repr_fragment", "_context", "__weakref__")
 
-    def __init__(self, loop, callback, args, context=None) -> None:
+    def __init__(self, loop, context=None) -> None:
         self._loop = loop
         self._slot = None
         self._cancelled = False
         self._repr_fragment = None
-        self._callback = callback
-        self._args = args
         self._context = context
 
     def __repr__(self) -> str:
@@ -25,12 +22,8 @@ class _SnekHandle:
         if self._cancelled:
             parts.append("cancelled")
         fragment = self._repr_fragment
-        if fragment is None and self._callback is not None:
-            fragment = format_helpers._format_callback_source(
-                self._callback,
-                self._args,
-                debug=self._loop.get_debug(),
-            )
+        if fragment is None and self._slot is not None:
+            fragment = self._loop._handle_repr(self._slot)
             self._repr_fragment = fragment
         if fragment is not None:
             parts.append(fragment)
@@ -40,8 +33,6 @@ class _SnekHandle:
         if self._cancelled:
             return
         self._cancelled = True
-        self._callback = None
-        self._args = None
         slot = self._slot
         self._slot = None
         if slot is not None:
@@ -62,15 +53,13 @@ class _SnekHandle:
     def _mark_cancelled(self) -> None:
         self._cancelled = True
         self._slot = None
-        self._callback = None
-        self._args = None
 
 
 class _SnekTimerHandle(_SnekHandle):
     __slots__ = ("_when",)
 
-    def __init__(self, when, loop, callback, args, context=None) -> None:
-        super().__init__(loop, callback, args, context=context)
+    def __init__(self, when, loop, context=None) -> None:
+        super().__init__(loop, context=context)
         self._when = when
 
     def __repr__(self) -> str:
@@ -79,12 +68,8 @@ class _SnekTimerHandle(_SnekHandle):
             parts.append("cancelled")
         parts.append(f"when={self._when}")
         fragment = self._repr_fragment
-        if fragment is None and self._callback is not None:
-            fragment = format_helpers._format_callback_source(
-                self._callback,
-                self._args,
-                debug=self._loop.get_debug(),
-            )
+        if fragment is None and self._slot is not None:
+            fragment = self._loop._handle_repr(self._slot)
             self._repr_fragment = fragment
         if fragment is not None:
             parts.append(fragment)
@@ -145,7 +130,7 @@ class EventLoop:
     def call_soon(self, callback, *args, context=None):
         if self.is_closed():
             raise RuntimeError("Event loop is closed")
-        handle = _SnekHandle(self, callback, args, context=context)
+        handle = _SnekHandle(self, context=context)
         slot = _snek.loop_call_soon(self._handle, self, handle, callback, args, context)
         handle._bind(slot)
         return handle
@@ -156,7 +141,7 @@ class EventLoop:
     def call_at(self, when, callback, *args, context=None):
         if self.is_closed():
             raise RuntimeError("Event loop is closed")
-        handle = _SnekTimerHandle(when, self, callback, args, context=context)
+        handle = _SnekTimerHandle(when, self, context=context)
         slot = _snek.loop_call_at(self._handle, self, when, handle, callback, args, context)
         handle._bind(slot)
         return handle
@@ -197,6 +182,9 @@ class EventLoop:
 
     def _cancel_handle(self, slot: int) -> None:
         _snek.loop_handle_cancel(self._handle, slot)
+
+    def _handle_repr(self, slot: int):
+        return _snek.loop_handle_repr(self._handle, slot, self.get_debug())
 
     def _timer_handle_cancelled(self, handle) -> None:
         _ = handle
