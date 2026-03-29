@@ -458,29 +458,36 @@ pub const InvokeResult = union(enum) {
     /// Handler completed synchronously — response is ready.
     response: response_mod.Response,
     /// Handler yielded a redis sentinel — needs async I/O.
-    /// py_coro is owned by caller. RESP is pre-built in Zig-owned memory.
+    /// py_coro is owned by caller. RESP written directly into send buffer.
     redis_yield: RedisYield,
+    /// Handler yielded a postgres sentinel — needs async I/O.
+    /// py_coro is owned by caller. SQL wire message written directly into send buffer.
+    pg_yield: PgYield,
 
     pub const RedisYield = struct {
         py_coro: *PyObject,
-        resp: [256]u8,
-        resp_len: u8,
+        bytes_written: usize,
     };
 
-    pub fn redis_yield_type() type {
-        return RedisYield;
-    }
+    pub const PgYield = struct {
+        py_coro: *PyObject,
+        bytes_written: usize,
+        cmd: PgCmd,
+    };
 };
 
 /// Invoke a Python handler. Caller must hold the GIL and provide the _snek module.
-/// Returns InvokeResult — either a response or a redis yield requiring async I/O.
+/// On redis/pg yield, writes protocol bytes directly into the provided send buffers.
+/// Returns InvokeResult — either a response or a lightweight yield descriptor.
 pub fn invokePythonHandler(
     mod: *PyObject,
     handler_id: u32,
     req: *const http1.Request,
     params: []const router_mod.PathParam,
     resp_body_buf: []u8,
-) InvokeResult {
+    redis_send_buf: ?[]u8,
+    pg_send_buf: ?[]u8,
+) !InvokeResult {
     const handler = module.getHandler(mod, handler_id) orelse
         return .{ .response = response_mod.Response.init(500) };
     const flags = module.getHandlerFlags(mod, handler_id);
@@ -532,20 +539,15 @@ pub fn invokePythonHandler(
         const send = ffi.iterSend(call_result, ffi.getNone());
         switch (send.status) {
             .next => {
-                // Coroutine yielded — check for redis sentinel
+                // Coroutine yielded — classify as redis or postgres
                 const sentinel = send.result.?;
                 defer ffi.decref(sentinel);
 
-                if (checkRedisSentinel(sentinel)) |cmd_info| {
-                    // Build RESP now while sentinel is alive — args point into its memory
-                    var ry = InvokeResult.RedisYield{ .py_coro = call_result, .resp = undefined, .resp_len = 0 };
-                    ry.resp_len = @intCast(writeResp(&ry.resp, cmd_info.args[0..cmd_info.arg_count]));
-                    if (ry.resp_len > 0) return .{ .redis_yield = ry };
-                    // RESP too large — fall through to error
-                }
-                // Unknown sentinel — error
-                ffi.decref(call_result);
-                return .{ .response = response_mod.Response.init(500) };
+                const yield = try classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf);
+                return switch (yield) {
+                    .redis => |ry| .{ .redis_yield = ry },
+                    .pg => |pg| .{ .pg_yield = pg },
+                };
             },
             .@"return" => {
                 // Coroutine returned immediately (async def with no await)
@@ -567,29 +569,101 @@ pub fn invokePythonHandler(
     return .{ .response = convertPythonResponse(call_result, resp_body_buf) catch response_mod.Response.init(500) };
 }
 
-/// Check if a sentinel is a redis command: ("redis", "GET", "key", ...).
-/// Extracts command args as string slices (valid while GIL held).
+/// Redis command IDs — must match _Cmd in app.py.
+pub const RedisCmd = enum(u8) {
+    GET, SET, DEL, INCR, EXPIRE, TTL, EXISTS, PING, SETEX,
+
+    pub fn name(self: RedisCmd) []const u8 {
+        return switch (self) {
+            .GET => "GET", .SET => "SET", .DEL => "DEL",
+            .INCR => "INCR", .EXPIRE => "EXPIRE", .TTL => "TTL",
+            .EXISTS => "EXISTS", .PING => "PING", .SETEX => "SETEX",
+        };
+    }
+};
+
+/// Postgres command IDs — must match _DbCmd in app.py.
+pub const PgCmd = enum(u8) {
+    EXECUTE = 100,
+    FETCH_ONE = 101,
+    FETCH_ALL = 102,
+};
+
+/// Classified sentinel — either redis or postgres.
+pub const SentinelYield = union(enum) {
+    redis: InvokeResult.RedisYield,
+    pg: InvokeResult.PgYield,
+};
+
+/// Classify a coroutine sentinel and write protocol bytes directly into the
+/// destination buffer. Returns lightweight metadata (py_coro + bytes_written).
+pub fn classifySentinel(
+    sentinel: *PyObject,
+    py_coro: *PyObject,
+    redis_buf: ?[]u8,
+    pg_buf: ?[]u8,
+) !SentinelYield {
+    if (!ffi.isTuple(sentinel)) return error.SentinelNotTuple;
+    const size = ffi.tupleSize(sentinel);
+    if (size < 1) return error.SentinelEmpty;
+
+    const id_obj = ffi.tupleGetItem(sentinel, 0) orelse return error.SentinelMissingId;
+    if (c.PyLong_Check(id_obj) == 0) return error.SentinelIdNotInt;
+    const id = try ffi.longAsLong(id_obj);
+
+    // Redis: command IDs 0-8
+    if (id >= 0 and id <= @intFromEnum(RedisCmd.SETEX)) {
+        const buf = redis_buf orelse return error.NoRedisBuffer;
+        const cmd_info = try checkRedisSentinel(sentinel);
+        const n = writeResp(buf, cmd_info.args[0..cmd_info.arg_count]);
+        if (n == 0) return error.RespBufferOverflow;
+        return .{ .redis = .{ .py_coro = py_coro, .bytes_written = n } };
+    }
+
+    // Postgres: command IDs 100-102
+    if (id >= 100 and id <= 102) {
+        const buf = pg_buf orelse return error.NoPgBuffer;
+        const cmd: PgCmd = @enumFromInt(@as(u8, @intCast(id)));
+        if (size < 2) return error.SentinelMissingSql;
+        const sql_obj = ffi.tupleGetItem(sentinel, 1) orelse return error.SentinelMissingSql;
+        if (!ffi.isString(sql_obj)) return error.SentinelSqlNotString;
+        const sql_str = try ffi.unicodeAsUTF8(sql_obj);
+        const sql = std.mem.span(sql_str);
+
+        const wire = @import("../db/wire.zig");
+        const msg = wire.encodeQuery(buf, sql);
+        return .{ .pg = .{ .py_coro = py_coro, .bytes_written = msg.len, .cmd = cmd } };
+    }
+
+    return error.UnknownSentinelId;
+}
+
+/// Check if a sentinel is a redis command: (cmd_id, *args).
+/// cmd_id is an integer index into REDIS_CMDS.
+/// Extracts command name + args as string slices (valid while GIL held).
 pub const RedisSentinel = struct {
-    args: [8][]const u8,
+    args: [8][]const u8, // args[0] = command name from REDIS_CMDS, rest = user args
     arg_count: u8,
 };
 
-pub fn checkRedisSentinel(sentinel: *PyObject) ?RedisSentinel {
-    if (!ffi.isTuple(sentinel)) return null;
+pub fn checkRedisSentinel(sentinel: *PyObject) ffi.PythonError!RedisSentinel {
+    if (!ffi.isTuple(sentinel)) return error.PythonError;
     const size = ffi.tupleSize(sentinel);
-    if (size < 2) return null;
+    if (size < 1) return error.PythonError;
 
-    const op_obj = ffi.tupleGetItem(sentinel, 0) orelse return null;
-    if (!ffi.isString(op_obj)) return null;
-    const op = std.mem.span(ffi.unicodeAsUTF8(op_obj) catch return null);
-    if (!std.mem.eql(u8, op, "redis")) return null;
+    const cmd_obj = ffi.tupleGetItem(sentinel, 0) orelse return error.PythonError;
+    if (c.PyLong_Check(cmd_obj) == 0) return error.PythonError;
+    const cmd_id = try ffi.longAsLong(cmd_obj);
+    const cmd: RedisCmd = @enumFromInt(@as(u8, @intCast(cmd_id)));
 
     var result = RedisSentinel{ .args = undefined, .arg_count = 0 };
+    result.args[0] = cmd.name();
+    result.arg_count = 1;
     var i: isize = 1;
     while (i < size and result.arg_count < 8) : (i += 1) {
-        const arg_obj = ffi.tupleGetItem(sentinel, i) orelse return null;
-        if (!ffi.isString(arg_obj)) return null;
-        const s = ffi.unicodeAsUTF8(arg_obj) catch return null;
+        const arg_obj = ffi.tupleGetItem(sentinel, i) orelse return error.PythonError;
+        if (!ffi.isString(arg_obj)) return error.TypeError;
+        const s = try ffi.unicodeAsUTF8(arg_obj);
         result.args[result.arg_count] = std.mem.span(s);
         result.arg_count += 1;
     }
@@ -643,8 +717,8 @@ fn installShutdownSignals() void {
 
 const drv_log = std.log.scoped(.@"snek/driver");
 
-pub fn startServer(host: []const u8, port: u16) !void {
-    drv_log.info("startServer called host={s} port={d}", .{ host, port });
+pub fn startServer(host: []const u8, port: u16, threads: usize) !void {
+    drv_log.info("startServer called host={s} port={d} threads={d}", .{ host, port, threads });
     const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
     const state = module.getState(mod) orelse return error.ModuleNotSet;
 
@@ -652,11 +726,7 @@ pub fn startServer(host: []const u8, port: u16) !void {
 
     var server = server_mod.Server.init(std.heap.smp_allocator, host, port);
     defer server.deinit();
-
-    // SNEK_THREADS env var controls worker count (default: 1)
-    if (std.posix.getenv("SNEK_THREADS")) |threads_str| {
-        server.num_threads = std.fmt.parseInt(usize, threads_str, 10) catch 1;
-    }
+    server.num_threads = threads;
 
     if (module.getModuleRef(mod)) |ref| server.setModuleRef(ref);
 

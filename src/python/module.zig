@@ -327,8 +327,8 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     };
 
     const tuple_size = if (ffi.isTuple(tuple)) ffi.tupleSize(tuple) else 0;
-    if (tuple_size < 2 or tuple_size > 3) {
-        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port[, module_ref]) requires 2-3 arguments");
+    if (tuple_size < 3 or tuple_size > 4) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads[, module_ref]) requires 3-4 arguments");
         return null;
     }
 
@@ -360,13 +360,27 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         return null;
     }
 
+    // Extract threads int
+    const threads_obj = ffi.tupleGetItem(tuple, 2) orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "threads must be an integer");
+        return null;
+    };
+    const threads_long = ffi.longAsLong(threads_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "threads must be an integer");
+        return null;
+    };
+    if (threads_long < 1 or threads_long > 256) {
+        c.PyErr_SetString(c.PyExc_ValueError, "threads must be 1-256");
+        return null;
+    }
+
     // Extract optional module_ref string (e.g. "app:app")
     const state: *SnekModuleState = getState(mod) orelse {
         c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
         return null;
     };
-    if (tuple_size >= 3) {
-        const ref_obj = ffi.tupleGetItem(tuple, 2) orelse {
+    if (tuple_size >= 4) {
+        const ref_obj = ffi.tupleGetItem(tuple, 3) orelse {
             c.PyErr_SetString(c.PyExc_TypeError, "module_ref must be a string");
             return null;
         };
@@ -385,13 +399,14 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 
     const host_span = std.mem.span(host_str);
     const port: u16 = @intCast(port_long);
+    const threads: usize = @intCast(threads_long);
 
     // Set global module ref so driver can access state (temporary)
     g_current_module = mod;
     defer g_current_module = null;
 
     // Start the server with Python handlers wired in.
-    driver.startServer(host_span, port) catch {
+    driver.startServer(host_span, port, threads) catch {
         c.PyErr_SetString(c.PyExc_RuntimeError, "failed to start server");
         return null;
     };
