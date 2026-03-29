@@ -280,14 +280,15 @@ pub const RedisReader = struct {
             .next => {
                 const sentinel = send.result.?;
                 defer ffi.decref(sentinel);
-                if (driver.checkRedisSentinel(sentinel)) |cmd_info| {
-                    // Re-enqueue: build RESP in send buffer from args
-                    var resp_buf: [512]u8 = undefined;
-                    const resp_len = writeRespLegacy(&resp_buf, cmd_info.args[0..cmd_info.arg_count]);
-                    if (resp_len > 0) {
-                        self.enqueue(waiter, resp_buf[0..resp_len]);
-                        return;
-                    }
+                const cmd_info = driver.checkRedisSentinel(sentinel) catch {
+                    self.resumeWithError(rctx, waiter);
+                    return;
+                };
+                var resp_buf: [512]u8 = undefined;
+                const resp_len = writeRespLegacy(&resp_buf, cmd_info.args[0..cmd_info.arg_count]);
+                if (resp_len > 0) {
+                    self.enqueue(waiter, resp_buf[0..resp_len]);
+                    return;
                 }
                 self.resumeWithError(rctx, waiter);
             },

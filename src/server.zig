@@ -4,6 +4,7 @@
 //! No cross-thread GIL contention.
 
 const std = @import("std");
+const posix = std.posix;
 const Socket = @import("socket.zig").Socket;
 const Runtime = @import("runtime.zig").Runtime;
 const Task = @import("task.zig").Task;
@@ -207,26 +208,44 @@ const pipeline_mod = @import("pipeline.zig");
 
 pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
     const num_threads = server.num_threads;
+
+    // Bind the first socket without SO_REUSEPORT.
+    // If the port is already in use, bind fails naturally with AddressInUse.
+    const first_socket = try Socket.initTcp(server.host, server.port);
+    first_socket.bind() catch |err| switch (err) {
+        error.AddressInUse => {
+            log.err("port {d} is already in use — kill the existing process first", .{server.port});
+            return error.PortAlreadyInUse;
+        },
+        else => return err,
+    };
+    if (num_threads > 1) try first_socket.enableReusePort();
+    try first_socket.listen(128);
+
     log.info("pipeline: starting {d} threads on {s}:{d}", .{ num_threads, server.host, server.port });
 
     var threads: std.ArrayListUnmanaged(std.Thread) = .{};
     defer threads.deinit(allocator);
 
     for (1..num_threads) |_| {
-        const t = try std.Thread.spawn(.{}, pipelineThreadMain, .{ allocator, server });
+        const t = try std.Thread.spawn(.{}, pipelineThreadMain, .{ allocator, server, @as(?Socket, null) });
         try threads.append(allocator, t);
     }
 
-    try pipelineThreadMain(allocator, server);
+    try pipelineThreadMain(allocator, server, first_socket);
 
     for (threads.items) |t| t.join();
 }
 
-fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server) !void {
-    // Each thread gets its own socket (SO_REUSEPORT distributes connections)
-    const listen_socket = try Socket.initTcp(server.host, server.port);
-    try listen_socket.bind();
-    try listen_socket.listen(128);
+fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, existing_socket: ?Socket) !void {
+    const listen_socket = if (existing_socket) |s| s else blk: {
+        // Additional threads create their own socket with SO_REUSEPORT
+        const s = try Socket.initTcp(server.host, server.port);
+        try s.enableReusePort();
+        try s.bind();
+        try s.listen(128);
+        break :blk s;
+    };
 
     // Each thread gets its own sub-interpreter with its own GIL (PEP 734)
     if (server.module_ref_len > 0) {
@@ -268,6 +287,24 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server) !void
         };
         if (redis_fd) |fd| {
             pl.initRedis(fd);
+        }
+    }
+
+    // Postgres connection (optional, one pipelined connection per thread)
+    if (tl_py != null) {
+        const pg_host = std.posix.getenv("PG_HOST") orelse "127.0.0.1";
+        const pg_port_str = std.posix.getenv("PG_PORT") orelse "5432";
+        const pg_port = std.fmt.parseInt(u16, pg_port_str, 10) catch 5432;
+        const pg_user = std.posix.getenv("PG_USER") orelse "postgres";
+        const pg_pass = std.posix.getenv("PG_PASS") orelse "";
+        const pg_db = std.posix.getenv("PG_DB") orelse "postgres";
+        const query_mod = @import("db/query.zig");
+        var pg_client = query_mod.Client.connect(allocator, pg_host, pg_port, pg_user, pg_db, pg_pass) catch |err| blk: {
+            log.info("postgres not available at {s}:{d}: {}, db commands will fail", .{ pg_host, pg_port, err });
+            break :blk null;
+        };
+        if (pg_client) |*client| {
+            pl.initPostgres(client.fd);
         }
     }
 

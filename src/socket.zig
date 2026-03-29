@@ -12,8 +12,11 @@ pub const Socket = struct {
         const flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
         const handle = try posix.socket(addr.any.family, flags, posix.IPPROTO.TCP);
         try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        try posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
         return .{ .handle = handle, .addr = addr };
+    }
+
+    pub fn enableReusePort(self: Socket) !void {
+        try posix.setsockopt(self.handle, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
     }
 
     pub fn bind(self: Socket) !void {
