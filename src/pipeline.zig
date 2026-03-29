@@ -29,7 +29,7 @@ const response_mod = @import("http/response.zig");
 
 const log = std.log.scoped(.@"snek/pipeline");
 
-const MAX_BATCH = 256;
+const MAX_BATCH = 1024;
 const MAX_IOVECS = 4; // status | common | per-response | body
 
 // ── Cached response prefix ────────────────────────────────────────
@@ -42,9 +42,9 @@ const MAX_IOVECS = 4; // status | common | per-response | body
 
 const COMMON_HDR_CAP = 64;
 
-var cached_common_hdr: [COMMON_HDR_CAP]u8 = undefined;
-var cached_common_len: usize = 0;
-var cached_epoch: i64 = 0;
+threadlocal var cached_common_hdr: [COMMON_HDR_CAP]u8 = undefined;
+threadlocal var cached_common_len: usize = 0;
+threadlocal var cached_epoch: i64 = 0;
 
 fn refreshCommonHeaders() void {
     const now = std.time.timestamp();
@@ -140,16 +140,15 @@ pub const SendTask = struct {
     body: ?[]const u8, // points into conn.body_buf or static
 };
 
-pub const RedisTask = struct {
-    conn: u16,
-    py_coro: *ffi.PyObject,
-    resp: [256]u8, // pre-built RESP command (Zig-owned, no Python lifetime dependency)
-    resp_len: u8,
-};
-
 const RedisWaiter = struct {
     conn_idx: u16,
     py_coro: *ffi.PyObject,
+};
+
+const PgWaiter = struct {
+    conn_idx: u16,
+    py_coro: *ffi.PyObject,
+    cmd: driver.PgCmd,
 };
 
 // ── Typed stage queues ────────────────────────────────────────────
@@ -159,11 +158,10 @@ pub fn Queue(comptime T: type) type {
         items: [MAX_BATCH]T = undefined,
         len: usize = 0,
 
-        pub fn push(self: *@This(), item: T) void {
-            if (self.len < MAX_BATCH) {
-                self.items[self.len] = item;
-                self.len += 1;
-            }
+        pub fn push(self: *@This(), item: T) !void {
+            if (self.len >= MAX_BATCH) return error.Overflow;
+            self.items[self.len] = item;
+            self.len += 1;
         }
 
         pub fn slice(self: *const @This()) []const T {
@@ -191,27 +189,47 @@ pub const Pipeline = struct {
     parse_q: Queue(ParseTask) = .{},
     handle_q: Queue(HandleTask) = .{},
     send_q: Queue(SendTask) = .{},
-    redis_q: Queue(RedisTask) = .{},
     close_q: Queue(u16) = .{},
 
     // iovecs storage — one set of MAX_IOVECS per send task, reused each cycle
     iovecs_buf: [MAX_BATCH][MAX_IOVECS]posix.iovec_const = undefined,
 
-    // ── Redis state ──────────────────────────────────────────────
+    // ── Redis state (full-duplex: independent send/recv) ───────
     redis_fd: ?posix.socket_t = null,
-    redis_task: Task = undefined,
+    redis_send_task: Task = undefined,
+    redis_recv_task: Task = undefined,
     redis_send_buf: [8192]u8 = undefined,
     redis_send_len: usize = 0,
+    redis_send_state: enum { idle, sending } = .idle,
+    redis_send_offset: usize = 0,
     redis_recv_buf: [8192]u8 = undefined,
     redis_recv_len: usize = 0,
     redis_parse_pos: usize = 0,
-    redis_state: enum { idle, sending, receiving, parsing, err } = .idle,
+    redis_recv_state: enum { idle, receiving, parsing, err } = .idle,
     redis_waiters: [MAX_BATCH]RedisWaiter = undefined,
     redis_waiter_head: usize = 0,
     redis_waiter_tail: usize = 0,
     redis_waiter_count: usize = 0,
-    redis_batch_count: usize = 0,
-    redis_batch_sent: usize = 0, // bytes in current send batch (for compact)
+    redis_in_flight: usize = 0, // commands sent, awaiting RESP response
+
+    // ── Postgres state (full-duplex: independent send/recv) ────
+    pg_fd: ?posix.socket_t = null,
+    pg_send_task: Task = undefined,
+    pg_recv_task: Task = undefined,
+    pg_send_buf: [16384]u8 = undefined,
+    pg_send_len: usize = 0,
+    pg_send_state: enum { idle, sending } = .idle,
+    pg_send_offset: usize = 0,
+    pg_recv_buf: [65536]u8 = undefined,
+    pg_recv_len: usize = 0,
+    pg_parse_pos: usize = 0,
+    pg_recv_state: enum { idle, receiving, parsing, err } = .idle,
+    pg_waiters: [MAX_BATCH]PgWaiter = undefined,
+    pg_waiter_head: usize = 0,
+    pg_waiter_tail: usize = 0,
+    pg_waiter_count: usize = 0,
+    pg_in_flight: usize = 0, // queries sent, awaiting ReadyForQuery
+    pg_parse_ns: u64 = 0, // set by stagePostgres for profiling
 
     // Stage timing stats
     stats: Stats = .{},
@@ -250,10 +268,10 @@ pub const Pipeline = struct {
     }
 
     fn cycle(self: *Pipeline, wait_nr: u32) !bool {
-        const t0 = std.time.Instant.now() catch unreachable;
+        const t0 = try std.time.Instant.now();
         const completions = try self.backend.submitAndWait(wait_nr);
         if (completions.tasks.len == 0) return false;
-        const t_io = std.time.Instant.now() catch unreachable;
+        const t_io = try std.time.Instant.now();
 
         // Refresh cached date header (once per second)
         refreshCommonHeaders();
@@ -262,39 +280,47 @@ pub const Pipeline = struct {
         self.parse_q.len = 0;
         self.handle_q.len = 0;
         self.send_q.len = 0;
-        self.redis_q.len = 0;
         self.close_q.len = 0;
 
         // Classify
         for (completions.tasks, completions.results) |task, result| {
             if (task == &self.accept_task) {
                 self.onAccept(result);
-            } else if (self.redis_fd != null and task == &self.redis_task) {
-                self.onRedisIO(result);
+            } else if (self.redis_fd != null and task == &self.redis_send_task) {
+                try self.onRedisSendIO(result);
+            } else if (self.redis_fd != null and task == &self.redis_recv_task) {
+                try self.onRedisRecvIO(result);
+            } else if (self.pg_fd != null and task == &self.pg_send_task) {
+                try self.onPgSendIO(result);
+            } else if (self.pg_fd != null and task == &self.pg_recv_task) {
+                try self.onPgRecvIO(result);
             } else {
-                self.onConnCompletion(task, result);
+                try self.onConnCompletion(task, result);
             }
         }
-        const t_classify = std.time.Instant.now() catch unreachable;
+        const t_classify = try std.time.Instant.now();
 
         // DAG
-        self.stageParse();
-        const t_parse = std.time.Instant.now() catch unreachable;
+        try self.stageParse();
+        const t_parse = try std.time.Instant.now();
 
         // GIL held across handle + redis stages (one acquire for all Python work)
         const py_ctx = if (self.req_ctx) |ctx| ctx.py_ctx else null;
-        const need_gil = py_ctx != null and (self.handle_q.len > 0 or self.redis_q.len > 0 or self.redis_state == .parsing or self.redis_state == .err);
+        const need_gil = py_ctx != null and (self.handle_q.len > 0 or self.redis_recv_state == .parsing or self.redis_recv_state == .err or self.pg_recv_state == .parsing or self.pg_recv_state == .err);
         if (need_gil) py_ctx.?.py.acquireGil();
 
-        self.stageHandle();
-        const t_handle = std.time.Instant.now() catch unreachable;
-        self.stageRedis();
-        const t_redis = std.time.Instant.now() catch unreachable;
+        try self.stageHandle();
+        const t_handle = try std.time.Instant.now();
+        try self.stageRedis();
+        const t_redis = try std.time.Instant.now();
+        const pg_rows_before = self.pg_waiter_count;
+        try self.stagePostgres();
+        const t_pg = try std.time.Instant.now();
 
         if (need_gil) py_ctx.?.py.releaseGil();
 
-        self.stageSerializeAndSend();
-        const t_send = std.time.Instant.now() catch unreachable;
+        try self.stageSerializeAndSend();
+        const t_send = try std.time.Instant.now();
         self.stageClose();
 
         // Accumulate timing stats
@@ -305,7 +331,10 @@ pub const Pipeline = struct {
         self.stats.ns_parse += t_parse.since(t_classify);
         self.stats.ns_handle += t_handle.since(t_parse);
         self.stats.ns_redis += t_redis.since(t_handle);
-        self.stats.ns_send += t_send.since(t_redis);
+        self.stats.ns_pg_parse += self.pg_parse_ns;
+        self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_parse_ns;
+        self.stats.pg_rows += pg_rows_before -| self.pg_waiter_count;
+        self.stats.ns_send += t_send.since(t_pg);
 
         // Print every 10000 cycles
         if (self.stats.cycles % 10000 == 0) self.stats.dump();
@@ -321,10 +350,13 @@ pub const Pipeline = struct {
         ns_parse: u64 = 0,
         ns_handle: u64 = 0,
         ns_redis: u64 = 0,
+        ns_pg_parse: u64 = 0,
+        ns_pg_flush: u64 = 0,
+        pg_rows: u64 = 0,
         ns_send: u64 = 0,
 
         fn dump(self: *Stats) void {
-            const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_send;
+            const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_pg_parse + self.ns_pg_flush + self.ns_send;
             const reqs = self.completions;
             const us = struct {
                 fn f(ns: u64) u64 {
@@ -332,8 +364,8 @@ pub const Pipeline = struct {
                 }
             }.f;
             log.info(
-                "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  send={d}us",
-                .{ self.cycles, reqs, us(total), us(self.ns_io), us(self.ns_classify), us(self.ns_parse), us(self.ns_handle), us(self.ns_redis), us(self.ns_send) },
+                "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  pg_parse={d}us({d}rows)  pg_flush={d}us  send={d}us",
+                .{ self.cycles, reqs, us(total), us(self.ns_io), us(self.ns_classify), us(self.ns_parse), us(self.ns_handle), us(self.ns_redis), us(self.ns_pg_parse), self.pg_rows, us(self.ns_pg_flush), us(self.ns_send) },
             );
             self.completions = 0;
             self.ns_io = 0;
@@ -341,6 +373,9 @@ pub const Pipeline = struct {
             self.ns_parse = 0;
             self.ns_handle = 0;
             self.ns_redis = 0;
+            self.ns_pg_parse = 0;
+            self.ns_pg_flush = 0;
+            self.pg_rows = 0;
             self.ns_send = 0;
         }
     };
@@ -372,22 +407,22 @@ pub const Pipeline = struct {
         self.submitRecv(conn);
     }
 
-    fn onConnCompletion(self: *Pipeline, task: *Task, result: IoResult) void {
+    fn onConnCompletion(self: *Pipeline, task: *Task, result: IoResult) !void {
         const conn: *Conn = @fieldParentPtr("task", task);
         const index = conn.pool_index;
 
         switch (task.pending_op) {
             .recv => {
                 if (result <= 0) {
-                    self.close_q.push(index);
+                    try self.close_q.push(index);
                     return;
                 }
                 conn.zc.mark_written(@intCast(result));
-                self.parse_q.push(.{ .conn = index });
+                try self.parse_q.push(.{ .conn = index });
             },
             .send, .sendv => {
                 if (result < 0) {
-                    self.close_q.push(index);
+                    try self.close_q.push(index);
                     return;
                 }
                 // Send complete — keepalive
@@ -400,7 +435,7 @@ pub const Pipeline = struct {
 
     // ── Stage: Parse ──────────────────────────────────────────────
 
-    fn stageParse(self: *Pipeline) void {
+    fn stageParse(self: *Pipeline) !void {
         for (self.parse_q.slice()) |pt| {
             const conn = self.conns.get_ptr(pt.conn);
             const data = conn.zc.as_slice();
@@ -411,7 +446,7 @@ pub const Pipeline = struct {
 
             if (conn.head_parser.state != .finished) {
                 conn.recv_slice = conn.zc.get_write_area(4096) catch {
-                    self.close_q.push(pt.conn);
+                    try self.close_q.push(pt.conn);
                     continue;
                 };
                 self.submitRecv(conn);
@@ -426,7 +461,7 @@ pub const Pipeline = struct {
                     conn.recv_slice = conn.zc.get_write_area(
                         content_length - body_received,
                     ) catch {
-                        self.close_q.push(pt.conn);
+                        try self.close_q.push(pt.conn);
                         continue;
                     };
                     self.submitRecv(conn);
@@ -434,7 +469,7 @@ pub const Pipeline = struct {
                 }
             }
 
-            self.handle_q.push(.{
+            try self.handle_q.push(.{
                 .conn = pt.conn,
                 .header_end = header_end,
                 .content_length = content_length,
@@ -449,14 +484,12 @@ pub const Pipeline = struct {
     // 2. GIL acquired once for the entire batch.
     // 3. Remaining requests: full parse → route → invoke.
 
-    fn stageHandle(self: *Pipeline) void {
+    fn stageHandle(self: *Pipeline) !void {
         const req_ctx = self.req_ctx orelse return;
         const batch = self.handle_q.slice();
         if (batch.len == 0) return;
 
         // ── SIMD screen: gather + classify ───────────────────────
-        // Gather first byte from each request into contiguous memory,
-        // then vectorized compare against 'G' to find GET requests.
         var first_bytes: [MAX_BATCH]u8 = undefined;
         for (batch, 0..) |ht, i| {
             const data = self.conns.get_ptr(ht.conn).zc.as_slice();
@@ -465,7 +498,6 @@ pub const Pipeline = struct {
         var is_get: [MAX_BATCH]bool = .{false} ** MAX_BATCH;
         simdScreenBytes(first_bytes[0..batch.len], 'G', is_get[0..batch.len]);
 
-        // GIL already held by cycle() across handle + redis stages
         const py_ctx = req_ctx.py_ctx;
 
         for (batch, 0..) |ht, i| {
@@ -474,7 +506,6 @@ pub const Pipeline = struct {
 
             // Fast path: SIMD told us byte[0]=='G'. Check "GET / " or "GET /x".
             if (is_get[i] and data.len >= 6 and std.mem.eql(u8, data[1..4], "ET ")) {
-                // Extract URI: bytes 4..first-space-after-4
                 const uri_start = 4;
                 const uri_end = std.mem.indexOfScalarPos(u8, data, uri_start, ' ') orelse data.len;
                 const uri = data[uri_start..uri_end];
@@ -483,68 +514,51 @@ pub const Pipeline = struct {
                     .found => |found| {
                         if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
                             if (py_ctx) |py| {
-                                // no_args fast path: skip Request.parse + dict building
                                 const flags = module.getHandlerFlags(py.py.snek_module, py_id);
                                 if (flags.no_args) {
-                                    const result = driver.invokePythonHandler(
+                                    const result = try driver.invokePythonHandler(
                                         py.py.snek_module, py_id, &http1.Request{},
                                         &.{}, &conn.body_buf,
+                                        self.redisSendSlice(), self.pgSendSlice(),
                                     );
-                                    switch (result) {
-                                        .response => |resp| self.send_q.push(makeResponseSend(ht.conn, resp)),
-                                        .redis_yield => |ry| {
-                                            if (self.redis_fd != null) {
-                                                self.redis_q.push(.{ .conn = ht.conn, .py_coro = ry.py_coro, .resp = ry.resp, .resp_len = ry.resp_len });
-                                            } else {
-                                                ffi.decref(ry.py_coro);
-                                                self.send_q.push(makeErrorSend(ht.conn, 503));
-                                            }
-                                        },
-                                    }
+                                    try self.handleResult(ht.conn, result);
                                     continue;
                                 }
-                                // Has params or needs request dict — full parse needed
                                 const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                                    self.send_q.push(makeErrorSend(ht.conn, 400));
+                                    try self.send_q.push(makeErrorSend(ht.conn, 400));
                                     continue;
                                 };
                                 const result = driver.invokePythonHandler(
                                     py.py.snek_module, py_id, &req,
                                     found.params[0..found.param_count], &conn.body_buf,
-                                );
-                                switch (result) {
-                                    .response => |resp| self.send_q.push(makeResponseSend(ht.conn, resp)),
-                                    .redis_yield => |ry| {
-                                            if (self.redis_fd != null) {
-                                                self.redis_q.push(.{ .conn = ht.conn, .py_coro = ry.py_coro, .resp = ry.resp, .resp_len = ry.resp_len });
-                                            } else {
-                                                ffi.decref(ry.py_coro);
-                                                self.send_q.push(makeErrorSend(ht.conn, 503));
-                                            }
-                                        },
-                                }
+                                    self.redisSendSlice(), self.pgSendSlice(),
+                                ) catch {
+                                    try self.send_q.push(makeErrorSend(ht.conn, 500));
+                                    continue;
+                                };
+                                try self.handleResult(ht.conn, result);
                                 continue;
                             }
-                            self.send_q.push(makeErrorSend(ht.conn, 503));
+                            try self.send_q.push(makeErrorSend(ht.conn, 503));
                         } else if (req_ctx.handlers[found.handler_id]) |h| {
                             const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                                self.send_q.push(makeErrorSend(ht.conn, 400));
+                                try self.send_q.push(makeErrorSend(ht.conn, 400));
                                 continue;
                             };
-                            self.send_q.push(makeResponseSend(ht.conn, h(&req)));
+                            try self.send_q.push(makeResponseSend(ht.conn, h(&req)));
                         } else {
-                            self.send_q.push(makeErrorSend(ht.conn, 500));
+                            try self.send_q.push(makeErrorSend(ht.conn, 500));
                         }
                         continue;
                     },
                     .not_found => {
-                        self.send_q.push(makeErrorSend(ht.conn, 404));
+                        try self.send_q.push(makeErrorSend(ht.conn, 404));
                         continue;
                     },
                     .method_not_allowed => {
                         var r = response_mod.Response.init(405);
                         r.body = "Method Not Allowed";
-                        self.send_q.push(makeResponseSend(ht.conn, r));
+                        try self.send_q.push(makeResponseSend(ht.conn, r));
                         continue;
                     },
                 }
@@ -552,7 +566,7 @@ pub const Pipeline = struct {
 
             // Slow path: non-GET or SIMD screen missed — full parse
             const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                self.send_q.push(makeErrorSend(ht.conn, 400));
+                try self.send_q.push(makeErrorSend(ht.conn, 400));
                 continue;
             };
             const method_str = if (req.method) |m| @tagName(m) else "GET";
@@ -562,39 +576,58 @@ pub const Pipeline = struct {
                 .found => |found| {
                     if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
                         if (py_ctx) |py| {
-                            const result = driver.invokePythonHandler(
+                            const result = try driver.invokePythonHandler(
                                 py.py.snek_module, py_id, &req,
                                 found.params[0..found.param_count], &conn.body_buf,
+                                self.redisSendSlice(), self.pgSendSlice(),
                             );
-                            switch (result) {
-                                .response => |resp| self.send_q.push(makeResponseSend(ht.conn, resp)),
-                                .redis_yield => |ry| {
-                                            if (self.redis_fd != null) {
-                                                self.redis_q.push(.{ .conn = ht.conn, .py_coro = ry.py_coro, .resp = ry.resp, .resp_len = ry.resp_len });
-                                            } else {
-                                                ffi.decref(ry.py_coro);
-                                                self.send_q.push(makeErrorSend(ht.conn, 503));
-                                            }
-                                        },
-                            }
+                            try self.handleResult(ht.conn, result);
                         } else {
-                            self.send_q.push(makeErrorSend(ht.conn, 503));
+                            try self.send_q.push(makeErrorSend(ht.conn, 503));
                         }
                     } else if (req_ctx.handlers[found.handler_id]) |h| {
-                        self.send_q.push(makeResponseSend(ht.conn, h(&req)));
+                        try self.send_q.push(makeResponseSend(ht.conn, h(&req)));
                     } else {
-                        self.send_q.push(makeErrorSend(ht.conn, 500));
+                        try self.send_q.push(makeErrorSend(ht.conn, 500));
                     }
                 },
-                .not_found => self.send_q.push(makeErrorSend(ht.conn, 404)),
+                .not_found => try self.send_q.push(makeErrorSend(ht.conn, 404)),
                 .method_not_allowed => {
                     var r = response_mod.Response.init(405);
                     r.body = "Method Not Allowed";
-                    self.send_q.push(makeResponseSend(ht.conn, r));
+                    try self.send_q.push(makeResponseSend(ht.conn, r));
                 },
             }
         }
+    }
 
+    /// Handle an InvokeResult: response goes to send_q, yields update send buffers + push waiters.
+    fn handleResult(self: *Pipeline, conn: u16, result: driver.InvokeResult) !void {
+        switch (result) {
+            .response => |resp| try self.send_q.push(makeResponseSend(conn, resp)),
+            .redis_yield => |ry| {
+                self.redis_send_len += ry.bytes_written;
+                try self.pushRedisWaiter(conn, ry.py_coro);
+            },
+            .pg_yield => |pg| {
+                self.pg_send_len += pg.bytes_written;
+                try self.pushPgWaiter(conn, pg.py_coro, pg.cmd);
+            },
+        }
+    }
+
+    /// Remaining writable slice of the redis send buffer.
+    fn redisSendSlice(self: *Pipeline) ?[]u8 {
+        if (self.redis_fd == null) return null;
+        if (self.redis_send_len >= self.redis_send_buf.len) return null;
+        return self.redis_send_buf[self.redis_send_len..];
+    }
+
+    /// Remaining writable slice of the postgres send buffer.
+    fn pgSendSlice(self: *Pipeline) ?[]u8 {
+        if (self.pg_fd == null) return null;
+        if (self.pg_send_len >= self.pg_send_buf.len) return null;
+        return self.pg_send_buf[self.pg_send_len..];
     }
 
     // ── Stage: Serialize + Send ───────────────────────────────────
@@ -606,7 +639,7 @@ pub const Pipeline = struct {
     //   [2] per-response hdrs — "Connection: keep-alive\r\nContent-Type: ...\r\nContent-Length: N\r\n\r\n"
     //   [3] body              — from conn.body_buf or static string
 
-    fn stageSerializeAndSend(self: *Pipeline) void {
+    fn stageSerializeAndSend(self: *Pipeline) !void {
         const common = commonHeaders();
 
         for (self.send_q.mutableSlice(), 0..) |*st, i| {
@@ -634,7 +667,7 @@ pub const Pipeline = struct {
             } };
             conn.task.pending_op = op;
             self.backend.queue(&conn.task, op) catch {
-                self.close_q.push(st.conn);
+                try self.close_q.push(st.conn);
             };
         }
     }
@@ -645,98 +678,78 @@ pub const Pipeline = struct {
     // here with GIL held, pushing completed responses to send_q.
 
     /// IO state machine only — no Python work. Defers RESP parsing to stageRedis.
-    fn onRedisIO(self: *Pipeline, result: IoResult) void {
-        switch (self.redis_state) {
-            .sending => {
-                if (result <= 0) {
-                    self.redis_state = .err;
-                    return;
-                }
-                self.redis_recv_len = 0;
-                self.redis_parse_pos = 0;
-                self.redis_state = .receiving;
-                self.submitRedisRecv();
-            },
-            .receiving => {
-                if (result <= 0) {
-                    self.redis_state = .err;
-                    return;
-                }
-                self.redis_recv_len += @intCast(result);
-                // RESP bytes accumulated. Parsing + coroutine resumption
-                // happens in stageRedis under the shared GIL hold.
-                self.redis_state = .parsing;
-            },
-            .idle, .parsing, .err => {},
+    fn onRedisSendIO(self: *Pipeline, result: IoResult) !void {
+        if (result <= 0) {
+            self.redis_recv_state = .err;
+            return;
         }
+        const sent: usize = @intCast(result);
+        self.redis_send_offset += sent;
+        if (self.redis_send_offset < self.redis_send_len) {
+            try self.submitRedisSend();
+            return;
+        }
+        // Send complete — compact and go idle
+        self.redis_send_len = 0;
+        self.redis_send_offset = 0;
+        self.redis_send_state = .idle;
     }
 
-    /// Process redis: parse deferred RESP responses + enqueue new commands.
+    fn onRedisRecvIO(self: *Pipeline, result: IoResult) !void {
+        if (result <= 0) {
+            self.redis_recv_state = .err;
+            return;
+        }
+        self.redis_recv_len += @intCast(result);
+        self.redis_recv_state = .parsing;
+    }
+
+    /// Process redis: parse RESP responses + flush pending sends.
+    /// Full-duplex: send and receive operate independently.
     /// GIL is already held from stageHandle.
-    fn stageRedis(self: *Pipeline) void {
+    fn stageRedis(self: *Pipeline) !void {
         if (self.redis_fd == null) return;
 
-        // 1. Handle deferred errors (GIL needed for decref)
-        if (self.redis_state == .err) {
-            self.failRedisWaiters();
+        // 1. Handle deferred errors
+        if (self.redis_recv_state == .err) {
+            try self.failRedisWaiters();
         }
 
-        // 2. Parse RESP responses deferred from classify (redis recv completed)
-        if (self.redis_state == .parsing) {
-            self.parseRedisResponses();
+        // 2. Parse RESP responses
+        if (self.redis_recv_state == .parsing) {
+            try self.parseRedisResponses();
 
-            if (self.redis_batch_count > 0) {
-                // More responses expected — keep receiving
+            if (self.redis_in_flight > 0) {
                 self.compactRedisRecv();
-                self.redis_state = .receiving;
-                self.submitRedisRecv();
+                self.redis_recv_state = .receiving;
+                try self.submitRedisRecv();
             } else {
-                // Batch done
-                self.compactRedisSend();
-                self.redis_state = .idle;
+                self.redis_recv_state = .idle;
             }
         }
 
-        // 2. Enqueue new commands from stageHandle's redis_q
-        //    RESP was pre-built in invokePythonHandler while sentinel was alive.
-        for (self.redis_q.slice()) |rt| {
-            const len: usize = rt.resp_len;
-            if (self.redis_send_len + len <= self.redis_send_buf.len) {
-                @memcpy(self.redis_send_buf[self.redis_send_len..][0..len], rt.resp[0..len]);
-                self.redis_send_len += len;
-                self.pushRedisWaiter(rt.conn, rt.py_coro);
-            } else {
-                ffi.decref(rt.py_coro);
-                self.send_q.push(makeErrorSend(rt.conn, 503));
+        // 3. Flush pending sends (independent of recv state)
+        const new_queries = self.redis_waiter_count - self.redis_in_flight;
+        if (new_queries > 0 and self.redis_send_state == .idle and self.redis_send_len > 0) {
+            self.redis_in_flight += new_queries;
+            self.redis_send_state = .sending;
+            try self.submitRedisSend();
+            // Arm recv if not already receiving
+            if (self.redis_recv_state == .idle) {
+                self.redis_recv_state = .receiving;
+                try self.submitRedisRecv();
             }
-        }
-
-        // 3. If idle with pending commands, start sending
-        if (self.redis_state == .idle and self.redis_send_len > 0 and self.redis_waiter_count > 0) {
-            self.redis_batch_count = self.redis_waiter_count;
-            self.redis_batch_sent = self.redis_send_len;
-            self.redis_state = .sending;
-            self.submitRedisSend();
-        }
-
-        // If idle and we have commands, start sending
-        if (self.redis_state == .idle and self.redis_send_len > 0 and self.redis_waiter_count > 0) {
-            log.debug("redis: starting send, {d} bytes, {d} waiters", .{ self.redis_send_len, self.redis_waiter_count });
-            self.redis_batch_count = self.redis_waiter_count;
-            self.redis_batch_sent = self.redis_send_len;
-            self.redis_state = .sending;
-            self.submitRedisSend();
         }
     }
 
-    fn parseRedisResponses(self: *Pipeline) void {
-        while (self.redis_batch_count > 0 and self.redis_waiter_count > 0) {
-            if (!self.parseOneResp()) break; // incomplete
+    fn parseRedisResponses(self: *Pipeline) !void {
+        while (self.redis_in_flight > 0 and self.redis_waiter_count > 0) {
+            if (!try self.parseOneResp()) break; // incomplete
         }
     }
 
     /// Parse one RESP response and resume the head waiter's coroutine.
-    fn parseOneResp(self: *Pipeline) bool {
+    fn parseOneResp(self: *Pipeline) !bool {
         const data = self.redis_recv_buf[self.redis_parse_pos..self.redis_recv_len];
         if (data.len == 0) return false;
 
@@ -758,8 +771,8 @@ pub const Pipeline = struct {
                     err_buf[line.len] = 0;
                     c.PyErr_SetString(c.PyExc_RuntimeError, err_buf[0..line.len :0]);
                 }
-                self.failHeadWaiter();
-                self.redis_batch_count -= 1;
+                try self.failHeadWaiter();
+                self.redis_in_flight -= 1;
                 return true;
             },
             ':' => blk: {
@@ -791,71 +804,79 @@ pub const Pipeline = struct {
         };
 
         // Resume head waiter's coroutine with the parsed result
-        self.resumeRedisWaiter(py_result);
-        self.redis_batch_count -= 1;
+        try self.resumeRedisWaiter(py_result);
+        self.redis_in_flight -= 1;
         return true;
     }
 
     /// Resume the head waiter's Python coroutine with a redis result.
     /// Uses PyIter_Send — no method lookup, no StopIteration exception overhead.
-    fn resumeRedisWaiter(self: *Pipeline, result: *ffi.PyObject) void {
+    fn resumeRedisWaiter(self: *Pipeline, result: *ffi.PyObject) !void {
         const waiter = self.popRedisWaiter() orelse return;
         const conn = self.conns.get_ptr(waiter.conn_idx);
 
         const send = ffi.iterSend(waiter.py_coro, result);
         switch (send.status) {
             .next => {
-                // Coroutine yielded again — check for another redis command
+                // Coroutine yielded again — classify sentinel
                 const sentinel = send.result.?;
                 defer ffi.decref(sentinel);
-                if (driver.checkRedisSentinel(sentinel)) |cmd_info| {
-                    const resp_len = driver.writeResp(self.redis_send_buf[self.redis_send_len..], cmd_info.args[0..cmd_info.arg_count]);
-                    if (resp_len > 0) {
-                        self.redis_send_len += resp_len;
-                        self.pushRedisWaiter(waiter.conn_idx, waiter.py_coro);
-                        self.redis_batch_count += 1;
-                    }
+                const yield = driver.classifySentinel(
+                    sentinel, waiter.py_coro,
+                    self.redisSendSlice(), self.pgSendSlice(),
+                ) catch {
+                    ffi.decref(waiter.py_coro);
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
                     return;
+                };
+                switch (yield) {
+                    .redis => |ry| {
+                        self.redis_send_len += ry.bytes_written;
+                        try self.pushRedisWaiter(waiter.conn_idx, ry.py_coro);
+                        self.redis_in_flight += 1;
+                    },
+                    .pg => |pg| {
+                        self.pg_send_len += pg.bytes_written;
+                        try self.pushPgWaiter(waiter.conn_idx, pg.py_coro, pg.cmd);
+                    },
                 }
-                ffi.decref(waiter.py_coro);
-                self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
             },
             .@"return" => {
-                // Coroutine completed — return value is the response
                 ffi.decref(waiter.py_coro);
                 const py_res = send.result orelse {
-                    self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
                     return;
                 };
                 defer ffi.decref(py_res);
                 const resp = driver.convertPythonResponse(py_res, &conn.body_buf) catch
                     response_mod.Response.init(500);
-                self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
             },
             .@"error" => {
                 ffi.decref(waiter.py_coro);
                 if (ffi.errOccurred()) ffi.errPrint();
-                self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
             },
         }
     }
 
-    fn failHeadWaiter(self: *Pipeline) void {
+    fn failHeadWaiter(self: *Pipeline) !void {
         const waiter = self.popRedisWaiter() orelse return;
         ffi.decref(waiter.py_coro);
-        self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+        try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
     }
 
-    fn failRedisWaiters(self: *Pipeline) void {
+    fn failRedisWaiters(self: *Pipeline) !void {
         while (self.redis_waiter_count > 0) {
-            self.failHeadWaiter();
+            try self.failHeadWaiter();
         }
-        self.redis_state = .idle;
-        self.redis_batch_count = 0;
+        self.redis_recv_state = .idle;
+        self.redis_send_state = .idle;
+        self.redis_in_flight = 0;
     }
 
-    fn pushRedisWaiter(self: *Pipeline, conn_idx: u16, py_coro: *ffi.PyObject) void {
-        if (self.redis_waiter_count >= MAX_BATCH) return;
+    fn pushRedisWaiter(self: *Pipeline, conn_idx: u16, py_coro: *ffi.PyObject) !void {
+        if (self.redis_waiter_count >= MAX_BATCH) return error.WaiterQueueFull;
         self.redis_waiters[self.redis_waiter_tail] = .{ .conn_idx = conn_idx, .py_coro = py_coro };
         self.redis_waiter_tail = (self.redis_waiter_tail + 1) % MAX_BATCH;
         self.redis_waiter_count += 1;
@@ -869,18 +890,18 @@ pub const Pipeline = struct {
         return w;
     }
 
-    fn submitRedisSend(self: *Pipeline) void {
+    fn submitRedisSend(self: *Pipeline) !void {
         const fd = self.redis_fd orelse return;
-        const op = IoOp{ .send = .{ .socket = fd, .buffer = self.redis_send_buf[0..self.redis_send_len] } };
-        self.redis_task.pending_op = op;
-        self.backend.queue(&self.redis_task, op) catch {};
+        const op = IoOp{ .send = .{ .socket = fd, .buffer = self.redis_send_buf[self.redis_send_offset..self.redis_send_len] } };
+        self.redis_send_task.pending_op = op;
+        try self.backend.queue(&self.redis_send_task, op);
     }
 
-    fn submitRedisRecv(self: *Pipeline) void {
+    fn submitRedisRecv(self: *Pipeline) !void {
         const fd = self.redis_fd orelse return;
         const op = IoOp{ .recv = .{ .socket = fd, .buffer = self.redis_recv_buf[self.redis_recv_len..] } };
-        self.redis_task.pending_op = op;
-        self.backend.queue(&self.redis_task, op) catch {};
+        self.redis_recv_task.pending_op = op;
+        try self.backend.queue(&self.redis_recv_task, op);
     }
 
     fn compactRedisRecv(self: *Pipeline) void {
@@ -894,24 +915,302 @@ pub const Pipeline = struct {
         }
     }
 
-    fn compactRedisSend(self: *Pipeline) void {
-        if (self.redis_batch_sent == 0) return;
-        if (self.redis_batch_sent >= self.redis_send_len) {
-            // No new commands arrived during batch — clear all
-            self.redis_send_len = 0;
-        } else {
-            // New commands appended during batch — keep them
-            const remaining = self.redis_send_len - self.redis_batch_sent;
-            std.mem.copyForwards(u8, self.redis_send_buf[0..remaining], self.redis_send_buf[self.redis_batch_sent..self.redis_send_len]);
-            self.redis_send_len = remaining;
-        }
-        self.redis_batch_sent = 0;
-    }
 
     pub fn initRedis(self: *Pipeline, fd: posix.socket_t) void {
         self.redis_fd = fd;
-        self.redis_task = Task.init(Pipeline, self, dummyStep);
+        self.redis_send_task = Task.init(Pipeline, self, dummyStep);
+        self.redis_recv_task = Task.init(Pipeline, self, dummyStep);
         log.info("redis connected fd={d}", .{fd});
+    }
+
+    // ── Postgres IO ──────────────────────────────────────────────
+    // Mirrors redis: IO state machine (GIL-free), parsing + coroutine
+    // resumption in stagePostgres (under GIL).
+
+    fn onPgSendIO(self: *Pipeline, result: IoResult) !void {
+        if (result <= 0) {
+            self.pg_recv_state = .err;
+            return;
+        }
+        const sent: usize = @intCast(result);
+        self.pg_send_offset += sent;
+        if (self.pg_send_offset < self.pg_send_len) {
+            try self.submitPgSend();
+            return;
+        }
+        // Send complete — clear buffer, go idle
+        self.pg_send_len = 0;
+        self.pg_send_offset = 0;
+        self.pg_send_state = .idle;
+    }
+
+    fn onPgRecvIO(self: *Pipeline, result: IoResult) !void {
+        if (result <= 0) {
+            self.pg_recv_state = .err;
+            return;
+        }
+        self.pg_recv_len += @intCast(result);
+        self.pg_recv_state = .parsing;
+    }
+
+    /// Process postgres: parse responses + flush pending sends.
+    /// Full-duplex: send and receive operate independently.
+    /// GIL is already held from stageHandle.
+    fn stagePostgres(self: *Pipeline) !void {
+        self.pg_parse_ns = 0;
+        if (self.pg_fd == null) return;
+
+        // 1. Handle deferred errors
+        if (self.pg_recv_state == .err) {
+            try self.failPgWaiters();
+        }
+
+        // 2. Parse responses
+        if (self.pg_recv_state == .parsing) {
+            const t0 = try std.time.Instant.now();
+            try self.parsePgResponses();
+            self.pg_parse_ns = (try std.time.Instant.now()).since(t0);
+
+            if (self.pg_in_flight > 0) {
+                self.compactPgRecv();
+                self.pg_recv_state = .receiving;
+                try self.submitPgRecv();
+            } else {
+                self.pg_recv_state = .idle;
+            }
+        }
+
+        // 3. Flush pending sends (independent of recv state)
+        const new_queries = self.pg_waiter_count - self.pg_in_flight;
+        if (new_queries > 0 and self.pg_send_state == .idle and self.pg_send_len > 0) {
+            self.pg_in_flight += new_queries;
+            self.pg_send_state = .sending;
+            try self.submitPgSend();
+            // Arm recv if not already receiving
+            if (self.pg_recv_state == .idle) {
+                self.pg_recv_state = .receiving;
+                try self.submitPgRecv();
+            }
+        }
+    }
+
+    fn parsePgResponses(self: *Pipeline) !void {
+        while (self.pg_in_flight > 0 and self.pg_waiter_count > 0) {
+            const status = try self.parseOnePgResponse();
+            if (status == .incomplete) break;
+        }
+    }
+
+    /// Parse one complete postgres response (through ReadyForQuery).
+    /// If any message is incomplete, restores parse_pos and returns .incomplete.
+    fn parseOnePgResponse(self: *Pipeline) !enum { complete, incomplete } {
+        const wire = @import("db/wire.zig");
+        const save_pos = self.pg_parse_pos;
+        const waiter = self.peekPgWaiter() orelse return .complete;
+
+        var col_descs: [64]wire.ColumnDesc = undefined;
+        var col_count: u16 = 0;
+        var py_result: ?*ffi.PyObject = null;
+        var py_list: ?*ffi.PyObject = null;
+
+        while (true) {
+            const data = self.pg_recv_buf[self.pg_parse_pos..self.pg_recv_len];
+            if (data.len < 5) {
+                self.pg_parse_pos = save_pos;
+                if (py_list) |l| ffi.decref(l);
+                return .incomplete;
+            }
+
+            const hdr = wire.readMessageHeader(data[0..5]) catch {
+                self.pg_parse_pos = save_pos;
+                if (py_list) |l| ffi.decref(l);
+                return .incomplete;
+            };
+            const msg_len: usize = @intCast(hdr.length);
+            if (data.len < 1 + msg_len) {
+                self.pg_parse_pos = save_pos;
+                if (py_list) |l| ffi.decref(l);
+                return .incomplete;
+            }
+
+            const payload = data[5..][0 .. msg_len - 4];
+            self.pg_parse_pos += 1 + msg_len;
+
+            switch (hdr.tag) {
+                wire.BackendTag.row_description => {
+                    col_count = wire.parseRowDescription(payload, &col_descs) catch 0;
+                },
+                wire.BackendTag.data_row => {
+                    var values: [64]?[]const u8 = undefined;
+                    const field_count = wire.parseDataRow(payload, &values) catch 0;
+
+                    const dict = try ffi.dictNew();
+                    for (0..@min(col_count, field_count)) |i| {
+                        const name = try ffi.unicodeFromSlice(col_descs[i].name.ptr, col_descs[i].name.len);
+                        defer ffi.decref(name);
+                        if (values[i]) |val| {
+                            const val_obj = try ffi.unicodeFromSlice(val.ptr, val.len);
+                            defer ffi.decref(val_obj);
+                            try ffi.dictSetItem(dict, name, val_obj);
+                        } else {
+                            const none = ffi.getNone();
+                            defer ffi.decref(none);
+                            try ffi.dictSetItem(dict, name, none);
+                        }
+                    }
+
+                    switch (waiter.cmd) {
+                        .FETCH_ONE => {
+                            if (py_result == null) py_result = dict else ffi.decref(dict);
+                        },
+                        .FETCH_ALL => {
+                            if (py_list == null) py_list = c.PyList_New(0) orelse return error.PythonError;
+                            if (c.PyList_Append(py_list.?, dict) != 0) return error.PythonError;
+                            ffi.decref(dict);
+                        },
+                        .EXECUTE => ffi.decref(dict),
+                    }
+                },
+                wire.BackendTag.command_complete => {
+                    if (waiter.cmd == .EXECUTE) {
+                        const tag = wire.parseCommandComplete(payload);
+                        var count: i64 = 0;
+                        if (std.mem.lastIndexOfScalar(u8, tag, ' ')) |space| {
+                            count = std.fmt.parseInt(i64, tag[space + 1 ..], 10) catch 0;
+                        }
+                        py_result = ffi.longFromLong(count) catch ffi.getNone();
+                    }
+                },
+                wire.BackendTag.ready_for_query => {
+                    const final_result = if (waiter.cmd == .FETCH_ALL)
+                        py_list orelse (c.PyList_New(0) orelse return error.PythonError)
+                    else
+                        py_result orelse ffi.getNone();
+
+                    py_list = null;
+                    py_result = null;
+
+                    _ = self.popPgWaiter();
+                    self.pg_in_flight -= 1;
+                    try self.resumePgWaiter(waiter, final_result);
+                    return .complete;
+                },
+                wire.BackendTag.error_response => {
+                    if (py_list) |l| ffi.decref(l);
+                    if (py_result) |r| ffi.decref(r);
+                    py_list = null;
+                    py_result = null;
+                    continue;
+                },
+                else => continue,
+            }
+        }
+    }
+
+    fn resumePgWaiter(self: *Pipeline, waiter: PgWaiter, result: *ffi.PyObject) !void {
+        const conn = self.conns.get_ptr(waiter.conn_idx);
+        const send = ffi.iterSend(waiter.py_coro, result);
+        switch (send.status) {
+            .next => {
+                // Coroutine yielded again — classify sentinel
+                const sentinel = send.result.?;
+                defer ffi.decref(sentinel);
+                const yield = driver.classifySentinel(
+                    sentinel, waiter.py_coro,
+                    self.redisSendSlice(), self.pgSendSlice(),
+                ) catch {
+                    ffi.decref(waiter.py_coro);
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                    return;
+                };
+                switch (yield) {
+                    .redis => |ry| {
+                        self.redis_send_len += ry.bytes_written;
+                        try self.pushRedisWaiter(waiter.conn_idx, ry.py_coro);
+                    },
+                    .pg => |pg| {
+                        self.pg_send_len += pg.bytes_written;
+                        try self.pushPgWaiter(waiter.conn_idx, pg.py_coro, pg.cmd);
+                    },
+                }
+            },
+            .@"return" => {
+                ffi.decref(waiter.py_coro);
+                const py_res = send.result orelse return error.PythonError;
+                defer ffi.decref(py_res);
+                const resp = driver.convertPythonResponse(py_res, &conn.body_buf) catch
+                    response_mod.Response.init(500);
+                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+            },
+            .@"error" => {
+                ffi.decref(waiter.py_coro);
+                if (ffi.errOccurred()) ffi.errPrint();
+                try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+            },
+        }
+    }
+
+    fn failPgWaiters(self: *Pipeline) !void {
+        while (self.pg_waiter_count > 0) {
+            const waiter = self.popPgWaiter() orelse break;
+            ffi.decref(waiter.py_coro);
+            try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+        }
+        self.pg_recv_state = .idle;
+        self.pg_send_state = .idle;
+        self.pg_in_flight = 0;
+    }
+
+    fn pushPgWaiter(self: *Pipeline, conn_idx: u16, py_coro: *ffi.PyObject, cmd: driver.PgCmd) !void {
+        if (self.pg_waiter_count >= MAX_BATCH) return error.WaiterQueueFull;
+        self.pg_waiters[self.pg_waiter_tail] = .{ .conn_idx = conn_idx, .py_coro = py_coro, .cmd = cmd };
+        self.pg_waiter_tail = (self.pg_waiter_tail + 1) % MAX_BATCH;
+        self.pg_waiter_count += 1;
+    }
+
+    fn peekPgWaiter(self: *Pipeline) ?PgWaiter {
+        if (self.pg_waiter_count == 0) return null;
+        return self.pg_waiters[self.pg_waiter_head];
+    }
+
+    fn popPgWaiter(self: *Pipeline) ?PgWaiter {
+        if (self.pg_waiter_count == 0) return null;
+        const w = self.pg_waiters[self.pg_waiter_head];
+        self.pg_waiter_head = (self.pg_waiter_head + 1) % MAX_BATCH;
+        self.pg_waiter_count -= 1;
+        return w;
+    }
+
+    fn submitPgSend(self: *Pipeline) !void {
+        const fd = self.pg_fd orelse return;
+        const op = IoOp{ .send = .{ .socket = fd, .buffer = self.pg_send_buf[self.pg_send_offset..self.pg_send_len] } };
+        self.pg_send_task.pending_op = op;
+        try self.backend.queue(&self.pg_send_task, op);
+    }
+
+    fn submitPgRecv(self: *Pipeline) !void {
+        const fd = self.pg_fd orelse return;
+        const op = IoOp{ .recv = .{ .socket = fd, .buffer = self.pg_recv_buf[self.pg_recv_len..] } };
+        self.pg_recv_task.pending_op = op;
+        try self.backend.queue(&self.pg_recv_task, op);
+    }
+
+    fn compactPgRecv(self: *Pipeline) void {
+        if (self.pg_parse_pos > 0) {
+            const remaining = self.pg_recv_len - self.pg_parse_pos;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.pg_recv_buf[0..remaining], self.pg_recv_buf[self.pg_parse_pos..self.pg_recv_len]);
+            }
+            self.pg_recv_len = remaining;
+            self.pg_parse_pos = 0;
+        }
+    }
+
+    pub fn initPostgres(self: *Pipeline, fd: posix.socket_t) void {
+        self.pg_fd = fd;
+        self.pg_send_task = Task.init(Pipeline, self, dummyStep);
+        self.pg_recv_task = Task.init(Pipeline, self, dummyStep);
+        log.info("postgres connected fd={d}", .{fd});
     }
 
     // ── Close ─────────────────────────────────────────────────────
@@ -932,8 +1231,8 @@ pub const Pipeline = struct {
         self.backend.queue(&conn.task, op) catch {};
     }
 
-    pub fn pushSendTask(self: *Pipeline, task: SendTask) void {
-        self.send_q.push(task);
+    pub fn pushSendTask(self: *Pipeline, task: SendTask) !void {
+        try self.send_q.push(task);
     }
 };
 
@@ -1159,8 +1458,8 @@ test "quickContentLength POST no body" {
 
 test "Queue typed" {
     var q: Queue(HandleTask) = .{};
-    q.push(.{ .conn = 1, .header_end = 100, .content_length = 0 });
-    q.push(.{ .conn = 5, .header_end = 200, .content_length = 42 });
+    try q.push(.{ .conn = 1, .header_end = 100, .content_length = 0 });
+    try q.push(.{ .conn = 5, .header_end = 200, .content_length = 42 });
     try std.testing.expectEqual(@as(usize, 2), q.len);
     try std.testing.expectEqual(@as(u16, 1), q.slice()[0].conn);
 }
