@@ -23,6 +23,17 @@ pub const Task = struct {
     pending_op: IoOp = undefined,
     /// Intrusive linked list for queues (e.g. redis pipelining waiters).
     next: ?*Task = null,
+    /// Discriminator for the pipeline classify loop.
+    tag: Tag = .conn,
+
+    pub const Tag = enum(u8) {
+        conn,
+        accept,
+        redis_send,
+        redis_recv,
+        pg_send,
+        pg_recv,
+    };
 
     /// Create a Task with a typed context and step function.
     pub fn init(comptime C: type, ctx: *C, comptime stepFn: fn (*C, *Task, IoResult) ?IoOp) Task {

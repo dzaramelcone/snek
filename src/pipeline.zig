@@ -298,6 +298,7 @@ pub const Pipeline = struct {
         self.listen_fd = listen_fd;
         // Dummy step fn — pipeline ignores it, just need pending_op storage
         self.accept_task = Task.init(Pipeline, self, dummyStep);
+        self.accept_task.tag = .accept;
         try self.backend.queue(&self.accept_task, IoOp{ .accept = .{ .socket = listen_fd } });
     }
 
@@ -332,18 +333,13 @@ pub const Pipeline = struct {
 
         // Classify
         for (completions.tasks, completions.results) |task, result| {
-            if (task == &self.accept_task) {
-                self.onAccept(result);
-            } else if (self.redis_fd != null and task == &self.redis_send_task) {
-                try self.onRedisSendIO(result);
-            } else if (self.redis_fd != null and task == &self.redis_recv_task) {
-                try self.onRedisRecvIO(result);
-            } else if (self.matchPgSendTask(task)) |pg| {
-                try self.onPgSendIO(pg, result);
-            } else if (self.matchPgRecvTask(task)) |pg| {
-                try self.onPgRecvIO(pg, result);
-            } else {
-                try self.onConnCompletion(task, result);
+            switch (task.tag) {
+                .accept => self.onAccept(result),
+                .redis_send => try self.onRedisSendIO(result),
+                .redis_recv => try self.onRedisRecvIO(result),
+                .pg_send => try self.onPgSendIO(self.matchPgSendTask(task) orelse continue, result),
+                .pg_recv => try self.onPgRecvIO(self.matchPgRecvTask(task) orelse continue, result),
+                .conn => try self.onConnCompletion(task, result),
             }
         }
         const t_classify = try std.time.Instant.now();
@@ -994,7 +990,9 @@ pub const Pipeline = struct {
     pub fn initRedis(self: *Pipeline, fd: posix.socket_t) void {
         self.redis_fd = fd;
         self.redis_send_task = Task.init(Pipeline, self, dummyStep);
+        self.redis_send_task.tag = .redis_send;
         self.redis_recv_task = Task.init(Pipeline, self, dummyStep);
+        self.redis_recv_task.tag = .redis_recv;
         log.info("redis connected fd={d}", .{fd});
     }
 
@@ -1317,7 +1315,9 @@ pub const Pipeline = struct {
         self.pg_conns[idx] = .{};
         self.pg_conns[idx].fd = fd;
         self.pg_conns[idx].send_task = Task.init(Pipeline, self, dummyStep);
+        self.pg_conns[idx].send_task.tag = .pg_send;
         self.pg_conns[idx].recv_task = Task.init(Pipeline, self, dummyStep);
+        self.pg_conns[idx].recv_task.tag = .pg_recv;
         self.pg_conn_count += 1;
         log.info("postgres pool: connection {d} fd={d}", .{ idx, fd });
     }
