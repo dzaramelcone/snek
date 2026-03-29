@@ -276,7 +276,7 @@ def parse_queries(path: Path, tables: dict[str, Table]) -> list[Query]:
 
     # Split on query annotations
     pattern = re.compile(
-        r"--\s*name:\s*(\w+)\s+:(one|many|exec|execrows)\s*\n(.*?)(?=(?:--\s*name:|\Z))",
+        r"--\s*name:\s*(\w+)\s+:(one|many|exec|execrows|batch)\s*\n(.*?)(?=(?:--\s*name:|\Z))",
         re.DOTALL,
     )
 
@@ -295,8 +295,19 @@ def parse_queries(path: Path, tables: dict[str, Table]) -> list[Query]:
         select_items: list[SelectItem] = []
         joins: list[JoinInfo] = []
 
-        if kind in ("one", "many"):
+        if kind in ("one", "many", "batch"):
             returns_table, returns_columns, select_items, joins = _infer_return_columns(sql, tables)
+
+        # Validate :batch param names match table columns
+        if kind == "batch" and returns_table and returns_table in tables:
+            table_col_names = {c.name for c in tables[returns_table].columns}
+            for p in params:
+                if p.name not in table_col_names:
+                    raise ValueError(
+                        f"Query {name}: :batch param '{{{p.name}}}' does not match "
+                        f"any column in '{returns_table}'. "
+                        f"Available columns: {', '.join(sorted(table_col_names))}"
+                    )
 
         queries.append(Query(
             name=name,
@@ -595,8 +606,14 @@ def _infer_return_columns(
     """
     upper = sql.upper()
 
-    # RETURNING * → get table from INSERT/UPDATE/DELETE
-    if re.search(r"\bRETURNING\s+\*\s*$", sql, re.IGNORECASE):
+    # RETURNING * or RETURNING table.* → get table from INSERT/UPDATE/DELETE
+    ret_star = re.search(r"\bRETURNING\s+(?:(\w+)\.)?\*\s*$", sql, re.IGNORECASE)
+    if ret_star:
+        # If RETURNING table.*, use that table name directly
+        explicit_table = ret_star.group(1)
+        if explicit_table and explicit_table in tables:
+            return explicit_table, list(tables[explicit_table].columns), [], []
+        # Otherwise infer from INSERT INTO / UPDATE / DELETE FROM
         m = re.search(r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(\w+)", sql, re.IGNORECASE)
         if m:
             table_name = m.group(1)
@@ -717,13 +734,30 @@ def emit_models(tables: dict[str, Table], queries: list[Query]) -> str:
 
     # Emit nested row types for JOINs, partials, computed columns
     for q in queries:
-        if q.returns_table or q.kind not in ("one", "many"):
+        if q.returns_table or q.kind not in ("one", "many", "batch"):
             continue  # simple table return or exec — already handled
         if not q.select_items:
             continue
 
         row_lines = _emit_row_type(q, tables, emitted)
         lines.extend(row_lines)
+
+    # Emit Params models for queries with parameters
+    for q in queries:
+        if not q.params:
+            continue
+        params_class = q.name + "Params"
+        if params_class in emitted:
+            continue
+        param_cols: list[Column] = []
+        for p in q.params:
+            py_type = _infer_param_type(p.name, q, tables)
+            param_cols.append(Column(
+                name=p.name, pg_type="unknown", python_type=py_type,
+                is_nullable=False, has_default=False,
+            ))
+        lines.extend(_emit_model_class(params_class, param_cols))
+        emitted.add(params_class)
 
     return "\n".join(lines)
 
@@ -855,18 +889,22 @@ def emit_queries(queries: list[Query], tables: dict[str, Table], models_module: 
 
 
 def _emit_query_method(query: Query, tables: dict[str, Table]) -> list[str]:
-    """Emit a single async method on the Db class."""
-    # Build parameter signature
+    """Emit query method(s) on the Db class."""
+    if query.kind == "batch":
+        return _emit_batch_method(query, tables)
+    return _emit_single_method(query, tables)
+
+
+def _emit_single_method(query: Query, tables: dict[str, Table]) -> list[str]:
+    """Emit a single-row query method with kwargs."""
     params_sig = ""
     if query.params:
         param_parts = []
         for p in query.params:
-            # Try to infer param type from the table column
             py_type = _infer_param_type(p.name, query, tables)
             param_parts.append(f"{p.name}: {py_type}")
         params_sig = ", *, " + ", ".join(param_parts)
 
-    # Return type
     if query.kind == "one":
         model_name = _return_type_name(query, tables)
         ret_type = f"{model_name} | None"
@@ -878,7 +916,6 @@ def _emit_query_method(query: Query, tables: dict[str, Table]) -> list[str]:
     else:
         ret_type = "None"
 
-    # Map query kind to command
     cmd_map = {"one": "FETCH_ONE", "many": "FETCH_ALL", "exec": "EXECUTE", "execrows": "EXECUTE"}
     cmd = cmd_map[query.kind]
     const_name = query.func_name.upper()
@@ -889,13 +926,33 @@ def _emit_query_method(query: Query, tables: dict[str, Table]) -> list[str]:
         f"    def {query.func_name}(self{params_sig}) -> {ret_type}:",
     ]
 
-    # Method body — yields (cmd_id, sql, *params) to the pipeline
     if query.params:
         param_args = ", ".join(p.name for p in query.params)
         lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}, {param_args}))")
     else:
         lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}))")
 
+    lines.append("")
+    return lines
+
+
+def _emit_batch_method(query: Query, tables: dict[str, Table]) -> list[str]:
+    """Emit a batch method that accepts list[Params] and transposes to arrays."""
+    params_class = query.name + "Params"
+    model_name = _return_type_name(query, tables)
+    const_name = query.func_name.upper()
+
+    lines = [
+        "",
+        "    @types.coroutine",
+        f"    def {query.func_name}(self, rows: list[{params_class}]) -> list[{model_name}]:",
+    ]
+
+    for p in query.params:
+        lines.append(f"        _{p.name} = [r.{p.name} for r in rows]")
+
+    param_args = ", ".join(f"_{p.name}" for p in query.params)
+    lines.append(f"        return (yield (_DbCmd.FETCH_ALL, {const_name}, {param_args}))")
     lines.append("")
     return lines
 

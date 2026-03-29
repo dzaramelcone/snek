@@ -221,6 +221,77 @@ class TestCtes:
 # Edge cases
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Batch operations
+# ---------------------------------------------------------------------------
+
+class TestBatch:
+    def setup_method(self):
+        self.models, self.db, self.queries = _gen("queries_batch.sql")
+
+    def test_batch_insert_method(self):
+        q = next(q for q in self.queries if q.func_name == "create_idea_batch")
+        assert q.kind == "batch"
+        assert "def create_idea_batch(self, rows: list[CreateIdeaBatchParams])" in self.db
+
+    def test_batch_update_method(self):
+        q = next(q for q in self.queries if q.func_name == "update_idea_batch")
+        assert q.kind == "batch"
+        assert "def update_idea_batch(self, rows: list[UpdateIdeaBatchParams])" in self.db
+
+    def test_batch_params_model(self):
+        assert "class CreateIdeaBatchParams(Model):" in self.models
+        assert "    id: str" in self.models
+        assert "    description: str" in self.models
+
+    def test_batch_transposes(self):
+        assert "_id = [r.id for r in rows]" in self.db
+        assert "_description = [r.description for r in rows]" in self.db
+
+    def test_batch_returns_list(self):
+        assert "-> list[Idea]:" in self.db
+
+    def test_batch_rejects_bad_param_names(self):
+        import pytest
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d:
+            sp = Path(d) / "schema.sql"
+            sp.write_text("CREATE TABLE t (id TEXT PRIMARY KEY, name TEXT NOT NULL);")
+            qp = Path(d) / "query.sql"
+            qp.write_text(
+                "-- name: BadBatch :batch\n"
+                "INSERT INTO t (id, name)\n"
+                "SELECT * FROM UNNEST({ids}::text[], {names}::text[])\n"
+                "RETURNING *;"
+            )
+            tables = parse_schemas([sp])
+            with pytest.raises(ValueError, match="ids.*does not match"):
+                parse_queries(qp, tables)
+
+
+# ---------------------------------------------------------------------------
+# Params models
+# ---------------------------------------------------------------------------
+
+class TestParamsModels:
+    def setup_method(self):
+        self.models, self.db, self.queries = _gen("queries_basic.sql")
+
+    def test_params_model_generated(self):
+        assert "class GetIdeaParams(Model):" in self.models
+        assert "    id: str" in self.models
+
+    def test_create_params_model(self):
+        assert "class CreateIdeaParams(Model):" in self.models
+        assert "    id: str" in self.models
+        assert "    description: str" in self.models
+        assert "    tags: list[str]" in self.models
+
+    def test_no_params_no_model(self):
+        # ListIdeas has no params — no Params model
+        assert "ListIdeasParams" not in self.models
+
+
 class TestEdgeCases:
     def setup_method(self):
         self.models, self.db, self.queries = _gen("queries_edge_cases.sql")

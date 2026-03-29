@@ -1034,7 +1034,38 @@ test "wire protocol authenticate scram" {}
 test "wire protocol ssl negotiation" {}
 test "wire protocol simple query" {}
 test "wire protocol extended query parse" {}
-test "wire protocol extended query bind" {}
+test "wire protocol bind with params" {
+    var buf: [256]u8 = undefined;
+
+    // No params
+    const b0 = encodeBindWithParams(&buf, "s0", &.{});
+    try std.testing.expectEqual(Tag.bind, b0[0]);
+    try std.testing.expectEqual(@as(usize, 15), b0.len);
+
+    // One text param: "idea1"
+    const params1 = [_]?[]const u8{@as([]const u8, "idea1")};
+    const b1 = encodeBindWithParams(&buf, "s1", &params1);
+    try std.testing.expectEqual(Tag.bind, b1[0]);
+    try std.testing.expectEqual(@as(usize, 24), b1.len);
+
+    // Verify num_params is 1 (at offset: tag(1)+len(4)+portal\0(1)+"s1"\0(3)+fmtcodes(2) = 11)
+    const num_params = mem.readInt(u16, b1[11..13], .big);
+    try std.testing.expectEqual(@as(u16, 1), num_params);
+
+    // Verify param length is 5 (at offset 13)
+    const param_len = mem.readInt(i32, b1[13..17], .big);
+    try std.testing.expectEqual(@as(i32, 5), param_len);
+
+    // Verify param data is "idea1" (at offset 17)
+    try std.testing.expectEqualStrings("idea1", b1[17..22]);
+
+    // NULL param
+    const params_null = [_]?[]const u8{null};
+    const b2 = encodeBindWithParams(&buf, "s0", &params_null);
+    try std.testing.expectEqual(@as(usize, 19), b2.len);
+    const null_len = mem.readInt(i32, b2[13..17], .big);
+    try std.testing.expectEqual(@as(i32, -1), null_len);
+}
 test "wire protocol extended query execute" {}
 test "wire protocol sync and flush" {}
 test "wire protocol error response parsing" {}
