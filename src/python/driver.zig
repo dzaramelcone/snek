@@ -119,9 +119,7 @@ pub fn buildRequestDict(req: *const http1.Request, params: []const router_mod.Pa
             defer ffi.decref(body_obj);
             try ffi.dictSetItem(dict, sc.key_body, body_obj);
         } else {
-            const none = ffi.getNone();
-            defer ffi.decref(none);
-            try ffi.dictSetItem(dict, sc.key_body, none);
+            try ffi.dictSetItem(dict, sc.key_body, ffi.none());
         }
 
         // Params
@@ -176,9 +174,7 @@ fn buildRequestDictUncached(dict: *PyObject, req: *const http1.Request, params: 
         defer ffi.decref(body_obj);
         try ffi.dictSetItemString(dict, "body", body_obj);
     } else {
-        const none = ffi.getNone();
-        defer ffi.decref(none);
-        try ffi.dictSetItemString(dict, "body", none);
+        try ffi.dictSetItemString(dict, "body", ffi.none());
     }
 
     if (params.len > 0) {
@@ -499,23 +495,22 @@ pub fn invokePythonHandler(
     const flags = module.getHandlerFlags(mod, handler_id);
 
     const call_result = if (flags.no_args) blk: {
-        break :blk ffi.callObject(handler, null) catch {
+        break :blk ffi.vectorcallNoArgs(handler) catch {
             if (ffi.errOccurred()) ffi.errPrint();
             return .{ .response = response_mod.Response.init(500) };
         };
     } else if (flags.needs_params) blk: {
-        const empty_args = ffi.tupleNew(0) catch return .{ .response = response_mod.Response.init(500) };
-        defer ffi.decref(empty_args);
-
         if (params.len > 0) {
             const kwargs = buildParamsKwargs(params) catch return .{ .response = response_mod.Response.init(500) };
             defer ffi.decref(kwargs);
+            const empty_args = ffi.tupleNew(0) catch return .{ .response = response_mod.Response.init(500) };
+            defer ffi.decref(empty_args);
             break :blk ffi.callObjectKwargs(handler, empty_args, kwargs) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
                 return .{ .response = response_mod.Response.init(500) };
             };
         } else {
-            break :blk ffi.callObject(handler, empty_args) catch {
+            break :blk ffi.vectorcallNoArgs(handler) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
                 return .{ .response = response_mod.Response.init(500) };
             };
@@ -523,26 +518,17 @@ pub fn invokePythonHandler(
     } else blk: {
         const req_dict = buildRequestDict(req, params) catch return .{ .response = response_mod.Response.init(500) };
         defer ffi.decref(req_dict);
-        const call_args = ffi.tupleNew(1) catch return .{ .response = response_mod.Response.init(500) };
-        ffi.incref(req_dict);
-        ffi.tupleSetItem(call_args, 0, req_dict) catch {
-            ffi.decref(call_args);
-            return .{ .response = response_mod.Response.init(500) };
-        };
-        const result = ffi.callObject(handler, call_args) catch {
-            ffi.decref(call_args);
+        break :blk ffi.vectorcallOneArg(handler, req_dict) catch {
             if (ffi.errOccurred()) ffi.errPrint();
             return .{ .response = response_mod.Response.init(500) };
         };
-        ffi.decref(call_args);
-        break :blk result;
     };
 
     // Drive coroutines (async def) — first yield may require async I/O.
     // Uses PyIter_Send for fast path: no method lookup, no args tuple,
     // no StopIteration exception on return.
     if (ffi.isCoroutine(call_result)) {
-        const send = ffi.iterSend(call_result, ffi.getNone());
+        const send = ffi.iterSend(call_result, ffi.none());
         switch (send.status) {
             .next => {
                 // Coroutine yielded — classify as redis or postgres
@@ -550,6 +536,7 @@ pub fn invokePythonHandler(
                 defer ffi.decref(sentinel);
 
                 const yield = classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf, pg_stmt_cache, pg_conn_prepared) catch {
+                    ffi.coroutineClose(call_result);
                     ffi.decref(call_result);
                     return .{ .response = response_mod.Response.init(503) };
                 };
@@ -769,16 +756,16 @@ test "build request dict" {
     // Verify method
     const method = ffi.dictGetItemString(dict, "method") orelse unreachable;
     const method_str = try ffi.unicodeAsUTF8(method);
-    std.testing.expect(std.mem.eql(u8, std.mem.span(method_str), "GET")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, std.mem.span(method_str), "GET"));
 
     // Verify path
     const path = ffi.dictGetItemString(dict, "path") orelse unreachable;
     const path_str = try ffi.unicodeAsUTF8(path);
-    std.testing.expect(std.mem.eql(u8, std.mem.span(path_str), "/hello")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, std.mem.span(path_str), "/hello"));
 
     // Verify headers
     const headers = ffi.dictGetItemString(dict, "headers") orelse unreachable;
-    std.testing.expect(ffi.isDict(headers)) catch unreachable;
+    try std.testing.expect(ffi.isDict(headers));
 }
 
 test "build request dict with params" {
@@ -795,10 +782,10 @@ test "build request dict with params" {
     defer ffi.decref(dict);
 
     const params_dict = ffi.dictGetItemString(dict, "params") orelse unreachable;
-    std.testing.expect(ffi.isDict(params_dict)) catch unreachable;
+    try std.testing.expect(ffi.isDict(params_dict));
     const id_val = ffi.dictGetItemString(params_dict, "id") orelse unreachable;
     const id_str = try ffi.unicodeAsUTF8(id_val);
-    std.testing.expect(std.mem.eql(u8, std.mem.span(id_str), "42")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, std.mem.span(id_str), "42"));
 }
 
 test "convert dict response" {
@@ -814,11 +801,11 @@ test "convert dict response" {
     var body_buf: [4096]u8 = undefined;
     const resp = try convertPythonResponse(dict, &body_buf);
 
-    std.testing.expectEqual(@as(u16, 200), resp.status) catch unreachable;
-    std.testing.expect(resp.body != null) catch unreachable;
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(resp.body != null);
     // Should contain "message" and "hello" in JSON
-    std.testing.expect(std.mem.indexOf(u8, resp.body.?, "message") != null) catch unreachable;
-    std.testing.expect(std.mem.indexOf(u8, resp.body.?, "hello") != null) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, resp.body.?, "message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body.?, "hello") != null);
 }
 
 test "convert string response" {
@@ -831,8 +818,8 @@ test "convert string response" {
     var body_buf: [4096]u8 = undefined;
     const resp = try convertPythonResponse(s, &body_buf);
 
-    std.testing.expectEqual(@as(u16, 200), resp.status) catch unreachable;
-    std.testing.expect(std.mem.eql(u8, resp.body.?, "plain text")) catch unreachable;
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.eql(u8, resp.body.?, "plain text"));
 }
 
 test "convert none response" {
@@ -845,7 +832,7 @@ test "convert none response" {
     var body_buf: [4096]u8 = undefined;
     const resp = try convertPythonResponse(none, &body_buf);
 
-    std.testing.expectEqual(@as(u16, 204), resp.status) catch unreachable;
+    try std.testing.expectEqual(@as(u16, 204), resp.status);
 }
 
 test "convert tuple response" {
@@ -861,8 +848,8 @@ test "convert tuple response" {
     const resp = try convertPythonResponse(tuple, &body_buf);
     defer ffi.decref(tuple);
 
-    std.testing.expectEqual(@as(u16, 201), resp.status) catch unreachable;
-    std.testing.expect(std.mem.eql(u8, resp.body.?, "created")) catch unreachable;
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expect(std.mem.eql(u8, resp.body.?, "created"));
 }
 
 test "json serialization of nested dict" {
@@ -884,9 +871,9 @@ test "json serialization of nested dict" {
     const json_str = try pyDictToJson(test_dict, &body_buf);
 
     // Verify key parts are present
-    std.testing.expect(std.mem.indexOf(u8, json_str, "\"user\"") != null) catch unreachable;
-    std.testing.expect(std.mem.indexOf(u8, json_str, "\"name\"") != null) catch unreachable;
-    std.testing.expect(std.mem.indexOf(u8, json_str, "\"snek\"") != null) catch unreachable;
-    std.testing.expect(std.mem.indexOf(u8, json_str, "42") != null) catch unreachable;
-    std.testing.expect(std.mem.indexOf(u8, json_str, "true") != null) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"name\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"snek\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "true") != null);
 }

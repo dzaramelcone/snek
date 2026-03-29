@@ -156,7 +156,7 @@ const PgWaiter = struct {
 };
 
 const MAX_PG_CONNS = 8;
-const PG_WAITER_CAP = MAX_BATCH / MAX_PG_CONNS;
+const PG_WAITER_CAP = MAX_BATCH;
 
 pub const PgConn = struct {
     fd: posix.socket_t = undefined,
@@ -352,10 +352,11 @@ pub const Pipeline = struct {
         try self.stageParse();
         const t_parse = try std.time.Instant.now();
 
-        // GIL held across handle + redis stages (one acquire for all Python work)
+        // GIL held across handle + redis + postgres stages (one acquire for all Python work)
         const py_ctx = if (self.req_ctx) |ctx| ctx.py_ctx else null;
         const need_gil = py_ctx != null and (self.handle_q.len > 0 or self.redis_recv_state == .parsing or self.redis_recv_state == .err or self.anyPgNeedsGil());
         if (need_gil) py_ctx.?.py.acquireGil();
+        defer if (need_gil) py_ctx.?.py.releaseGil();
 
         try self.stageHandle();
         const t_handle = try std.time.Instant.now();
@@ -364,8 +365,6 @@ pub const Pipeline = struct {
         const pg_rows_before = self.totalPgWaiters();
         try self.stagePostgres();
         const t_pg = try std.time.Instant.now();
-
-        if (need_gil) py_ctx.?.py.releaseGil();
 
         try self.stageSerializeAndSend();
         const t_send = try std.time.Instant.now();
@@ -883,6 +882,7 @@ pub const Pipeline = struct {
     /// Resume the head waiter's Python coroutine with a redis result.
     /// Uses PyIter_Send — no method lookup, no StopIteration exception overhead.
     fn resumeRedisWaiter(self: *Pipeline, result: *ffi.PyObject) !void {
+        defer ffi.decref(result); // iterSend increfs internally; we own the creation ref
         const waiter = self.popRedisWaiter() orelse return;
         const conn = self.conns.get_ptr(waiter.conn_idx);
 
@@ -897,6 +897,7 @@ pub const Pipeline = struct {
                     self.redisSendSlice(), self.pgSendSlice(),
                     self.pgStmtCache(), self.pgConnPrepared(),
                 ) catch {
+                    ffi.coroutineClose(waiter.py_coro);
                     ffi.decref(waiter.py_coro);
                     try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
                     return;
@@ -935,6 +936,7 @@ pub const Pipeline = struct {
 
     fn failHeadWaiter(self: *Pipeline) !void {
         const waiter = self.popRedisWaiter() orelse return;
+        ffi.coroutineClose(waiter.py_coro);
         ffi.decref(waiter.py_coro);
         try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
     }
@@ -1154,9 +1156,7 @@ pub const Pipeline = struct {
                             defer ffi.decref(val_obj);
                             try ffi.dictSetItem(dict, name, val_obj);
                         } else {
-                            const none = ffi.getNone();
-                            defer ffi.decref(none);
-                            try ffi.dictSetItem(dict, name, none);
+                            try ffi.dictSetItem(dict, name, ffi.none());
                         }
                     }
                     self.pg_py_ns += (try std.time.Instant.now()).since(py_t0);
@@ -1212,6 +1212,7 @@ pub const Pipeline = struct {
     }
 
     fn resumePgWaiter(self: *Pipeline, waiter: PgWaiter, result: *ffi.PyObject) !void {
+        defer ffi.decref(result); // iterSend increfs internally; we own the creation ref
         const conn = self.conns.get_ptr(waiter.conn_idx);
         const send = ffi.iterSend(waiter.py_coro, result);
         switch (send.status) {
@@ -1224,6 +1225,7 @@ pub const Pipeline = struct {
                     self.redisSendSlice(), self.pgSendSlice(),
                     self.pgStmtCache(), self.pgConnPrepared(),
                 ) catch {
+                    ffi.coroutineClose(waiter.py_coro);
                     ffi.decref(waiter.py_coro);
                     try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
                     return;
@@ -1259,6 +1261,7 @@ pub const Pipeline = struct {
     fn failPgConnWaiters(self: *Pipeline, pg: *PgConn) !void {
         while (pg.waiter_count > 0) {
             const waiter = pg.popWaiter() orelse break;
+            ffi.coroutineClose(waiter.py_coro);
             ffi.decref(waiter.py_coro);
             try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
         }

@@ -80,6 +80,25 @@ pub fn callObject(callable: *PyObject, args: ?*PyObject) PythonError!*PyObject {
     };
 }
 
+/// Vectorcall a Python callable with no arguments (PEP 590).
+/// Fastest calling convention — no tuple creation, no method lookup.
+pub fn vectorcallNoArgs(callable: *PyObject) PythonError!*PyObject {
+    return c.PyObject_Vectorcall(callable, null, 0, null) orelse {
+        c.PyErr_Print();
+        return error.CallError;
+    };
+}
+
+/// Vectorcall a Python callable with a single positional argument (PEP 590).
+/// Avoids tuple creation — passes a stack array directly.
+pub fn vectorcallOneArg(callable: *PyObject, arg: *PyObject) PythonError!*PyObject {
+    var args = [1]?*PyObject{arg};
+    return c.PyObject_Vectorcall(callable, @ptrCast(&args), 1, null) orelse {
+        c.PyErr_Print();
+        return error.CallError;
+    };
+}
+
 /// Call a Python callable with args tuple and kwargs dict. Caller must decref result.
 pub fn callObjectKwargs(callable: *PyObject, args: ?*PyObject, kwargs: *PyObject) PythonError!*PyObject {
     return c.PyObject_Call(callable, args, kwargs) orelse {
@@ -131,6 +150,19 @@ pub fn errPrint() void {
 /// Check if an object is a coroutine (from async def).
 pub fn isCoroutine(obj: *PyObject) bool {
     return c.PyCoro_CheckExact(obj) != 0;
+}
+
+/// Properly close a suspended coroutine/generator by calling its .close() method.
+/// This throws GeneratorExit into the coroutine, allowing finally blocks to run
+/// and preventing GC corruption from half-unwound frames.
+/// Must be called BEFORE decref on any coroutine that was suspended (yielded).
+pub fn coroutineClose(coro: *PyObject) void {
+    const close_result = c.PyObject_CallMethod(coro, "close", null);
+    if (close_result) |r| {
+        c.Py_DecRef(r);
+    } else {
+        c.PyErr_Clear();
+    }
 }
 
 /// Fast coroutine/generator send — bypasses method lookup, tuple creation,
@@ -185,10 +217,17 @@ pub fn boolFromBool(v: bool) *PyObject {
     return c.PyBool_FromLong(@intFromBool(v));
 }
 
+/// Borrowed reference to None — no incref, do NOT decref.
+/// Use for transient reads (e.g. passing to PyIter_Send which increfs internally).
+pub fn none() *PyObject {
+    return @ptrCast(&c._Py_NoneStruct);
+}
+
+/// New reference to None — caller must decref.
 pub fn getNone() *PyObject {
-    const none: *PyObject = @ptrCast(&c._Py_NoneStruct);
-    incref(none);
-    return none;
+    const n = none();
+    incref(n);
+    return n;
 }
 
 // ── Bytes operations ────────────────────────────────────────────────
@@ -412,7 +451,7 @@ test "initialize and finalize python" {
     init();
     defer deinit();
     // If we get here without crashing, init/deinit works.
-    std.testing.expect(c.Py_IsInitialized() != 0) catch unreachable;
+    try std.testing.expect(c.Py_IsInitialized() != 0);
 }
 
 test "run python string" {
@@ -434,7 +473,7 @@ test "import module" {
     const version_str = try unicodeAsUTF8(version);
     const span = std.mem.span(version_str);
     // Python 3.14 version string starts with "3.14"
-    std.testing.expect(span.len > 0) catch unreachable;
+    try std.testing.expect(span.len > 0);
 }
 
 test "call python function" {
@@ -459,7 +498,7 @@ test "call python function" {
     decref(args);
 
     const val = try longAsLong(result);
-    std.testing.expectEqual(@as(c_long, 7), val) catch unreachable;
+    try std.testing.expectEqual(@as(c_long, 7), val);
 }
 
 test "python exception handling" {
@@ -468,7 +507,7 @@ test "python exception handling" {
 
     // PyRun_SimpleString returns -1 on exception
     const err = runString("raise ValueError('test error')");
-    std.testing.expectError(error.PythonError, err) catch unreachable;
+    try std.testing.expectError(error.PythonError, err);
 }
 
 test "reference counting" {
@@ -498,7 +537,7 @@ test "unicode round-trip" {
 
     const back = try unicodeAsUTF8(obj);
     const span = std.mem.span(back);
-    std.testing.expect(std.mem.eql(u8, span, "hello snek")) catch unreachable;
+    try std.testing.expect(std.mem.eql(u8, span, "hello snek"));
 }
 
 test "float round-trip" {
@@ -509,7 +548,7 @@ test "float round-trip" {
     defer decref(obj);
 
     const val = try floatAsDouble(obj);
-    std.testing.expect(@abs(val - 3.14) < 0.001) catch unreachable;
+    try std.testing.expect(@abs(val - 3.14) < 0.001);
 }
 
 test "dict operations" {
@@ -524,9 +563,9 @@ test "dict operations" {
     decref(val);
 
     const got = dictGetItemString(dict, "key"); // borrowed ref
-    std.testing.expect(got != null) catch unreachable;
+    try std.testing.expect(got != null);
     const got_val = try longAsLong(got.?);
-    std.testing.expectEqual(@as(c_long, 42), got_val) catch unreachable;
+    try std.testing.expectEqual(@as(c_long, 42), got_val);
 }
 
 test "list operations" {
@@ -541,7 +580,7 @@ test "list operations" {
     decref(item);
 
     const size = c.PyList_Size(list);
-    std.testing.expectEqual(@as(isize, 1), size) catch unreachable;
+    try std.testing.expectEqual(@as(isize, 1), size);
 }
 
 test "tuple operations" {
@@ -556,7 +595,7 @@ test "tuple operations" {
     try tupleSetItem(tuple, 1, try longFromLong(20));
 
     const size = c.PyTuple_Size(tuple);
-    std.testing.expectEqual(@as(isize, 2), size) catch unreachable;
+    try std.testing.expectEqual(@as(isize, 2), size);
 }
 
 test "bool and none" {
@@ -568,20 +607,20 @@ test "bool and none" {
     const f = boolFromBool(false);
     defer decref(f);
 
-    const none = getNone();
-    defer decref(none);
-    std.testing.expect(c.Py_IsNone(none) != 0) catch unreachable;
+    const none_obj = getNone();
+    defer decref(none_obj);
+    try std.testing.expect(c.Py_IsNone(none_obj) != 0);
 }
 
 test "error set and check" {
     init();
     defer deinit();
 
-    std.testing.expect(!errOccurred()) catch unreachable;
+    try std.testing.expect(!errOccurred());
     errSetString(c.PyExc_RuntimeError, "test error");
-    std.testing.expect(errOccurred()) catch unreachable;
+    try std.testing.expect(errOccurred());
     errClear();
-    std.testing.expect(!errOccurred()) catch unreachable;
+    try std.testing.expect(!errOccurred());
 }
 
 test "wrapNoArgs produces valid method" {
@@ -610,5 +649,5 @@ test "wrapNoArgs produces valid method" {
     defer decref(result);
 
     const val = try longAsLong(result);
-    std.testing.expectEqual(@as(c_long, 42), val) catch unreachable;
+    try std.testing.expectEqual(@as(c_long, 42), val);
 }

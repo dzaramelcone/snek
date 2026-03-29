@@ -329,6 +329,7 @@ pub const RedisReader = struct {
 
     fn resumeWithError(self: *RedisReader, rctx: *RedisCtx, waiter: *Task) void {
         const conn = rctx.conn;
+        ffi.coroutineClose(rctx.py_coro);
         ffi.decref(rctx.py_coro);
         rctx.release();
 
