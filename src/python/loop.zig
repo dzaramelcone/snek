@@ -199,6 +199,19 @@ pub fn cancelHandle(handle_obj: *PyObject, handle_token: HandleToken) LoopError!
     cancelNativeHandle(slot, handle_id);
 }
 
+pub fn handleRepr(handle_obj: *PyObject, handle_token: HandleToken, debug: bool) LoopError!*PyObject {
+    const slot = try slotFromCapsule(handle_obj);
+    const decoded = decodeHandleToken(handle_token);
+    const handle_id = decoded.id;
+    if (@as(usize, handle_id) >= MAX_HANDLES) return ffi.getNone();
+    const native = &slot.handles[handle_id];
+    if (!native.used) return ffi.getNone();
+    if (native.generation != decoded.generation) return ffi.getNone();
+    const callback = native.callback orelse return ffi.getNone();
+    const args = native.args orelse return ffi.getNone();
+    return formatCallbackSource(callback, args, debug);
+}
+
 pub fn runForever(handle_obj: *PyObject, loop_obj: *PyObject) LoopError!void {
     const slot = try slotFromCapsule(handle_obj);
     if (slot.closed) return error.LoopClosed;
@@ -817,6 +830,31 @@ fn callObjectRaw(callable: *PyObject, args: ?*PyObject) LoopError!*PyObject {
 
 fn callObjectKwargsRaw(callable: *PyObject, args: ?*PyObject, kwargs: *PyObject) LoopError!*PyObject {
     return c.PyObject_Call(callable, args, kwargs) orelse error.PythonError;
+}
+
+fn formatCallbackSource(callback: *PyObject, args: *PyObject, debug: bool) LoopError!*PyObject {
+    const helpers_mod = try importModuleRaw("asyncio.format_helpers");
+    defer ffi.decref(helpers_mod);
+    const func = try getAttrRaw(helpers_mod, "_format_callback_source");
+    defer ffi.decref(func);
+
+    const call_args = try ffi.tupleNew(2);
+    errdefer ffi.decref(call_args);
+    ffi.incref(callback);
+    try ffi.tupleSetItem(call_args, 0, callback);
+    ffi.incref(args);
+    try ffi.tupleSetItem(call_args, 1, args);
+
+    const kwargs = try ffi.dictNew();
+    errdefer ffi.decref(kwargs);
+    const debug_obj = ffi.boolFromBool(debug);
+    defer ffi.decref(debug_obj);
+    try ffi.dictSetItemString(kwargs, "debug", debug_obj);
+
+    const result = try callObjectKwargsRaw(func, call_args, kwargs);
+    ffi.decref(call_args);
+    ffi.decref(kwargs);
+    return result;
 }
 
 fn tokenForHandle(slot: *LoopSlot, handle_id: HandleId) HandleToken {

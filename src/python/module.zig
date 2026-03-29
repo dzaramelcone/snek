@@ -669,6 +669,30 @@ fn pyLoopHandleCancel(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     return ffi.getNone();
 }
 
+fn pyLoopHandleRepr(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_handle_repr(handle, slot_id, debug) requires 3 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_handle_repr(handle, slot_id, debug) requires exactly 3 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const slot_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const debug_obj = ffi.tupleGetItem(tuple, 2) orelse return null;
+    const slot_id = ffi.longAsLong(slot_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "slot_id must be an int");
+        return null;
+    };
+    const truth = c.PyObject_IsTrue(debug_obj);
+    if (truth < 0) return null;
+    return loop_mod.handleRepr(handle, @intCast(slot_id), truth == 1) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+}
+
 fn pyLoopRunForever(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const tuple = args orelse {
         c.PyErr_SetString(c.PyExc_TypeError, "loop_run_forever(handle, loop) requires 2 arguments");
@@ -729,6 +753,7 @@ var methods = [_]c.PyMethodDef{
     ffi.wrapVarArgs("loop_call_soon", &pyLoopCallSoon),
     ffi.wrapVarArgs("loop_call_at", &pyLoopCallAt),
     ffi.wrapVarArgs("loop_handle_cancel", &pyLoopHandleCancel),
+    ffi.wrapVarArgs("loop_handle_repr", &pyLoopHandleRepr),
     ffi.wrapVarArgs("loop_run_forever", &pyLoopRunForever),
     ffi.wrapVarArgs("loop_run_until_complete", &pyLoopRunUntilComplete),
     std.mem.zeroes(c.PyMethodDef), // sentinel
