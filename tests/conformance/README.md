@@ -11,6 +11,7 @@ Protocol conformance suites for snek's network implementations.
 | `http2/` | HTTP/2 | [h2spec](https://github.com/summerwind/h2spec) | RFC 7540 |
 | `tls/` | TLS | [testssl.sh](https://github.com/drwetter/testssl.sh) | RFC 8446 / 5246 |
 | `postgres/` | PostgreSQL wire | psql + libpq | Frontend/Backend Protocol |
+| `python_eventloop/` | Python event loop | uvloop + CPython upstream tests | asyncio / PEP 492 |
 
 ## Running
 

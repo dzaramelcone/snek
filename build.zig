@@ -99,15 +99,16 @@ pub fn build(b: *std.Build) void {
             }),
         });
         linkPython(pyext.root_module);
-        b.installArtifact(pyext);
+        const install_pyext = b.addInstallArtifact(pyext, .{});
         if (target.result.os.tag == .macos) {
             const codesign = b.addSystemCommand(&.{ "codesign", "-fs", "-" });
             codesign.addFileArg(pyext.getEmittedBin());
             codesign.step.dependOn(&pyext.step);
-            pyext_step.dependOn(&codesign.step);
+            install_pyext.step.dependOn(&codesign.step);
         } else {
-            pyext_step.dependOn(&pyext.step);
+            install_pyext.step.dependOn(&pyext.step);
         }
+        pyext_step.dependOn(&install_pyext.step);
 
     }
 
