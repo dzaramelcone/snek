@@ -1092,9 +1092,6 @@ pub const Pipeline = struct {
         const stmt_entry = self.pg_stmt_cache.get(waiter.stmt_idx);
         var col_descs: [64]wire.ColumnDesc = undefined;
         var col_count: u16 = if (stmt_entry.described) stmt_entry.col_count else 0;
-        if (stmt_entry.described) {
-            @memcpy(col_descs[0..col_count], stmt_entry.col_descs[0..col_count]);
-        }
         var py_result: ?*ffi.PyObject = null;
         var py_list: ?*ffi.PyObject = null;
 
@@ -1133,12 +1130,11 @@ pub const Pipeline = struct {
                 wire.BackendTag.row_description => {
                     col_count = wire.parseRowDescription(payload, &col_descs) catch 0;
                     if (!stmt_entry.described) {
-                        @memcpy(stmt_entry.col_descs[0..col_count], col_descs[0..col_count]);
                         stmt_entry.col_count = col_count;
                         stmt_entry.described = true;
-                    }
-                    // Cache Python key objects for column names
-                    if (!stmt_entry.keys_cached) {
+                        // Cache Python key objects for column names.
+                        // Must happen now while col_descs.name slices still
+                        // point into valid recv buffer memory.
                         for (0..col_count) |ki| {
                             stmt_entry.col_keys[ki] = ffi.unicodeFromSlice(col_descs[ki].name.ptr, col_descs[ki].name.len) catch null;
                         }

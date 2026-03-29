@@ -13,7 +13,6 @@ pub const MAX_STMTS = 128;
 
 pub const Entry = struct {
     sql_hash: u64,
-    col_descs: [64]wire.ColumnDesc = undefined,
     col_count: u16 = 0,
     described: bool = false, // true once RowDescription/NoData received
     // Cached Python string objects for column names — created once, reused per row

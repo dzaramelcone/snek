@@ -549,7 +549,10 @@ pub fn invokePythonHandler(
                 const sentinel = send.result.?;
                 defer ffi.decref(sentinel);
 
-                const yield = try classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf, pg_stmt_cache, pg_conn_prepared);
+                const yield = classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf, pg_stmt_cache, pg_conn_prepared) catch {
+                    ffi.decref(call_result);
+                    return .{ .response = response_mod.Response.init(503) };
+                };
                 return switch (yield) {
                     .redis => |ry| .{ .redis_yield = ry },
                     .pg => |pg| .{ .pg_yield = pg },
