@@ -1,3 +1,16 @@
+# GOLDEN RULES
+You MUST NEVER use `catch unreachable`, `return null` `catch {}` or `catch { /* log and return */ }`
+
+EXCEPT IN VERY LIMITED CIRCUMSTANCES, WITH NARROWLY TAILORED ERROR HANDLING, ALL ERRORS **MUST** BE BUBBLED UP THE CALL GRAPH.
+
+IF YOU ARE INTRODUCING A POSSIBLE NEW ERROR, YOU **MUST** REWRITE THE CALL GRAPH TO SUPPORT THE POSSIBLE ERROR BY RETURNING TYPES UNION WITH ERRORS!!! NO IFS ANDS OR BUTS.
+
+NO EXCEPTIONS TO THIS IRON-CLAD GOLDEN RULE WITHOUT EXPLICIT PERMISSION FROM DZARA!!
+
+**NEVER** USE NULLS IN PLACE OF ERRORS!
+
+Name errors descriptively. Zig allows you to define errors inline. Take advantage of this minimal friction for creating descriptive error conditions.
+
 ## Build
 
 ```bash
@@ -41,10 +54,10 @@ Use oha (not hey). Always warm up before measuring:
 oha --no-tui -c 8 -z 4s http://127.0.0.1:8080/
 
 # 2. Warmup — ramp to target concurrency (c=target, 3s)
-oha --no-tui -c 50 -z 3s http://127.0.0.1:8080/
+oha --no-tui -c 256 -z 3s http://127.0.0.1:8080/
 
 # 3. Bench — actual measurement (c=target, 10s)
-oha --no-tui -c 50 -z 10s http://127.0.0.1:8080/
+oha --no-tui -c 256 -z 10s http://127.0.0.1:8080/
 ```
 
 Only report numbers from step 3.
@@ -78,6 +91,22 @@ docker compose down
 ```
 
 Granian benchmark methodology: primer (c=8, 4s), warmup (c=max, 3s), bench (10s).
+
+## Multi-threading
+
+```python
+app.run(threads=4)  # each thread gets its own pipeline + sub-interpreter + GIL
+```
+
+Each thread owns: socket (SO_REUSEPORT), kqueue/io_uring, pipeline, sub-interpreter (OWN_GIL), redis connection. No shared mutable state between threads.
+
+## Python C API rules
+
+- Use `PyIter_Send` for coroutine driving (not `PyObject_CallMethod("send", ...)`). Avoids method lookup, tuple creation, and StopIteration exception overhead.
+- Use `PyUnicode_DecodeUTF8(ptr, len)` for string creation from slices (not `PyUnicode_FromString` which needs null termination).
+- Use `PyDict_SetItem` with cached key objects (not `PyDict_SetItemString` which creates a temporary string).
+- GIL must be held for ALL Python C API calls including `Py_DECREF`.
+- String slices from `PyUnicode_AsUTF8` point into Python object memory — consume immediately, do not store past the object's lifetime.
 
 ## Stale binary gotchas
 
