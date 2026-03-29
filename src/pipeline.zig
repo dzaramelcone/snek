@@ -29,6 +29,7 @@ const response_mod = @import("http/response.zig");
 const stmt_cache_mod = @import("db/stmt_cache.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
+const perf = @import("observe/perf.zig");
 
 const log = std.log.scoped(.@"snek/pipeline");
 
@@ -310,6 +311,8 @@ pub const Pipeline = struct {
 
     pub fn run(self: *Pipeline) !void {
         refreshCommonHeaders();
+        self.stats.initPmu();
+        defer self.stats.deinitPmu();
         while (self.running) {
             _ = try self.cycle(1);
             while (try self.cycle(0)) {}
@@ -321,6 +324,11 @@ pub const Pipeline = struct {
         const completions = try self.backend.submitAndWait(wait_nr);
         if (completions.tasks.len == 0) return false;
         const t_io = try std.time.Instant.now();
+
+        // PMU — comptime-stripped when no backend; sample near dump boundaries
+        const pmu_before = if (comptime Stats.has_pmu)
+            (if (self.stats.pmu.backend != null and self.stats.cycles % 10000 >= 9990) self.stats.pmuRead() else null)
+        else {};
 
         // Refresh cached date header (once per second)
         refreshCommonHeaders();
@@ -366,6 +374,11 @@ pub const Pipeline = struct {
         const t_send = try std.time.Instant.now();
         self.stageClose();
 
+        // PMU snapshot — end
+        if (comptime Stats.has_pmu) {
+            self.stats.pmuAccum(pmu_before, self.stats.pmuRead());
+        }
+
         // Accumulate timing stats
         self.stats.cycles += 1;
         self.stats.completions += completions.tasks.len;
@@ -394,11 +407,59 @@ pub const Pipeline = struct {
         ns_parse: u64 = 0,
         ns_handle: u64 = 0,
         ns_redis: u64 = 0,
-        ns_pg_wire: u64 = 0, // wire protocol parsing (pure Zig)
-        ns_pg_py: u64 = 0, // Python C API calls (dict building + coroutine resume)
+        ns_pg_wire: u64 = 0,
+        ns_pg_py: u64 = 0,
         ns_pg_flush: u64 = 0,
         pg_rows: u64 = 0,
         ns_send: u64 = 0,
+        // PMU — comptime-stripped when no backend available
+        pmu: if (has_pmu) PmuState else void = if (has_pmu) .{} else {},
+
+        const has_pmu = perf.Backend != void;
+
+        const PmuState = struct {
+            backend: ?perf.Backend = null,
+            cpu_cycles: u64 = 0,
+            instructions: u64 = 0,
+            branches: u64 = 0,
+            branch_misses: u64 = 0,
+            cache_misses: u64 = 0,
+            tlb_misses: u64 = 0,
+        };
+
+        fn initPmu(self: *Stats) void {
+            if (comptime !has_pmu) return;
+            if (perf.Backend.init()) |pe| {
+                self.pmu.backend = pe;
+                log.info("PMU counters enabled", .{});
+            } else |err| {
+                log.info("PMU unavailable: {s}", .{@errorName(err)});
+            }
+        }
+
+        fn deinitPmu(self: *Stats) void {
+            if (comptime !has_pmu) return;
+            if (self.pmu.backend) |*p| perf.deinit(p);
+        }
+
+        fn pmuRead(self: *Stats) if (has_pmu) ?perf.Counters else void {
+            if (comptime !has_pmu) return {};
+            if (self.pmu.backend) |*p| return perf.read(p);
+            return null;
+        }
+
+        fn pmuAccum(self: *Stats, before: anytype, after: anytype) void {
+            if (comptime !has_pmu) return;
+            const b = before orelse return;
+            const a = after orelse return;
+            const d = perf.Counters.diff(a, b);
+            self.pmu.cpu_cycles += d.cycles;
+            self.pmu.instructions += d.instructions;
+            self.pmu.branches += d.branches;
+            self.pmu.branch_misses += d.missed_branches;
+            self.pmu.cache_misses += d.cache_misses;
+            self.pmu.tlb_misses += d.tlb_misses;
+        }
 
         fn dump(self: *Stats) void {
             const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_py + self.ns_pg_flush + self.ns_send;
@@ -412,6 +473,21 @@ pub const Pipeline = struct {
                 "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  pg_wire={d}us  pg_py={d}us({d}rows)  pg_flush={d}us  send={d}us",
                 .{ self.cycles, reqs, us(total), us(self.ns_io), us(self.ns_classify), us(self.ns_parse), us(self.ns_handle), us(self.ns_redis), us(self.ns_pg_wire), us(self.ns_pg_py), self.pg_rows, us(self.ns_pg_flush), us(self.ns_send) },
             );
+            if (comptime has_pmu) {
+                if (self.pmu.cpu_cycles > 0) {
+                    log.info(
+                        "PMU  cycles={d}  insn={d}  IPC={d}.{d:0>2}  branches={d}  mispredict={d}  L1miss={d}  TLBmiss={d}",
+                        .{
+                            self.pmu.cpu_cycles, self.pmu.instructions,
+                            self.pmu.instructions / (self.pmu.cpu_cycles | 1),
+                            (self.pmu.instructions * 100 / (self.pmu.cpu_cycles | 1)) % 100,
+                            self.pmu.branches, self.pmu.branch_misses,
+                            self.pmu.cache_misses, self.pmu.tlb_misses,
+                        },
+                    );
+                }
+                self.pmu = .{ .backend = self.pmu.backend };
+            }
             self.completions = 0;
             self.ns_io = 0;
             self.ns_classify = 0;

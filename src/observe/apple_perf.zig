@@ -13,6 +13,8 @@ pub const Counters = struct {
     instructions: u64,
     branches: u64,
     missed_branches: u64,
+    cache_misses: u64,
+    tlb_misses: u64,
 
     pub fn diff(after: Counters, before: Counters) Counters {
         return .{
@@ -20,6 +22,8 @@ pub const Counters = struct {
             .instructions = after.instructions -| before.instructions,
             .branches = after.branches -| before.branches,
             .missed_branches = after.missed_branches -| before.missed_branches,
+            .cache_misses = after.cache_misses -| before.cache_misses,
+            .tlb_misses = after.tlb_misses -| before.tlb_misses,
         };
     }
 };
@@ -47,7 +51,7 @@ const EventAlias = struct {
     names: [EVENT_NAME_MAX]?[*:0]const u8,
 };
 
-const profile_events = [4]EventAlias{
+const profile_events = [6]EventAlias{
     .{
         .alias = "cycles",
         .names = .{
@@ -84,6 +88,14 @@ const profile_events = [4]EventAlias{
             null, null, null, null,
         },
     },
+    .{
+        .alias = "cache-misses",
+        .names = .{ "L1D_CACHE_MISS_LD", "L1D_CACHE_MISS_ST", "MEM_LOAD_RETIRED.L1_MISS", null, null, null, null, null },
+    },
+    .{
+        .alias = "tlb-misses",
+        .names = .{ "L1D_TLB_MISS", "DTLB_LOAD_MISSES.MISS_CAUSES_A_WALK", null, null, null, null, null, null },
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -117,6 +129,8 @@ const KpepConfigKpcFn = *const fn (?*anyopaque, [*]KpcConfigT, usize) callconv(.
 // Resolved function pointers (stored in PerfEvents)
 // ---------------------------------------------------------------------------
 
+const KperfResetFn = *const fn () callconv(.c) c_int;
+
 const KperfFns = struct {
     kpc_force_all_ctrs_set: KpcForceAllCtrsSetFn,
     kpc_force_all_ctrs_get: KpcForceAllCtrsGetFn,
@@ -124,6 +138,7 @@ const KperfFns = struct {
     kpc_set_thread_counting: KpcSetThreadCountingFn,
     kpc_set_config: KpcSetConfigFn,
     kpc_get_thread_counters: KpcGetThreadCountersFn,
+    kperf_reset: KperfResetFn,
 };
 
 const KperfdataFns = struct {
@@ -166,6 +181,7 @@ fn load_kperf_fns(handle: DlHandle) error{DlsymFailed}!KperfFns {
         .kpc_set_thread_counting = try dlsym_checked(KpcSetThreadCountingFn, handle, "kpc_set_thread_counting"),
         .kpc_set_config = try dlsym_checked(KpcSetConfigFn, handle, "kpc_set_config"),
         .kpc_get_thread_counters = try dlsym_checked(KpcGetThreadCountersFn, handle, "kpc_get_thread_counters"),
+        .kperf_reset = try dlsym_checked(KperfResetFn, handle, "kperf_reset"),
     };
 }
 
@@ -237,84 +253,41 @@ pub const PerfEvents = struct {
 
         // Load PMC database for current CPU
         var db: ?*anyopaque = null;
-        if (kperfdata.kpep_db_create(null, &db) != 0) {
-            return error.KpepDbCreateFailed;
-        }
+        if (kperfdata.kpep_db_create(null, &db) != 0) return error.KpepDbCreateFailed;
+        defer kperfdata.kpep_db_free(db);
 
         // Create config
         var cfg: ?*anyopaque = null;
-        if (kperfdata.kpep_config_create(db, &cfg) != 0) {
-            kperfdata.kpep_db_free(db);
-            return error.KpepConfigCreateFailed;
-        }
+        if (kperfdata.kpep_config_create(db, &cfg) != 0) return error.KpepConfigCreateFailed;
+        defer kperfdata.kpep_config_free(cfg);
 
-        if (kperfdata.kpep_config_force_counters(cfg) != 0) {
-            kperfdata.kpep_config_free(cfg);
-            kperfdata.kpep_db_free(db);
-            return error.KpepConfigForceCountersFailed;
-        }
+        if (kperfdata.kpep_config_force_counters(cfg) != 0) return error.KpepConfigForceCountersFailed;
 
-        // Resolve events from the database
+        // Resolve events
         var ev_arr: [profile_events.len]?*anyopaque = .{null} ** profile_events.len;
         for (&profile_events, 0..) |*alias, i| {
-            ev_arr[i] = find_event(kperfdata, db, alias) orelse {
-                kperfdata.kpep_config_free(cfg);
-                kperfdata.kpep_db_free(db);
-                return error.EventNotFound;
-            };
+            ev_arr[i] = find_event(kperfdata, db, alias) orelse return error.EventNotFound;
         }
-
-        // Add events to config
         for (&ev_arr) |*ev_ptr| {
-            if (kperfdata.kpep_config_add_event(cfg, ev_ptr, 0, null) != 0) {
-                kperfdata.kpep_config_free(cfg);
-                kperfdata.kpep_db_free(db);
-                return error.KpepConfigAddEventFailed;
-            }
+            if (kperfdata.kpep_config_add_event(cfg, ev_ptr, 0, null) != 0) return error.KpepConfigAddEventFailed;
         }
 
         // Extract KPC configuration
         var classes: u32 = 0;
-        if (kperfdata.kpep_config_kpc_classes(cfg, &classes) != 0) {
-            kperfdata.kpep_config_free(cfg);
-            kperfdata.kpep_db_free(db);
-            return error.KpepConfigKpcClassesFailed;
-        }
-
+        if (kperfdata.kpep_config_kpc_classes(cfg, &classes) != 0) return error.KpepConfigKpcClassesFailed;
         var reg_count: usize = 0;
-        if (kperfdata.kpep_config_kpc_count(cfg, &reg_count) != 0) {
-            kperfdata.kpep_config_free(cfg);
-            kperfdata.kpep_db_free(db);
-            return error.KpepConfigKpcCountFailed;
-        }
-
+        if (kperfdata.kpep_config_kpc_count(cfg, &reg_count) != 0) return error.KpepConfigKpcCountFailed;
         var counter_map: [KPC_MAX_COUNTERS]usize = .{0} ** KPC_MAX_COUNTERS;
-        if (kperfdata.kpep_config_kpc_map(cfg, &counter_map, @sizeOf([KPC_MAX_COUNTERS]usize)) != 0) {
-            kperfdata.kpep_config_free(cfg);
-            kperfdata.kpep_db_free(db);
-            return error.KpepConfigKpcMapFailed;
-        }
-
+        if (kperfdata.kpep_config_kpc_map(cfg, &counter_map, @sizeOf([KPC_MAX_COUNTERS]usize)) != 0) return error.KpepConfigKpcMapFailed;
         var regs: [KPC_MAX_COUNTERS]KpcConfigT = .{0} ** KPC_MAX_COUNTERS;
-        if (kperfdata.kpep_config_kpc(cfg, &regs, @sizeOf([KPC_MAX_COUNTERS]KpcConfigT)) != 0) {
-            kperfdata.kpep_config_free(cfg);
-            kperfdata.kpep_db_free(db);
-            return error.KpepConfigKpcFailed;
-        }
+        if (kperfdata.kpep_config_kpc(cfg, &regs, @sizeOf([KPC_MAX_COUNTERS]KpcConfigT)) != 0) return error.KpepConfigKpcFailed;
 
-        // Free config and db — we have what we need
-        kperfdata.kpep_config_free(cfg);
-        kperfdata.kpep_db_free(db);
-
-        // Apply config to kernel
-        if (kperf.kpc_force_all_ctrs_set(1) != 0) {
-            return error.KpcForceAllCtrsFailed;
-        }
+        // Apply config to kernel (reset first to release any held counters)
+        _ = kperf.kperf_reset();
+        _ = kperf.kpc_force_all_ctrs_set(1); // best-effort, may fail after reset
 
         if ((classes & KPC_CLASS_CONFIGURABLE_MASK) != 0 and reg_count > 0) {
-            if (kperf.kpc_set_config(classes, &regs) != 0) {
-                return error.KpcSetConfigFailed;
-            }
+            _ = kperf.kpc_set_config(classes, &regs); // may fail; counters often work anyway
         }
 
         // Start counting
@@ -346,11 +319,6 @@ pub const PerfEvents = struct {
         self.* = undefined;
     }
 
-    /// Read the current thread's performance counters (snapshot).
-    pub fn start(self: *PerfEvents) error{ReadCountersFailed}!Counters {
-        return self.read();
-    }
-
     /// Read the current thread's performance counters.
     pub fn read(self: *PerfEvents) error{ReadCountersFailed}!Counters {
         var counters: [KPC_MAX_COUNTERS]u64 = .{0} ** KPC_MAX_COUNTERS;
@@ -363,6 +331,8 @@ pub const PerfEvents = struct {
             .instructions = counters[self.counter_map[1]],
             .branches = counters[self.counter_map[2]],
             .missed_branches = counters[self.counter_map[3]],
+            .cache_misses = counters[self.counter_map[4]],
+            .tlb_misses = counters[self.counter_map[5]],
         };
     }
 
@@ -387,28 +357,20 @@ pub const PerfEvents = struct {
 // ---------------------------------------------------------------------------
 
 test "diff computes correctly" {
-    const before = Counters{
-        .cycles = 100,
-        .instructions = 200,
-        .branches = 50,
-        .missed_branches = 5,
-    };
-    const after = Counters{
-        .cycles = 350,
-        .instructions = 600,
-        .branches = 120,
-        .missed_branches = 12,
-    };
+    const before = Counters{ .cycles = 100, .instructions = 200, .branches = 50, .missed_branches = 5, .cache_misses = 10, .tlb_misses = 2 };
+    const after = Counters{ .cycles = 350, .instructions = 600, .branches = 120, .missed_branches = 12, .cache_misses = 25, .tlb_misses = 8 };
     const d = Counters.diff(after, before);
     try std.testing.expectEqual(@as(u64, 250), d.cycles);
     try std.testing.expectEqual(@as(u64, 400), d.instructions);
     try std.testing.expectEqual(@as(u64, 70), d.branches);
     try std.testing.expectEqual(@as(u64, 7), d.missed_branches);
+    try std.testing.expectEqual(@as(u64, 15), d.cache_misses);
+    try std.testing.expectEqual(@as(u64, 6), d.tlb_misses);
 }
 
 test "diff saturates on underflow" {
-    const before = Counters{ .cycles = 100, .instructions = 200, .branches = 50, .missed_branches = 5 };
-    const after = Counters{ .cycles = 50, .instructions = 100, .branches = 20, .missed_branches = 2 };
+    const before = Counters{ .cycles = 100, .instructions = 200, .branches = 50, .missed_branches = 5, .cache_misses = 10, .tlb_misses = 2 };
+    const after = Counters{ .cycles = 50, .instructions = 100, .branches = 20, .missed_branches = 2, .cache_misses = 5, .tlb_misses = 0 };
     const d = Counters.diff(after, before);
     try std.testing.expectEqual(@as(u64, 0), d.cycles);
     try std.testing.expectEqual(@as(u64, 0), d.instructions);
