@@ -46,6 +46,9 @@ Examples:
 # In-process loop microbench only
 python3 bench/eventloop_microbench.py --json-out bench/results/eventloop_microbench.json
 
+# Isolated provider microbench checkpoint
+python3 bench/eventloop_regression_check.py --json-out bench/results/eventloop_regression.json
+
 # HTTP async-route benchmark only
 python3 bench/eventloop_http_bench.py --duration 15s --connections 256 --providers snek,uvloop
 
@@ -70,6 +73,11 @@ comparison yet. `snek.loop` does not expose the socket/server APIs needed to
 run the same `streams` / `protocol` / `sockets` workloads, so this benchmark is
 currently for `uvloop` versus stdlib `asyncio`, matching uvloop's published
 benchmark categories more closely.
+
+For quick regression tracking on macOS, prefer
+`bench/eventloop_regression_check.py`. It runs each provider in a separate
+subprocess so `snek.loop`'s `asyncio` monkeypatching does not contaminate the
+`asyncio` and `uvloop` control measurements.
 
 ## Methodology
 
