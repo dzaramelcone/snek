@@ -7,12 +7,24 @@ Upstream event-loop conformance suite for snek's future Python loop runtime.
 - uvloop `tests/test_base.py` at commit `a308f75ff8f133262d234e87b1263dd1571894c2`
 - CPython `Lib/test/test_asyncio/test_pep492.py` at commit `1fd66eadd258223a0e3446b5b23ff2303294112c`
 - CPython `Lib/test/test_asyncio/test_tasks.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_locks.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_queues.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_futures.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_timeouts.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_taskgroups.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_waitfor.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_context.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_runners.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_threads.py` from the local Python 3.14 stdlib
+- CPython `Lib/test/test_asyncio/test_eager_task_factory.py` from the local Python 3.14 stdlib
 
 These are not original snek tests. The local files keep the upstream test
 bodies and add only the minimum harness needed to point them at `snek.loop`.
 Some CPython task tests that depend on `TestLoop` time-generator support are
 currently skipped for `snek`, since the runtime does not provide that harness
-yet.
+yet. CPython `test_events.py` was evaluated separately, but is not part of this
+suite as-is because it mostly targets explicit stdlib selector loop classes
+rather than a policy-pluggable custom loop like `snek.loop`.
 
 The suite also includes a small local ownership test that pins the current
 runtime contract: `snek.loop` owns asyncio for the life of an active snek loop,

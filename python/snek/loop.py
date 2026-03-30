@@ -27,6 +27,10 @@ _ORIG_TASKS_GATHER = asyncio.tasks.gather
 _ORIG_NEW_EVENT_LOOP = asyncio.new_event_loop
 _ORIG_SET_EVENT_LOOP = asyncio.set_event_loop
 _ORIG_SET_EVENT_LOOP_POLICY = asyncio.set_event_loop_policy
+_ORIG_CREATE_EAGER_TASK_FACTORY = getattr(asyncio, "create_eager_task_factory", _MISSING)
+_ORIG_TASKS_CREATE_EAGER_TASK_FACTORY = getattr(asyncio.tasks, "create_eager_task_factory", _MISSING)
+_ORIG_EAGER_TASK_FACTORY = getattr(asyncio, "eager_task_factory", _MISSING)
+_ORIG_TASKS_EAGER_TASK_FACTORY = getattr(asyncio.tasks, "eager_task_factory", _MISSING)
 _GATHERING_FUTURE = getattr(asyncio.tasks, "_GatheringFuture", None)
 _FUTURE_ADD_TO_AWAITED_BY = getattr(asyncio.futures, "future_add_to_awaited_by", None)
 _FUTURE_DISCARD_FROM_AWAITED_BY = getattr(asyncio.futures, "future_discard_from_awaited_by", None)
@@ -284,6 +288,19 @@ def _patched_set_event_loop_policy(policy) -> None:
     _ORIG_SET_EVENT_LOOP_POLICY(policy)
 
 
+def _patched_create_eager_task_factory(custom_task_constructor):
+    def factory(loop, coro, *, eager_start=True, **kwargs):
+        return custom_task_constructor(
+            coro, loop=loop, eager_start=eager_start, **kwargs
+        )
+
+    return factory
+
+
+def _patched_eager_task_factory(loop, coro, *, eager_start=True, **kwargs):
+    return asyncio.Task(coro, loop=loop, eager_start=eager_start, **kwargs)
+
+
 def _install_asyncio_shims() -> None:
     global _ACTIVE_SNEK_LOOPS, _SHIMS_INSTALLED
     if _ACTIVE_SNEK_LOOPS == 0:
@@ -314,6 +331,14 @@ def _install_asyncio_shims() -> None:
     asyncio.events.set_event_loop = _patched_set_event_loop
     asyncio.set_event_loop_policy = _patched_set_event_loop_policy
     asyncio.events.set_event_loop_policy = _patched_set_event_loop_policy
+    if _ORIG_CREATE_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.create_eager_task_factory = _patched_create_eager_task_factory
+    if _ORIG_TASKS_CREATE_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.tasks.create_eager_task_factory = _patched_create_eager_task_factory
+    if _ORIG_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.eager_task_factory = _patched_eager_task_factory
+    if _ORIG_TASKS_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.tasks.eager_task_factory = _patched_eager_task_factory
 
     _SHIMS_INSTALLED = True
 
@@ -348,6 +373,14 @@ def _restore_asyncio_shims() -> None:
     asyncio.events.set_event_loop = _ORIG_SET_EVENT_LOOP
     asyncio.set_event_loop_policy = _ORIG_SET_EVENT_LOOP_POLICY
     asyncio.events.set_event_loop_policy = _ORIG_SET_EVENT_LOOP_POLICY
+    if _ORIG_CREATE_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.create_eager_task_factory = _ORIG_CREATE_EAGER_TASK_FACTORY
+    if _ORIG_TASKS_CREATE_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.tasks.create_eager_task_factory = _ORIG_TASKS_CREATE_EAGER_TASK_FACTORY
+    if _ORIG_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.eager_task_factory = _ORIG_EAGER_TASK_FACTORY
+    if _ORIG_TASKS_EAGER_TASK_FACTORY is not _MISSING:
+        asyncio.tasks.eager_task_factory = _ORIG_TASKS_EAGER_TASK_FACTORY
 
     _SHIMS_INSTALLED = False
 
@@ -360,7 +393,10 @@ def current_task(loop=None):
             return _stdlib_current_task()
     handle = getattr(loop, "_handle", None)
     if isinstance(loop, EventLoop) and handle is not None:
-        return _snek.loop_current_task(handle)
+        task = _snek.loop_current_task(handle)
+        if task is not None:
+            return task
+        return _stdlib_current_task(loop=loop)
     return _stdlib_current_task(loop=loop)
 
 
@@ -372,7 +408,11 @@ def all_tasks(loop=None):
             return _stdlib_all_tasks()
     handle = getattr(loop, "_handle", None)
     if isinstance(loop, EventLoop) and handle is not None:
-        return _snek.loop_all_tasks(handle)
+        native_tasks = _snek.loop_all_tasks(handle)
+        stdlib_tasks = _stdlib_all_tasks(loop=loop)
+        if stdlib_tasks:
+            native_tasks.update(stdlib_tasks)
+        return native_tasks
     return _stdlib_all_tasks(loop=loop)
 
 
@@ -511,6 +551,7 @@ class EventLoop(asyncio.AbstractEventLoop):
         _install_asyncio_shims()
         try:
             self._handle = _snek.loop_new()
+            self.set_debug(asyncio.coroutines._is_debug_mode())
         except Exception:
             _restore_asyncio_shims()
             raise
@@ -681,10 +722,16 @@ class EventLoop(asyncio.AbstractEventLoop):
         self._exception_handler = handler
 
     def _cancel_handle(self, slot: int) -> None:
-        _snek.loop_handle_cancel(self._handle, slot)
+        handle = self._handle
+        if handle is None:
+            return
+        _snek.loop_handle_cancel(handle, slot)
 
     def _handle_repr(self, slot: int):
-        return _snek.loop_handle_repr(self._handle, slot, self.get_debug())
+        handle = self._handle
+        if handle is None:
+            return None
+        return _snek.loop_handle_repr(handle, slot, self.get_debug())
 
     def _timer_handle_cancelled(self, handle) -> None:
         _ = handle

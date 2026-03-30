@@ -7,11 +7,12 @@ extern fn PyEval_SaveThread() ?*anyopaque;
 extern fn PyEval_RestoreThread(tstate: ?*anyopaque) void;
 
 pub const MAX_LOOPS: usize = 32;
-pub const MAX_READY: usize = 256;
+pub const MAX_READY: usize = 8192;
 pub const MAX_SCHEDULED: usize = 256;
 pub const MAX_HANDLES: usize = MAX_READY + MAX_SCHEDULED;
 pub const MAX_FUTURES: usize = 2048;
 pub const MAX_TASKS: usize = 1024;
+pub const MAX_HOST_YIELDS: usize = MAX_TASKS;
 pub const MAX_FUTURE_CALLBACKS: usize = 8192;
 pub const MAX_GATHERS: usize = 1024;
 pub const MAX_GATHER_LINKS: usize = 8192;
@@ -30,6 +31,8 @@ const invalid_task_id = std.math.maxInt(TaskId);
 const invalid_callback_id = std.math.maxInt(CallbackId);
 const invalid_gather_id = std.math.maxInt(GatherId);
 const invalid_gather_link_id = std.math.maxInt(GatherLinkId);
+const RequestConnId = u16;
+const invalid_request_conn_id = std.math.maxInt(RequestConnId);
 const loop_capsule_name: [*:0]const u8 = "snek.loop_slot";
 const vectorcall_offset: usize = @as(usize, c.PY_VECTORCALL_ARGUMENTS_OFFSET);
 const type_flags: c_ulong = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_BASETYPE;
@@ -52,7 +55,26 @@ pub const LoopError = ffi.PythonError || error{
     FutureCallbackPoolFull,
     GatherPoolFull,
     GatherLinkPoolFull,
+    HostYieldQueueFull,
     InvalidState,
+};
+
+pub const DriveResult = struct {
+    ran: usize,
+    ready_remaining: usize,
+    next_timer_ns: ?u64,
+};
+
+pub const HostYieldKind = enum(u8) {
+    redis,
+    pg,
+};
+
+pub const HostYieldRequest = struct {
+    kind: HostYieldKind,
+    task_token: TaskToken,
+    conn_idx: u16,
+    sentinel: *PyObject,
 };
 
 pub const TypeState = extern struct {
@@ -130,10 +152,12 @@ pub const NativeTaskSlot = extern struct {
     name: ?*PyObject = null,
     fut_waiter: ?*PyObject = null,
     step_exc: ?*PyObject = null,
+    step_value: ?*PyObject = null,
     wakeup_cb: ?*PyObject = null,
     must_cancel: bool = false,
     scheduled: bool = false,
     num_cancels_requested: u32 = 0,
+    request_conn_idx: RequestConnId = invalid_request_conn_id,
 };
 
 pub const NativeGatherSlot = extern struct {
@@ -155,6 +179,13 @@ pub const GatherLinkSlot = extern struct {
     next_in_gather: GatherLinkId = invalid_gather_link_id,
     gather_id: GatherId = invalid_gather_id,
     child_index: u32 = 0,
+};
+
+pub const HostYieldSlot = extern struct {
+    kind: HostYieldKind = .redis,
+    task_token: TaskToken = 0,
+    conn_idx: u16 = invalid_request_conn_id,
+    sentinel: ?*PyObject = null,
 };
 
 pub const ScheduledEntry = extern struct {
@@ -184,6 +215,8 @@ pub const LoopSlot = extern struct {
     free_callback_len: usize = 0,
     free_gather_len: usize = 0,
     free_gather_link_len: usize = 0,
+    host_yield_head: usize = 0,
+    host_yield_count: usize = 0,
     sequence: u64 = 0,
     start_ns: i64 = 0,
     type_state: ?*TypeState = null,
@@ -202,6 +235,7 @@ pub const LoopSlot = extern struct {
     free_gathers: [MAX_GATHERS]GatherId = .{invalid_gather_id} ** MAX_GATHERS,
     gather_links: [MAX_GATHER_LINKS]GatherLinkSlot = .{GatherLinkSlot{}} ** MAX_GATHER_LINKS,
     free_gather_links: [MAX_GATHER_LINKS]GatherLinkId = .{invalid_gather_link_id} ** MAX_GATHER_LINKS,
+    host_yields: [MAX_HOST_YIELDS]HostYieldSlot = .{HostYieldSlot{}} ** MAX_HOST_YIELDS,
 };
 
 const FutureObject = extern struct {
@@ -217,6 +251,12 @@ const FutureObject = extern struct {
     asyncio_future_blocking: bool = false,
     log_destroy_pending: bool = false,
     log_traceback: bool = false,
+    shadow_valid: bool = false,
+    shadow_state: FutureState = .pending,
+    shadow_result: ?*PyObject = null,
+    shadow_exception: ?*PyObject = null,
+    shadow_exception_tb: ?*PyObject = null,
+    shadow_cancel_message: ?*PyObject = null,
 };
 
 const TaskObject = extern struct {
@@ -296,6 +336,12 @@ var task_methods = [_]c.PyMethodDef{
     std.mem.zeroes(c.PyMethodDef),
 };
 
+var future_iter_methods = [_]c.PyMethodDef{
+    .{ .ml_name = "send", .ml_meth = @ptrCast(&futureIterSendMethod), .ml_flags = c.METH_O, .ml_doc = null },
+    .{ .ml_name = "throw", .ml_meth = @ptrCast(&futureIterThrowMethod), .ml_flags = c.METH_VARARGS, .ml_doc = null },
+    std.mem.zeroes(c.PyMethodDef),
+};
+
 var future_getset = [_]c.PyGetSetDef{
     .{ .name = "_asyncio_future_blocking", .get = futureBlockingGet, .set = futureBlockingSet, .doc = null, .closure = null },
     .{ .name = "_loop", .get = futureLoopAttrGet, .set = null, .doc = null, .closure = null },
@@ -325,6 +371,7 @@ var future_type_slots = [_]c.PyType_Slot{
     .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&futureDealloc)) },
     .{ .slot = c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&futureTraverse)) },
     .{ .slot = c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&futureClear)) },
+    .{ .slot = c.Py_tp_finalize, .pfunc = @ptrCast(@constCast(&futureFinalize)) },
     .{ .slot = c.Py_tp_repr, .pfunc = @ptrCast(@constCast(&futureRepr)) },
     .{ .slot = c.Py_tp_methods, .pfunc = &future_methods },
     .{ .slot = c.Py_tp_getset, .pfunc = &future_getset },
@@ -352,6 +399,7 @@ var task_type_slots = [_]c.PyType_Slot{
 
 var future_iter_type_slots = [_]c.PyType_Slot{
     .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&futureIterDealloc)) },
+    .{ .slot = c.Py_tp_methods, .pfunc = &future_iter_methods },
     .{ .slot = c.Py_tp_iter, .pfunc = @ptrCast(@constCast(&futureIterSelf)) },
     .{ .slot = c.Py_tp_iternext, .pfunc = @ptrCast(@constCast(&futureIterNext)) },
     .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&futureIterTypeNew)) },
@@ -506,6 +554,19 @@ pub fn createTaskObject(
     return createTaskObjectWithType(type_state, type_obj, handle_obj, loop_obj, coro, context, name, eager_start);
 }
 
+pub fn adoptStartedTaskObject(
+    type_state: *TypeState,
+    handle_obj: *PyObject,
+    loop_obj: *PyObject,
+    coro: *PyObject,
+    yielded: *PyObject,
+    context: ?*PyObject,
+    name: ?*PyObject,
+) LoopError!*PyObject {
+    const type_obj = type_state.task_type orelse return error.InvalidState;
+    return adoptStartedTaskObjectWithType(type_state, type_obj, handle_obj, loop_obj, coro, yielded, context, name);
+}
+
 fn createTaskObjectWithType(
     type_state: *TypeState,
     type_obj: *PyObject,
@@ -525,7 +586,7 @@ fn createTaskObjectWithType(
     initFutureObject(&self.future, type_state, handle_obj, loop_obj);
     self.future.native_kind = .task;
     self.future.log_destroy_pending = true;
-    try maybeInitSourceTraceback(&self.future, handle_obj);
+    try maybeInitTaskSourceTraceback(&self.future, handle_obj);
 
     const resolved_context = if (context) |ctx|
         if (!isNone(ctx)) blk: {
@@ -538,6 +599,52 @@ fn createTaskObjectWithType(
     try initTaskName(self, type_state, name);
 
     self.task_token = try newTask(handle_obj, loop_obj, taskPy(self), coro, resolved_context, self.name, eager_start);
+    if (self.name) |task_name| {
+        ffi.decref(task_name);
+        self.name = null;
+    }
+    return taskPy(self);
+}
+
+fn adoptStartedTaskObjectWithType(
+    type_state: *TypeState,
+    type_obj: *PyObject,
+    handle_obj: *PyObject,
+    loop_obj: *PyObject,
+    coro: *PyObject,
+    yielded: *PyObject,
+    context: ?*PyObject,
+    name: ?*PyObject,
+) LoopError!*PyObject {
+    if (!(try isCoroutineObject(type_state, coro))) {
+        _ = c.PyErr_Format(c.PyExc_TypeError, "a coroutine was expected, got %R", coro);
+        return error.PythonError;
+    }
+
+    const self = try allocHeapObject(TaskObject, type_obj);
+    errdefer destroyTaskObject(self);
+    initFutureObject(&self.future, type_state, handle_obj, loop_obj);
+    self.future.native_kind = .task;
+    self.future.log_destroy_pending = true;
+    try maybeInitTaskSourceTraceback(&self.future, handle_obj);
+
+    const resolved_context = if (context) |ctx|
+        if (!isNone(ctx)) blk: {
+            ffi.incref(ctx);
+            break :blk ctx;
+        } else try currentContext()
+    else
+        try currentContext();
+    defer ffi.decref(resolved_context);
+    try initTaskName(self, type_state, name);
+
+    const slot = try slotFromCapsule(handle_obj);
+    const task_id = try allocTask(handle_obj, slot, loop_obj, taskPy(self), coro, resolved_context, self.name, null);
+    errdefer releaseTask(slot, task_id);
+    self.task_token = tokenForTask(slot, task_id);
+
+    try handleTaskYielded(slot, task_id, yielded);
+
     if (self.name) |task_name| {
         ffi.decref(task_name);
         self.name = null;
@@ -563,11 +670,17 @@ fn initFutureObject(self: *FutureObject, type_state: *TypeState, handle_obj: *Py
     self.asyncio_future_blocking = false;
     self.log_destroy_pending = false;
     self.log_traceback = false;
+    self.shadow_valid = false;
+    self.shadow_state = .pending;
+    self.shadow_result = null;
+    self.shadow_exception = null;
+    self.shadow_exception_tb = null;
+    self.shadow_cancel_message = null;
     ffi.incref(handle_obj);
     ffi.incref(loop_obj);
 }
 
-fn maybeInitSourceTraceback(self: *FutureObject, handle_obj: *PyObject) LoopError!void {
+fn maybeInitSourceTracebackDepth(self: *FutureObject, handle_obj: *PyObject, depth_value: c_long) LoopError!void {
     const slot = try slotFromCapsule(handle_obj);
     if (!slot.debug) return;
 
@@ -575,7 +688,7 @@ fn maybeInitSourceTraceback(self: *FutureObject, handle_obj: *PyObject) LoopErro
     defer ffi.decref(sys_mod);
     const getframe_fn = try getAttrRaw(sys_mod, "_getframe");
     defer ffi.decref(getframe_fn);
-    const depth = try ffi.longFromLong(1);
+    const depth = try ffi.longFromLong(depth_value);
     defer ffi.decref(depth);
     const frame = try callCallableOneArg(getframe_fn, depth);
     defer ffi.decref(frame);
@@ -585,6 +698,46 @@ fn maybeInitSourceTraceback(self: *FutureObject, handle_obj: *PyObject) LoopErro
     const extract_stack_fn = try getAttrRaw(helpers_mod, "extract_stack");
     defer ffi.decref(extract_stack_fn);
     self.source_traceback = try callCallableOneArg(extract_stack_fn, frame);
+}
+
+fn maybeInitSourceTraceback(self: *FutureObject, handle_obj: *PyObject) LoopError!void {
+    // Native Future constructors don't add a Python frame of their own, so
+    // depth 0 is the visible Python caller.
+    try maybeInitSourceTracebackDepth(self, handle_obj, 0);
+}
+
+fn maybeInitTaskSourceTraceback(self: *FutureObject, handle_obj: *PyObject) LoopError!void {
+    // _snek.task_new is called from EventLoop.create_task(), and CPython omits
+    // that helper frame from Task._source_traceback.
+    try maybeInitSourceTracebackDepth(self, handle_obj, 1);
+}
+
+fn raiseAsyncioInvalidStateError(message: [*:0]const u8) LoopError {
+    const excs = try importModuleRaw("asyncio.exceptions");
+    defer ffi.decref(excs);
+    const invalid = try getAttrRaw(excs, "InvalidStateError");
+    defer ffi.decref(invalid);
+    c.PyErr_SetString(invalid, message);
+    return error.PythonError;
+}
+
+fn normalizeFutureException(exc: *PyObject) LoopError!*PyObject {
+    if (c.PyErr_GivenExceptionMatches(exc, c.PyExc_StopIteration) == 0) {
+        ffi.incref(exc);
+        return exc;
+    }
+
+    const message = try ffi.unicodeFromString(
+        "StopIteration interacts badly with generators and cannot be raised into a Future",
+    );
+    defer ffi.decref(message);
+
+    const wrapped = try callCallableOneArg(c.PyExc_RuntimeError, message);
+    ffi.incref(exc);
+    c.PyException_SetCause(wrapped, exc);
+    ffi.incref(exc);
+    c.PyException_SetContext(wrapped, exc);
+    return wrapped;
 }
 
 fn bindFutureObject(self: *FutureObject, type_state: *TypeState, handle_obj: *PyObject, loop_obj: *PyObject) LoopError!void {
@@ -624,6 +777,64 @@ fn ensureFutureTypeState(self: *FutureObject) LoopError!*TypeState {
         }
     }
     return error.InvalidState;
+}
+
+fn activeFutureCore(self: *FutureObject) LoopError!?*FutureCore {
+    if (self.loop_handle == null or !futureHasBacking(self)) return null;
+    return futureCore(self) catch |err| switch (err) {
+        error.InvalidLoopHandle, error.InvalidState => null,
+        else => return err,
+    };
+}
+
+fn futureResultShadow(self: *FutureObject) LoopError!*PyObject {
+    switch (self.shadow_state) {
+        .pending => {
+            const excs = try importModuleRaw("asyncio.exceptions");
+            defer ffi.decref(excs);
+            const invalid = try getAttrRaw(excs, "InvalidStateError");
+            defer ffi.decref(invalid);
+            c.PyErr_SetString(invalid, "Result is not set.");
+            return error.PythonError;
+        },
+        .cancelled => {
+            const cancelled = try makeCancelledError(self.shadow_cancel_message);
+            return raiseStoredException(cancelled, null);
+        },
+        .finished => {
+            if (self.shadow_exception) |exc| {
+                ffi.incref(exc);
+                return raiseStoredException(exc, self.shadow_exception_tb);
+            }
+            const result = self.shadow_result orelse return ffi.getNone();
+            ffi.incref(result);
+            return result;
+        },
+    }
+}
+
+fn futureExceptionShadow(self: *FutureObject) LoopError!*PyObject {
+    switch (self.shadow_state) {
+        .pending => {
+            const excs = try importModuleRaw("asyncio.exceptions");
+            defer ffi.decref(excs);
+            const invalid = try getAttrRaw(excs, "InvalidStateError");
+            defer ffi.decref(invalid);
+            c.PyErr_SetString(invalid, "Exception is not set.");
+            return error.PythonError;
+        },
+        .cancelled => {
+            const cancelled = try makeCancelledError(self.shadow_cancel_message);
+            return raiseStoredException(cancelled, null);
+        },
+        .finished => {
+            if (self.shadow_exception) |exc| {
+                ffi.incref(exc);
+                return exc;
+            }
+            return ffi.getNone();
+        },
+    }
 }
 
 fn destroyFutureObject(self: *FutureObject) void {
@@ -767,6 +978,24 @@ fn clearFutureRefs(self: *FutureObject) void {
         ffi.decref(obj);
         self.loop_handle = null;
     }
+    if (self.shadow_result) |obj| {
+        ffi.decref(obj);
+        self.shadow_result = null;
+    }
+    if (self.shadow_exception) |obj| {
+        ffi.decref(obj);
+        self.shadow_exception = null;
+    }
+    if (self.shadow_exception_tb) |obj| {
+        ffi.decref(obj);
+        self.shadow_exception_tb = null;
+    }
+    if (self.shadow_cancel_message) |obj| {
+        ffi.decref(obj);
+        self.shadow_cancel_message = null;
+    }
+    self.shadow_valid = false;
+    self.shadow_state = .pending;
     self.type_state = null;
 }
 
@@ -828,15 +1057,75 @@ fn freeTaskBacking(self: *TaskObject) void {
     self.task_token = 0;
 }
 
+fn logFutureExceptionUnretrieved(self: *FutureObject, obj: *PyObject) void {
+    if (!self.log_traceback) return;
+    self.log_traceback = false;
+
+    const exception_obj, const tb_obj = blk: {
+        if (activeFutureCore(self) catch null) |core| {
+            break :blk .{ core.exception, core.exception_tb };
+        }
+        if (self.shadow_valid) {
+            break :blk .{ self.shadow_exception, self.shadow_exception_tb };
+        }
+        break :blk .{ null, null };
+    };
+
+    const exc = exception_obj orelse return;
+    const loop_obj = self.loop_obj orelse return;
+
+    const had_err = ffi.errOccurred();
+    const saved_err = if (had_err) fetchPyError() else SavedPyError{};
+    defer if (had_err) restorePyError(saved_err);
+
+    const ctx = ffi.dictNew() catch {
+        if (ffi.errOccurred()) ffi.errClear();
+        return;
+    };
+    defer ffi.decref(ctx);
+
+    const tp: *c.PyTypeObject = @ptrCast(@alignCast(self.ob_base.ob_type));
+    const tp_name = std.mem.span(tp.tp_name);
+    const short_name = if (std.mem.lastIndexOfScalar(u8, tp_name, '.')) |idx| tp_name[idx + 1 ..] else tp_name;
+    var message_buf: [256:0]u8 = undefined;
+    const message_z = std.fmt.bufPrintZ(&message_buf, "{s} exception was never retrieved", .{short_name}) catch return;
+    const message = ffi.unicodeFromString(message_z.ptr) catch {
+        if (ffi.errOccurred()) ffi.errClear();
+        return;
+    };
+    defer ffi.decref(message);
+
+    _ = c.PyDict_SetItemString(ctx, "message", message);
+    _ = c.PyDict_SetItemString(ctx, "exception", exc);
+    _ = c.PyDict_SetItemString(ctx, "future", obj);
+    if (self.source_traceback) |traceback_obj| {
+        _ = c.PyDict_SetItemString(ctx, "source_traceback", traceback_obj);
+    }
+
+    const res = callMethodOneArg(loop_obj, "call_exception_handler", ctx) catch {
+        if (ffi.errOccurred()) ffi.errPrint();
+        return;
+    };
+    ffi.decref(res);
+    _ = tb_obj;
+}
+
 fn futureDealloc(self_obj: ?*PyObject) callconv(.c) void {
     const obj = self_obj orelse return;
     const self = futureObjectFromPy(obj);
+    if (c.PyObject_CallFinalizerFromDealloc(obj) < 0) return;
     c.PyObject_GC_UnTrack(obj);
     c.PyObject_ClearWeakRefs(obj);
     freeFutureBacking(self);
     clearFutureRefs(self);
     const tp: *c.PyTypeObject = @ptrCast(self.ob_base.ob_type);
     tp.tp_free.?(@ptrCast(self));
+}
+
+fn futureFinalize(self_obj: ?*PyObject) callconv(.c) void {
+    const obj = self_obj orelse return;
+    const self = futureObjectFromPy(obj);
+    logFutureExceptionUnretrieved(self, obj);
 }
 
 fn taskDealloc(self_obj: ?*PyObject) callconv(.c) void {
@@ -899,6 +1188,10 @@ fn futureTraverse(self_obj: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) ca
     if (visitPyObj(visit, arg, self.loop_obj) != 0) return -1;
     if (visitPyObj(visit, arg, self.source_traceback) != 0) return -1;
     if (visitPyObj(visit, arg, self.cancelled_exc) != 0) return -1;
+    if (visitPyObj(visit, arg, self.shadow_result) != 0) return -1;
+    if (visitPyObj(visit, arg, self.shadow_exception) != 0) return -1;
+    if (visitPyObj(visit, arg, self.shadow_exception_tb) != 0) return -1;
+    if (visitPyObj(visit, arg, self.shadow_cancel_message) != 0) return -1;
 
     const slot = if (self.loop_handle) |handle| slotFromCapsule(handle) catch return 0 else return 0;
     const core = futureCore(self) catch return 0;
@@ -930,6 +1223,7 @@ fn taskTraverse(self_obj: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) call
     if (visitPyObj(visit, arg, task.name) != 0) return -1;
     if (visitPyObj(visit, arg, task.fut_waiter) != 0) return -1;
     if (visitPyObj(visit, arg, task.step_exc) != 0) return -1;
+    if (visitPyObj(visit, arg, task.step_value) != 0) return -1;
     if (visitPyObj(visit, arg, task.wakeup_cb) != 0) return -1;
     return 0;
 }
@@ -1203,9 +1497,7 @@ fn futureIterDealloc(self_obj: ?*PyObject) callconv(.c) void {
     tp.tp_free.?(@ptrCast(self));
 }
 
-fn futureIterNext(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
-    const obj = self_obj orelse return null;
-    const self: *FutureIterObject = @ptrCast(@alignCast(obj));
+fn futureIterAdvance(self: *FutureIterObject, sent_value: ?*PyObject) ?*PyObject {
     const future_obj = self.future orelse return null;
     const future = futureObjectFromPy(future_obj);
     const core = futureCore(future) catch |err| {
@@ -1214,6 +1506,12 @@ fn futureIterNext(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
     };
     const done = core.state != .pending;
     if (!self.yielded and !done) {
+        if (sent_value) |value| {
+            if (!isNone(value)) {
+                c.PyErr_SetString(c.PyExc_TypeError, "can't send non-None value to a just-started future iterator");
+                return null;
+            }
+        }
         future.asyncio_future_blocking = true;
         self.yielded = true;
         ffi.incref(future_obj);
@@ -1230,9 +1528,87 @@ fn futureIterNext(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
     else
         futureResultObject(core) catch null;
     if (result == null) return null;
-    defer ffi.decref(result.?);
-    c.PyErr_SetObject(c.PyExc_StopIteration, result.?);
+    const stop_exc = callCallableOneArg(c.PyExc_StopIteration, result.?) catch {
+        ffi.decref(result.?);
+        return null;
+    };
+    ffi.decref(result.?);
+    c.PyErr_SetRaisedException(stop_exc);
     return null;
+}
+
+fn futureIterNext(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
+    const obj = self_obj orelse return null;
+    const self: *FutureIterObject = @ptrCast(@alignCast(obj));
+    return futureIterAdvance(self, ffi.getNone());
+}
+
+fn futureIterSendMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
+    const obj = self_obj orelse return null;
+    const self: *FutureIterObject = @ptrCast(@alignCast(obj));
+    return futureIterAdvance(self, arg orelse ffi.getNone());
+}
+
+fn futureIterThrowMethod(self_obj: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    _ = self_obj;
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "throw expected at least 1 argument, got 0");
+        return null;
+    };
+    if (!ffi.isTuple(tuple)) {
+        c.PyErr_SetString(c.PyExc_TypeError, "throw arguments must be a tuple");
+        return null;
+    }
+
+    const nargs = ffi.tupleSize(tuple);
+    if (nargs < 1 or nargs > 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "throw expected 1 to 3 arguments");
+        return null;
+    }
+
+    const typ = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const val = if (nargs >= 2) ffi.tupleGetItem(tuple, 1) else null;
+    const tb = if (nargs >= 3) ffi.tupleGetItem(tuple, 2) else null;
+
+    if (nargs == 3) {
+        if (c.PyErr_WarnEx(c.PyExc_DeprecationWarning, "the (type, exc, tb) signature of throw() is deprecated", 1) < 0) {
+            return null;
+        }
+    }
+    if (tb) |traceback| {
+        if (!isNone(traceback) and c.PyTraceBack_Check(traceback) == 0) {
+            c.PyErr_SetString(c.PyExc_TypeError, "throw() third argument must be a traceback object");
+            return null;
+        }
+    }
+
+    var raise_obj: ?*PyObject = null;
+    if (c.PyExceptionInstance_Check(typ) != 0) {
+        if (nargs != 1) {
+            c.PyErr_SetString(c.PyExc_TypeError, "instance exception may not have a separate value");
+            return null;
+        }
+        ffi.incref(typ);
+        raise_obj = typ;
+    } else if (c.PyExceptionClass_Check(typ)) {
+        if (val) |exc_val| {
+            if (isNone(exc_val)) {
+                raise_obj = callCallableNoArgs(typ) catch return null;
+            } else if (c.PyExceptionInstance_Check(exc_val) != 0) {
+                ffi.incref(exc_val);
+                raise_obj = exc_val;
+            } else {
+                raise_obj = callCallableOneArg(typ, exc_val) catch return null;
+            }
+        } else {
+            raise_obj = callCallableNoArgs(typ) catch return null;
+        }
+    } else {
+        c.PyErr_SetString(c.PyExc_TypeError, "exceptions must be classes or instances deriving from BaseException");
+        return null;
+    }
+    const exc = raise_obj orelse return null;
+    return raiseStoredException(exc, if (tb) |traceback| if (!isNone(traceback)) traceback else null else null) catch null;
 }
 
 fn tryFutureHandle(self: *FutureObject) *PyObject {
@@ -1262,7 +1638,7 @@ fn taskRepr(self_obj: ?*PyObject) callconv(.c) ?*PyObject {
 fn futureGetLoopMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
     const loop_obj = self.loop_obj orelse {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "future loop is not available");
+        c.PyErr_SetString(c.PyExc_RuntimeError, "Future object is not initialized.");
         return null;
     };
     ffi.incref(loop_obj);
@@ -1271,7 +1647,12 @@ fn futureGetLoopMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObj
 
 fn futureCancelMethod(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    if (self.loop_handle == null or !futureHasBacking(self)) return ffi.boolFromBool(false);
+    self.log_traceback = false;
+    if (self.loop_handle == null or !futureHasBacking(self)) {
+        if (self.shadow_valid) return ffi.boolFromBool(false);
+        c.PyErr_SetString(c.PyExc_RuntimeError, "Future object is not initialized.");
+        return null;
+    }
     const msg = parseOptionalMessageArg(args, kwargs) catch return null;
     const cancelled = switch (self.native_kind) {
         .task => taskCancel(tryFutureHandle(self), taskObjectFromFuture(self).task_token, msg),
@@ -1290,28 +1671,39 @@ fn futureMakeCancelledErrorMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(
 
 fn futureCancelledMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    if (self.loop_handle == null or !futureHasBacking(self)) return ffi.boolFromBool(false);
-    const core = futureCore(self) catch |err| {
+    const core = activeFutureCore(self) catch |err| {
         if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
         return null;
     };
-    return ffi.boolFromBool(core.state == .cancelled);
+    if (core) |active| return ffi.boolFromBool(active.state == .cancelled);
+    if (self.shadow_valid) return ffi.boolFromBool(self.shadow_state == .cancelled);
+    return ffi.boolFromBool(false);
 }
 
 fn futureDoneMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    if (self.loop_handle == null or !futureHasBacking(self)) return ffi.boolFromBool(false);
-    const core = futureCore(self) catch |err| {
+    const core = activeFutureCore(self) catch |err| {
         if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
         return null;
     };
-    return ffi.boolFromBool(core.state != .pending);
+    if (core) |active| return ffi.boolFromBool(active.state != .pending);
+    if (self.shadow_valid) return ffi.boolFromBool(self.shadow_state != .pending);
+    return ffi.boolFromBool(false);
 }
 
 fn futureResultMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
     self.log_traceback = false;
-    if (self.loop_handle == null or !futureHasBacking(self)) {
+    const core = activeFutureCore(self) catch |err| {
+        if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+        return null;
+    };
+    if (core) |active| {
+        if (active.state == .cancelled) return raiseCancelledFromFuture(self);
+        return futureResultObject(active) catch null;
+    }
+    if (self.shadow_valid) return futureResultShadow(self) catch null;
+    {
         const excs = importModuleRaw("asyncio.exceptions") catch return null;
         defer ffi.decref(excs);
         const invalid = getAttrRaw(excs, "InvalidStateError") catch return null;
@@ -1319,15 +1711,21 @@ fn futureResultMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObje
         c.PyErr_SetString(invalid, "Result is not set.");
         return null;
     }
-    const core = futureCore(self) catch return null;
-    if (core.state == .cancelled) return raiseCancelledFromFuture(self);
-    return futureResultObject(core) catch null;
 }
 
 fn futureExceptionMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
     self.log_traceback = false;
-    if (self.loop_handle == null or !futureHasBacking(self)) {
+    const core = activeFutureCore(self) catch |err| {
+        if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+        return null;
+    };
+    if (core) |active| {
+        if (active.state == .cancelled) return raiseCancelledFromFuture(self);
+        return futureExceptionObject(active) catch null;
+    }
+    if (self.shadow_valid) return futureExceptionShadow(self) catch null;
+    {
         const excs = importModuleRaw("asyncio.exceptions") catch return null;
         defer ffi.decref(excs);
         const invalid = getAttrRaw(excs, "InvalidStateError") catch return null;
@@ -1335,14 +1733,16 @@ fn futureExceptionMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyO
         c.PyErr_SetString(invalid, "Exception is not set.");
         return null;
     }
-    const core = futureCore(self) catch return null;
-    if (core.state == .cancelled) return raiseCancelledFromFuture(self);
-    return futureExceptionObject(core) catch null;
 }
 
 fn futureAddDoneCallbackMethod(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
     const obj = self_obj orelse return null;
     const self = futureObjectFromPy(obj);
+    if (self.loop_handle == null or !futureHasBacking(self)) {
+        if (self.shadow_valid) return ffi.getNone();
+        c.PyErr_SetString(c.PyExc_RuntimeError, "Future object is not initialized.");
+        return null;
+    }
     const tuple = args orelse {
         c.PyErr_SetString(c.PyExc_TypeError, "add_done_callback() missing callback");
         return null;
@@ -1357,10 +1757,6 @@ fn futureAddDoneCallbackMethod(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?
         return null;
     }
     const callback = ffi.tupleGetItem(tuple, 0) orelse return null;
-    if (!ffi.isCallable(callback)) {
-        c.PyErr_SetString(c.PyExc_TypeError, "callback must be callable");
-        return null;
-    }
 
     var context: ?*PyObject = if (nargs == 2) ffi.tupleGetItem(tuple, 1) else null;
     if (kwargs) |kw| {
@@ -1409,6 +1805,11 @@ fn futureAddDoneCallbackMethod(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?
 
 fn futureRemoveDoneCallbackMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
+    if (self.loop_handle == null or !futureHasBacking(self)) {
+        if (self.shadow_valid) return ffi.longFromLong(0) catch null;
+        c.PyErr_SetString(c.PyExc_RuntimeError, "Future object is not initialized.");
+        return null;
+    }
     const callback = arg orelse {
         c.PyErr_SetString(c.PyExc_TypeError, "remove_done_callback() missing callback");
         return null;
@@ -1431,9 +1832,16 @@ fn futureRemoveDoneCallbackMethod(self_obj: ?*PyObject, arg: ?*PyObject) callcon
 fn futureSetResultMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
     const result = arg orelse return ffi.getNone();
+    if (self.loop_handle == null or !futureHasBacking(self)) {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "Future object is not initialized.");
+        return null;
+    }
     switch (self.native_kind) {
         .future => futureSetResult(tryFutureHandle(self), self.future_token, result) catch |err| {
-            if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+            if (!ffi.errOccurred()) switch (err) {
+                error.InvalidState => _ = raiseAsyncioInvalidStateError("invalid state") catch {},
+                else => c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err)),
+            };
             return null;
         },
         .task => {
@@ -1446,7 +1854,10 @@ fn futureSetResultMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*P
                 return null;
             };
             setFutureResultCore(slot, &task.core, result) catch |err| {
-                if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+                if (!ffi.errOccurred()) switch (err) {
+                    error.InvalidState => _ = raiseAsyncioInvalidStateError("invalid state") catch {},
+                    else => c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err)),
+                };
                 return null;
             };
         },
@@ -1460,6 +1871,10 @@ fn futureSetExceptionMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) 
         c.PyErr_SetString(c.PyExc_TypeError, "set_exception() missing exception");
         return null;
     };
+    if (self.loop_handle == null or !futureHasBacking(self)) {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "Future object is not initialized.");
+        return null;
+    }
     var owned_exc: ?*PyObject = null;
     defer if (owned_exc) |obj| ffi.decref(obj);
     if (c.PyType_Check(exc) != 0) {
@@ -1468,7 +1883,10 @@ fn futureSetExceptionMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) 
     }
     switch (self.native_kind) {
         .future => futureSetException(tryFutureHandle(self), self.future_token, exc) catch |err| {
-            if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+            if (!ffi.errOccurred()) switch (err) {
+                error.InvalidState => _ = raiseAsyncioInvalidStateError("invalid state") catch {},
+                else => c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err)),
+            };
             return null;
         },
         .task => {
@@ -1481,7 +1899,10 @@ fn futureSetExceptionMethod(self_obj: ?*PyObject, arg: ?*PyObject) callconv(.c) 
                 return null;
             };
             setFutureExceptionCore(slot, &task.core, exc, null) catch |err| {
-                if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+                if (!ffi.errOccurred()) switch (err) {
+                    error.InvalidState => _ = raiseAsyncioInvalidStateError("invalid state") catch {},
+                    else => c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err)),
+                };
                 return null;
             };
         },
@@ -1519,6 +1940,12 @@ fn taskSetExceptionMethod(_: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject 
 fn taskCancelMethod(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
     const self = taskObjectFromPy(self_obj orelse return null);
     const msg = parseOptionalMessageArg(args, kwargs) catch return null;
+    if ((activeFutureCore(&self.future) catch |err| {
+        if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+        return null;
+    }) == null) {
+        return ffi.boolFromBool(false);
+    }
     const cancelled = taskCancel(tryFutureHandle(&self.future), self.task_token, msg) catch |err| {
         if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
         return null;
@@ -1528,6 +1955,12 @@ fn taskCancelMethod(self_obj: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) 
 
 fn taskCancellingMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = taskObjectFromPy(self_obj orelse return null);
+    if ((activeFutureCore(&self.future) catch |err| {
+        if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+        return null;
+    }) == null) {
+        return ffi.longFromLong(0) catch null;
+    }
     const count = taskCancelling(tryFutureHandle(&self.future), self.task_token) catch |err| {
         if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
         return null;
@@ -1537,6 +1970,12 @@ fn taskCancellingMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyOb
 
 fn taskUncancelMethod(self_obj: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
     const self = taskObjectFromPy(self_obj orelse return null);
+    if ((activeFutureCore(&self.future) catch |err| {
+        if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+        return null;
+    }) == null) {
+        return ffi.longFromLong(0) catch null;
+    }
     const count = taskUncancel(tryFutureHandle(&self.future), self.task_token) catch |err| {
         if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
         return null;
@@ -1636,8 +2075,13 @@ fn takeCancelledError(self: *FutureObject) LoopError!*PyObject {
         self.cancelled_exc = null;
         return exc;
     }
-    const core = try futureCore(self);
-    return makeCancelledError(core.cancel_message);
+    if (try activeFutureCore(self)) |core| {
+        return makeCancelledError(core.cancel_message);
+    }
+    if (self.shadow_valid and self.shadow_state == .cancelled) {
+        return makeCancelledError(self.shadow_cancel_message);
+    }
+    return makeCancelledError(null);
 }
 
 fn getExceptionTraceback(exc: *PyObject) ?*PyObject {
@@ -1659,8 +2103,15 @@ fn raiseCancelledFromFuture(self: *FutureObject) ?*PyObject {
         defer if (tb) |obj| ffi.decref(obj);
         return raiseStoredException(exc, tb) catch null;
     }
-    const core = futureCore(self) catch return null;
-    const cancelled = makeCancelledError(core.cancel_message) catch return null;
+    if (activeFutureCore(self) catch null) |core| {
+        const cancelled = makeCancelledError(core.cancel_message) catch return null;
+        return raiseStoredException(cancelled, null) catch null;
+    }
+    if (self.shadow_valid and self.shadow_state == .cancelled) {
+        const cancelled = makeCancelledError(self.shadow_cancel_message) catch return null;
+        return raiseStoredException(cancelled, null) catch null;
+    }
+    const cancelled = makeCancelledError(null) catch return null;
     return raiseStoredException(cancelled, null) catch null;
 }
 
@@ -1687,8 +2138,9 @@ fn futureLoopAttrGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObje
 
 fn futureStateGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    const core = futureCore(self) catch return ffi.unicodeFromString("PENDING") catch null;
-    const state: [*:0]const u8 = switch (core.state) {
+    const maybe_core = activeFutureCore(self) catch return ffi.unicodeFromString("PENDING") catch null;
+    const state_value = if (maybe_core) |core| core.state else if (self.shadow_valid) self.shadow_state else .pending;
+    const state: [*:0]const u8 = switch (state_value) {
         .pending => "PENDING",
         .cancelled => "CANCELLED",
         .finished => "FINISHED",
@@ -1698,9 +2150,17 @@ fn futureStateGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject 
 
 fn futureResultAttrGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    const core = futureCore(self) catch return ffi.getNone();
-    if (core.state != .finished or core.exception != null) return ffi.getNone();
-    if (core.result) |obj| {
+    const maybe_core = activeFutureCore(self) catch return ffi.getNone();
+    if (maybe_core) |core| {
+        if (core.state != .finished or core.exception != null) return ffi.getNone();
+        if (core.result) |obj| {
+            ffi.incref(obj);
+            return obj;
+        }
+        return ffi.getNone();
+    }
+    if (!self.shadow_valid or self.shadow_state != .finished or self.shadow_exception != null) return ffi.getNone();
+    if (self.shadow_result) |obj| {
         ffi.incref(obj);
         return obj;
     }
@@ -1709,8 +2169,15 @@ fn futureResultAttrGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyOb
 
 fn futureExceptionAttrGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    const core = futureCore(self) catch return ffi.getNone();
-    if (core.exception) |obj| {
+    const maybe_core = activeFutureCore(self) catch return ffi.getNone();
+    if (maybe_core) |core| {
+        if (core.exception) |obj| {
+            ffi.incref(obj);
+            return obj;
+        }
+        return ffi.getNone();
+    }
+    if (self.shadow_exception) |obj| {
         ffi.incref(obj);
         return obj;
     }
@@ -1792,8 +2259,14 @@ fn futureLogTracebackSet(self_obj: ?*PyObject, value: ?*PyObject, _: ?*anyopaque
 
 fn futureCancelMessageGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
     const self = futureObjectFromPy(self_obj orelse return null);
-    const core = futureCore(self) catch return ffi.getNone();
-    if (core.cancel_message) |obj| {
+    if (activeFutureCore(self) catch null) |core| {
+        if (core.cancel_message) |obj| {
+            ffi.incref(obj);
+            return obj;
+        }
+        return ffi.getNone();
+    }
+    if (self.shadow_cancel_message) |obj| {
         ffi.incref(obj);
         return obj;
     }
@@ -1911,8 +2384,14 @@ fn taskNumCancelsRequestedGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c)
 
 fn taskCancelMessageGet(self_obj: ?*PyObject, _: ?*anyopaque) callconv(.c) ?*PyObject {
     const self = taskObjectFromPy(self_obj orelse return null);
-    const core = futureCore(&self.future) catch return ffi.getNone();
-    if (core.cancel_message) |obj| {
+    if (activeFutureCore(&self.future) catch null) |core| {
+        if (core.cancel_message) |obj| {
+            ffi.incref(obj);
+            return obj;
+        }
+        return ffi.getNone();
+    }
+    if (self.future.shadow_cancel_message) |obj| {
         ffi.incref(obj);
         return obj;
     }
@@ -1957,7 +2436,7 @@ fn setTaskName(self: *TaskObject, value: *PyObject) LoopError!void {
             self.name = null;
         }
     } else |err| switch (err) {
-        error.InvalidState => {
+        error.InvalidState, error.InvalidLoopHandle => {
             if (self.name) |old| ffi.decref(old);
             self.name = name;
         },
@@ -2086,6 +2565,11 @@ pub fn traverseReadyCallbacks(slots: *[MAX_LOOPS]LoopSlot, visit: c.visitproc, a
             if (visitPyObj(visit, arg, entry.arg) != 0) return -1;
             if (visitPyObj(visit, arg, entry.loop_obj) != 0) return -1;
         }
+        var n: usize = 0;
+        while (n < slot.host_yield_count) : (n += 1) {
+            const idx = (slot.host_yield_head + n) % MAX_HOST_YIELDS;
+            if (visitPyObj(visit, arg, slot.host_yields[idx].sentinel) != 0) return -1;
+        }
     }
     return 0;
 }
@@ -2134,6 +2618,110 @@ pub fn currentTask(handle_obj: *PyObject) LoopError!?*PyObject {
         return obj;
     }
     return null;
+}
+
+pub fn taskSetRequestConn(self_obj: *PyObject, conn_idx: u16) LoopError!void {
+    const self = taskObjectFromPy(self_obj);
+    const task = try taskNative(self);
+    task.request_conn_idx = conn_idx;
+}
+
+pub fn taskResumeValue(handle_obj: *PyObject, task_token: TaskToken, value: *PyObject) LoopError!void {
+    const slot = try slotFromCapsule(handle_obj);
+    const task_id = try taskIdFromToken(slot, task_token);
+    const task = &slot.tasks[task_id];
+    if (task.step_value) |old| ffi.decref(old);
+    task.step_value = value;
+    ffi.incref(value);
+    try scheduleTaskStep(slot, task_id, null);
+}
+
+pub fn taskResumeRuntimeError(handle_obj: *PyObject, task_token: TaskToken, msg: [*:0]const u8) LoopError!void {
+    const slot = try slotFromCapsule(handle_obj);
+    const task_id = try taskIdFromToken(slot, task_token);
+    const exc = try runtimeError(msg);
+    defer ffi.decref(exc);
+    try scheduleTaskStep(slot, task_id, exc);
+}
+
+pub fn peekHostYield(handle_obj: *PyObject) LoopError!?HostYieldRequest {
+    const slot = try slotFromCapsule(handle_obj);
+    if (slot.host_yield_count == 0) return null;
+    const host_yield = &slot.host_yields[slot.host_yield_head];
+    return .{
+        .kind = host_yield.kind,
+        .task_token = host_yield.task_token,
+        .conn_idx = host_yield.conn_idx,
+        .sentinel = host_yield.sentinel orelse return error.InvalidState,
+    };
+}
+
+pub fn dropHostYield(handle_obj: *PyObject) LoopError!void {
+    const slot = try slotFromCapsule(handle_obj);
+    if (slot.host_yield_count == 0) return;
+    const idx = slot.host_yield_head;
+    if (slot.host_yields[idx].sentinel) |sentinel| ffi.decref(sentinel);
+    slot.host_yields[idx] = .{};
+    slot.host_yield_head = (slot.host_yield_head + 1) % MAX_HOST_YIELDS;
+    slot.host_yield_count -= 1;
+}
+
+pub fn driveNonblocking(handle_obj: *PyObject, loop_obj: *PyObject, budget: usize) LoopError!DriveResult {
+    const slot = try slotFromCapsule(handle_obj);
+    if (slot.closed) return error.LoopClosed;
+    if (slot.running) return error.EventLoopAlreadyRunning;
+
+    const old_loop = try getRunningLoop();
+    defer ffi.decref(old_loop);
+    if (!isNone(old_loop) and old_loop != loop_obj) return error.AnotherLoopRunning;
+
+    const old_depth = try getCoroutineOriginTrackingDepth();
+    if (slot.debug and old_depth <= 0) {
+        try setCoroutineOriginTrackingDepth(1);
+    }
+
+    slot.running = true;
+    try setRunningLoop(loop_obj);
+    defer {
+        const had_err = ffi.errOccurred();
+        const saved_err = if (had_err) fetchPyError() else SavedPyError{};
+        defer if (had_err) restorePyError(saved_err);
+
+        slot.running = false;
+        setRunningLoop(old_loop) catch {
+            if (ffi.errOccurred()) ffi.errClear();
+        };
+        if (slot.debug and old_depth <= 0) {
+            setCoroutineOriginTrackingDepth(old_depth) catch {
+                if (ffi.errOccurred()) ffi.errClear();
+            };
+        }
+    }
+
+    var ran: usize = 0;
+    while (ran < budget) {
+        _ = try drainScheduled(slot, slotTime(slot));
+        if (slot.ready_len == 0) break;
+
+        const idx = slot.ready_head;
+        const token = slot.ready[idx];
+        slot.ready[idx] = invalid_ready_token;
+        slot.ready_head = (slot.ready_head + 1) % MAX_READY;
+        slot.ready_len -= 1;
+        try runReadyToken(slot, token);
+        ran += 1;
+    }
+
+    if (slot.ready_len == 0) {
+        slot.ready_head = 0;
+    }
+
+    const next_timer_ns = try nextScheduledDelayNs(slot, slotTime(slot));
+    return .{
+        .ran = ran,
+        .ready_remaining = slot.ready_len,
+        .next_timer_ns = next_timer_ns,
+    };
 }
 
 pub fn allTasks(handle_obj: *PyObject) LoopError!*PyObject {
@@ -2259,6 +2847,16 @@ pub fn futureDone(handle_obj: *PyObject, future_token: FutureToken) LoopError!bo
     return future.core.state != .pending;
 }
 
+pub fn futureDonePy(self_obj: *PyObject) LoopError!bool {
+    const core = try futureCore(futureObjectFromPy(self_obj));
+    return core.state != .pending;
+}
+
+pub fn futureResultPy(self_obj: *PyObject) LoopError!*PyObject {
+    const core = try futureCore(futureObjectFromPy(self_obj));
+    return futureResultObject(core);
+}
+
 pub fn futureCancelledNative(handle_obj: *PyObject, future_token: FutureToken) LoopError!bool {
     const future = try futureFromToken(handle_obj, future_token);
     return future.core.state == .cancelled;
@@ -2317,6 +2915,12 @@ pub fn futureSetException(handle_obj: *PyObject, future_token: FutureToken, exc:
     try setFutureExceptionCore(slot, &slot.futures[future_id].core, exc, null);
 }
 
+pub fn futureSetRuntimeError(handle_obj: *PyObject, future_token: FutureToken, msg: [*:0]const u8) LoopError!void {
+    const exc = try runtimeError(msg);
+    defer ffi.decref(exc);
+    try futureSetException(handle_obj, future_token, exc);
+}
+
 pub fn gatherRegister(
     handle_obj: *PyObject,
     outer_obj: *PyObject,
@@ -2352,10 +2956,14 @@ pub fn newTask(
 ) LoopError!TaskToken {
     const slot = try slotFromCapsule(handle_obj);
     if (slot.closed) return error.LoopClosed;
-    const task_id = try allocTask(handle_obj, slot, loop_obj, wrapper_obj, coro, context, name);
+    const task_id = try allocTask(handle_obj, slot, loop_obj, wrapper_obj, coro, context, name, null);
     errdefer releaseTask(slot, task_id);
     if (eager_start and slot.running) {
         try runTaskStepById(slot, task_id);
+        const task = &slot.tasks[task_id];
+        if (task.used and task.core.state != .pending) {
+            hideTaskCoro(task);
+        }
     } else {
         try scheduleTaskStep(slot, task_id, null);
     }
@@ -2511,8 +3119,12 @@ pub fn runUntilComplete(handle_obj: *PyObject, loop_obj: *PyObject, future_obj: 
 
     if (!try futureDoneObject(target)) return error.EventLoopStoppedBeforeFutureCompleted;
     if (try futureCancelledObject(target)) {
-        const exc = try callMethodNoArgs(target, "_make_cancelled_error");
-        return raiseStoredException(exc, null);
+        _ = callMethodNoArgs(target, "result") catch |err| switch (err) {
+            error.PythonError => return error.PythonError,
+            else => return err,
+        };
+        c.PyErr_SetString(c.PyExc_RuntimeError, "cancelled awaitable returned a result");
+        return error.PythonError;
     }
     return callMethodNoArgs(target, "result");
 }
@@ -2580,6 +3192,15 @@ fn clearLoopQueues(slot: *LoopSlot) void {
         slot.scheduled[n] = .{};
     }
     slot.scheduled_len = 0;
+
+    n = 0;
+    while (n < slot.host_yield_count) : (n += 1) {
+        const idx = (slot.host_yield_head + n) % MAX_HOST_YIELDS;
+        if (slot.host_yields[idx].sentinel) |sentinel| ffi.decref(sentinel);
+        slot.host_yields[idx] = .{};
+    }
+    slot.host_yield_head = 0;
+    slot.host_yield_count = 0;
 }
 
 fn clearFutureTaskPools(slot: *LoopSlot) void {
@@ -2845,6 +3466,25 @@ fn runOnce(slot: *LoopSlot) LoopError!void {
     if (slot.ready_len == 0) {
         slot.ready_head = 0;
     }
+}
+
+fn nextScheduledDelayNs(slot: *LoopSlot, now: f64) LoopError!?u64 {
+    var next_when: ?f64 = null;
+    var i: usize = 0;
+    while (i < slot.scheduled_len) : (i += 1) {
+        const entry = slot.scheduled[i];
+        const handle_id = entry.handle_id;
+        if (handle_id == invalid_handle_id) continue;
+        if (@as(usize, handle_id) >= MAX_HANDLES) continue;
+        const native = &slot.handles[handle_id];
+        if (!native.used or native.cancelled) continue;
+        if (next_when == null or entry.when < next_when.?) next_when = entry.when;
+    }
+    if (next_when) |when| {
+        if (when <= now) return 0;
+        return @intFromFloat((when - now) * @as(f64, std.time.ns_per_s));
+    }
+    return null;
 }
 
 fn drainScheduled(slot: *LoopSlot, now: f64) LoopError!?f64 {
@@ -3459,8 +4099,48 @@ fn releaseFuture(slot: *LoopSlot, future_id: FutureId) void {
     slot.free_future_len += 1;
 }
 
+fn snapshotFutureCoreToWrapper(core: *FutureCore) void {
+    const wrapper = core.wrapper orelse return;
+    const self = futureObjectFromPy(wrapper);
+    if (self.shadow_result) |obj| {
+        ffi.decref(obj);
+        self.shadow_result = null;
+    }
+    if (self.shadow_exception) |obj| {
+        ffi.decref(obj);
+        self.shadow_exception = null;
+    }
+    if (self.shadow_exception_tb) |obj| {
+        ffi.decref(obj);
+        self.shadow_exception_tb = null;
+    }
+    if (self.shadow_cancel_message) |obj| {
+        ffi.decref(obj);
+        self.shadow_cancel_message = null;
+    }
+    self.shadow_valid = true;
+    self.shadow_state = core.state;
+    if (core.result) |obj| {
+        self.shadow_result = obj;
+        ffi.incref(obj);
+    }
+    if (core.exception) |obj| {
+        self.shadow_exception = obj;
+        ffi.incref(obj);
+    }
+    if (core.exception_tb) |obj| {
+        self.shadow_exception_tb = obj;
+        ffi.incref(obj);
+    }
+    if (core.cancel_message) |obj| {
+        self.shadow_cancel_message = obj;
+        ffi.incref(obj);
+    }
+}
+
 fn dropFutureWrapperCore(core: *FutureCore) void {
     if (core.wrapper) |obj| {
+        snapshotFutureCoreToWrapper(core);
         ffi.decref(obj);
         core.wrapper = null;
     }
@@ -3737,6 +4417,9 @@ fn notifyGatherLinks(slot: *LoopSlot, child_core: *FutureCore) LoopError!void {
 fn cancelFutureCore(slot: *LoopSlot, core: *FutureCore, message: ?*PyObject) LoopError!bool {
     if (core.state != .pending) return false;
     core.state = .cancelled;
+    if (core.wrapper) |wrapper| {
+        futureObjectFromPy(wrapper).log_traceback = false;
+    }
     if (core.cancel_message) |obj| {
         ffi.decref(obj);
         core.cancel_message = null;
@@ -3833,7 +4516,14 @@ fn removeFutureDoneCallbackCore(slot: *LoopSlot, core: *FutureCore, callback: *P
     var cur = core.callbacks_head;
     while (cur != invalid_callback_id) {
         const next = slot.future_callbacks[cur].next;
-        const matches = slot.future_callbacks[cur].callback == callback;
+        const callback_obj = slot.future_callbacks[cur].callback;
+        const matches = if (callback_obj) |candidate| blk: {
+            ffi.incref(candidate);
+            defer ffi.decref(candidate);
+            const eq = c.PyObject_RichCompareBool(candidate, callback, c.Py_EQ);
+            if (eq < 0) return error.PythonError;
+            break :blk eq == 1;
+        } else false;
         if (matches) {
             removed += 1;
             if (prev == invalid_callback_id) core.callbacks_head = next else slot.future_callbacks[prev].next = next;
@@ -3859,12 +4549,18 @@ fn setFutureResultCore(slot: *LoopSlot, core: *FutureCore, result: *PyObject) Lo
 
 fn setFutureExceptionCore(slot: *LoopSlot, core: *FutureCore, exc: *PyObject, tb: ?*PyObject) LoopError!void {
     if (core.state != .pending) return error.InvalidState;
+    const normalized_exc = try normalizeFutureException(exc);
+    errdefer ffi.decref(normalized_exc);
     core.state = .finished;
-    core.exception = exc;
-    ffi.incref(exc);
+    core.exception = normalized_exc;
     if (tb) |trace| {
         core.exception_tb = trace;
         ffi.incref(trace);
+    } else {
+        core.exception_tb = c.PyException_GetTraceback(normalized_exc);
+    }
+    if (core.wrapper) |wrapper| {
+        futureObjectFromPy(wrapper).log_traceback = true;
     }
     try drainFutureCallbacksCore(slot, core);
     try notifyGatherLinks(slot, core);
@@ -3885,6 +4581,14 @@ fn drainFutureCallbacksCore(slot: *LoopSlot, core: *FutureCore) LoopError!void {
     }
 }
 
+fn inheritRequestConnId(slot: *LoopSlot) RequestConnId {
+    const current = slot.current_task orelse return invalid_request_conn_id;
+    const future = futureObjectFromPy(current);
+    if (future.native_kind != .task) return invalid_request_conn_id;
+    const task = taskNative(taskObjectFromFuture(future)) catch return invalid_request_conn_id;
+    return task.request_conn_idx;
+}
+
 fn allocTask(
     handle_obj: *PyObject,
     slot: *LoopSlot,
@@ -3893,6 +4597,7 @@ fn allocTask(
     coro: *PyObject,
     context: ?*PyObject,
     name: ?*PyObject,
+    request_conn_idx: ?RequestConnId,
 ) LoopError!TaskId {
     if (slot.free_task_len == 0) return error.TaskPoolFull;
     slot.free_task_len -= 1;
@@ -3913,6 +4618,7 @@ fn allocTask(
         .coro = coro,
         .context = if (context != null and !isNone(context.?)) context else null,
         .name = if (name != null and !isNone(name.?)) name else null,
+        .request_conn_idx = request_conn_idx orelse inheritRequestConnId(slot),
     };
     ffi.incref(loop_obj);
     ffi.incref(wrapper_obj);
@@ -3949,6 +4655,7 @@ fn releaseTask(slot: *LoopSlot, task_id: TaskId) void {
     if (task.name) |obj| ffi.decref(obj);
     if (task.fut_waiter) |obj| ffi.decref(obj);
     if (task.step_exc) |obj| ffi.decref(obj);
+    if (task.step_value) |obj| ffi.decref(obj);
     if (task.wakeup_cb) |obj| ffi.decref(obj);
     const generation = task.generation;
     task.* = .{ .generation = generation };
@@ -3968,6 +4675,10 @@ fn clearFinishedTaskState(task: *NativeTaskSlot) void {
         ffi.decref(obj);
         task.step_exc = null;
     }
+    if (task.step_value) |obj| {
+        ffi.decref(obj);
+        task.step_value = null;
+    }
     if (task.wakeup_cb) |obj| {
         ffi.decref(obj);
         task.wakeup_cb = null;
@@ -3978,6 +4689,13 @@ fn finishTask(slot: *LoopSlot, task_id: TaskId) void {
     const task = &slot.tasks[task_id];
     if (!task.used) return;
     clearFinishedTaskState(task);
+}
+
+fn hideTaskCoro(task: *NativeTaskSlot) void {
+    if (task.coro) |obj| {
+        ffi.decref(obj);
+        task.coro = null;
+    }
 }
 
 fn scheduleInternalCallback(slot: *LoopSlot, loop_obj: *PyObject, callback: *PyObject, arg: *PyObject, context: ?*PyObject) LoopError!void {
@@ -4066,17 +4784,27 @@ fn runTaskStepByIdInContext(slot: *LoopSlot, task_id: TaskId, task_context_enter
         exc_obj = obj;
         task.step_exc = null;
     }
+    var send_value: ?*PyObject = null;
+    if (task.step_value) |obj| {
+        send_value = obj;
+        task.step_value = null;
+    }
 
     const core = &task.core;
     if (core.state != .pending) {
         reportTaskStepAlreadyDone(task, exc_obj);
         if (exc_obj) |obj| ffi.decref(obj);
+        if (send_value) |obj| ffi.decref(obj);
         closeTaskCoroutine(task);
         finishTask(slot, task_id);
         return;
     }
 
     if (task.must_cancel and exc_obj == null) {
+        if (send_value) |obj| {
+            ffi.decref(obj);
+            send_value = null;
+        }
         exc_obj = try makeCancelledError(core.cancel_message);
         task.must_cancel = false;
     }
@@ -4109,6 +4837,7 @@ fn runTaskStepByIdInContext(slot: *LoopSlot, task_id: TaskId, task_context_enter
 
     const coro = task.coro orelse return;
     if (exc_obj) |exc| {
+        if (send_value) |obj| ffi.decref(obj);
         const throw_fn = try getAttrRaw(coro, "throw");
         defer ffi.decref(throw_fn);
         const result = if (task.context) |ctx|
@@ -4178,12 +4907,12 @@ fn runTaskStepByIdInContext(slot: *LoopSlot, task_id: TaskId, task_context_enter
         return;
     }
 
-    const none = ffi.getNone();
-    defer ffi.decref(none);
+    const send_arg = send_value orelse ffi.getNone();
+    defer ffi.decref(send_arg);
     const send = if (task.context) |ctx|
-        try iterSendInContext(ctx, coro, none)
+        try iterSendInContext(ctx, coro, send_arg)
     else blk: {
-        const raw = ffi.iterSend(coro, none);
+        const raw = ffi.iterSend(coro, send_arg);
         break :blk IterSendResult{ .result = raw.result, .status = raw.status };
     };
     switch (send.status) {
@@ -4236,6 +4965,62 @@ fn handleTaskError(slot: *LoopSlot, task_id: TaskId) LoopError!void {
     finishTask(slot, task_id);
 }
 
+fn hostYieldKind(obj: *PyObject) LoopError!?HostYieldKind {
+    if (!ffi.isTuple(obj)) return null;
+    const size = ffi.tupleSize(obj);
+    if (size < 1) return null;
+    const id_obj = ffi.tupleGetItem(obj, 0) orelse return null;
+    if (c.PyLong_Check(id_obj) == 0) return null;
+    const id = try ffi.longAsLong(id_obj);
+    if (id >= 0 and id <= 8) return .redis;
+    if (id >= 100 and id <= 102) return .pg;
+    return null;
+}
+
+fn pushHostYield(
+    slot: *LoopSlot,
+    kind: HostYieldKind,
+    task_token: TaskToken,
+    conn_idx: u16,
+    sentinel: *PyObject,
+) LoopError!void {
+    if (slot.host_yield_count >= MAX_HOST_YIELDS) return error.HostYieldQueueFull;
+    const tail = (slot.host_yield_head + slot.host_yield_count) % MAX_HOST_YIELDS;
+    slot.host_yields[tail] = .{
+        .kind = kind,
+        .task_token = task_token,
+        .conn_idx = conn_idx,
+        .sentinel = sentinel,
+    };
+    ffi.incref(sentinel);
+    slot.host_yield_count += 1;
+}
+
+fn parkTaskOnFuture(slot: *LoopSlot, task_id: TaskId, future_obj: *PyObject, loop_obj: *PyObject, wrapper: *PyObject) LoopError!void {
+    const task = &slot.tasks[task_id];
+    if (future_obj == wrapper) {
+        const exc = try runtimeError("Task cannot await on itself");
+        try scheduleTaskStep(slot, task_id, exc);
+        ffi.decref(exc);
+        return;
+    }
+
+    const false_obj = ffi.boolFromBool(false);
+    defer ffi.decref(false_obj);
+    try setAttrRaw(future_obj, "_asyncio_future_blocking", false_obj);
+    const wakeup_cb = try ensureTaskWakeupCallback(task, task_id);
+    const add_res = try callMethodOneArg(future_obj, "add_done_callback", wakeup_cb);
+    ffi.decref(add_res);
+    task.fut_waiter = future_obj;
+    ffi.incref(future_obj);
+    if (task.must_cancel) {
+        if (try callCancelable(future_obj, task.core.cancel_message)) {
+            task.must_cancel = false;
+        }
+    }
+    _ = loop_obj;
+}
+
 fn handleTaskYielded(slot: *LoopSlot, task_id: TaskId, result: *PyObject) LoopError!void {
     const task = &slot.tasks[task_id];
     const loop_obj = task.core.loop_obj orelse return;
@@ -4244,6 +5029,22 @@ fn handleTaskYielded(slot: *LoopSlot, task_id: TaskId, result: *PyObject) LoopEr
     if (isNone(result)) {
         try scheduleTaskStep(slot, task_id, null);
         return;
+    }
+
+    if (task.request_conn_idx != invalid_request_conn_id) {
+        if (try hostYieldKind(result)) |kind| {
+        const task_token = tokenForTask(slot, task_id);
+        pushHostYield(slot, kind, task_token, task.request_conn_idx, result) catch |err| switch (err) {
+            error.HostYieldQueueFull => {
+                const exc = try runtimeError("Host yield queue is full");
+                try scheduleTaskStep(slot, task_id, exc);
+                ffi.decref(exc);
+                return;
+            },
+            else => return err,
+        };
+        return;
+        }
     }
 
     const blocking_attr = getAttrRaw(result, "_asyncio_future_blocking") catch blk: {
@@ -4266,25 +5067,7 @@ fn handleTaskYielded(slot: *LoopSlot, task_id: TaskId, result: *PyObject) LoopEr
         const truth = c.PyObject_IsTrue(blocking_obj);
         if (truth < 0) return error.PythonError;
         if (truth == 1) {
-            if (result == wrapper) {
-                const exc = try runtimeError("Task cannot await on itself");
-                try scheduleTaskStep(slot, task_id, exc);
-                ffi.decref(exc);
-                return;
-            }
-            const false_obj = ffi.boolFromBool(false);
-            defer ffi.decref(false_obj);
-            try setAttrRaw(result, "_asyncio_future_blocking", false_obj);
-            const wakeup_cb = try ensureTaskWakeupCallback(task, task_id);
-            const add_res = try callMethodOneArg(result, "add_done_callback", wakeup_cb);
-            ffi.decref(add_res);
-            task.fut_waiter = result;
-            ffi.incref(result);
-            if (task.must_cancel) {
-                if (try callCancelable(result, task.core.cancel_message)) {
-                    task.must_cancel = false;
-                }
-            }
+            try parkTaskOnFuture(slot, task_id, result, loop_obj, wrapper);
             return;
         }
 

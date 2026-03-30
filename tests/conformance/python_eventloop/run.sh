@@ -23,7 +23,7 @@ python -m pip install --quiet --upgrade pip setuptools wheel
 python -m pip install --quiet -e "$ROOT_DIR"
 
 set +e
-python -m unittest discover -s "$SCRIPT_DIR" -p 'test_*.py' \
+python "$SCRIPT_DIR/run_conformance.py" \
     2>&1 | tee "$RESULTS_DIR/unittest.txt"
 STATUS=${PIPESTATUS[0]}
 set -e
