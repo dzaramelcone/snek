@@ -2328,7 +2328,6 @@ pub fn gatherRegister(
     const outer_core = try futureCore(futureObjectFromPy(outer_obj));
     const gather_id = try allocGather(slot, outer_obj, outer_core, children_obj, count, return_exceptions);
     errdefer releaseGather(slot, gather_id);
-    slot.gathers[gather_id].child_count = @intCast(count);
 
     var idx: usize = 0;
     while (idx < count) : (idx += 1) {
@@ -3537,17 +3536,15 @@ fn allocGather(
     const gather = &slot.gathers[gather_id];
     var generation = gather.generation +% 1;
     if (generation == 0) generation = 1;
-    const results_obj = ffi.listNew(@intCast(count)) catch return error.PythonError;
-    errdefer ffi.decref(results_obj);
     gather.* = .{
         .used = true,
         .generation = generation,
         .outer_obj = outer_obj,
         .outer_core = outer_core,
         .children_obj = children_obj,
-        .results_obj = results_obj,
+        .results_obj = null,
         .links_head = invalid_gather_link_id,
-        .child_count = 0,
+        .child_count = @intCast(count),
         .finished_count = 0,
         .return_exceptions = return_exceptions,
     };
@@ -3635,22 +3632,6 @@ fn gatherCancelRequested(outer_obj: *PyObject) LoopError!bool {
     return truth == 1;
 }
 
-fn storeGatherResultItem(result_list: *PyObject, child_index: u32, child_core: *FutureCore) LoopError!void {
-    const item = blk: {
-        if (child_core.state == .cancelled) break :blk try makeCancelledError(child_core.cancel_message);
-        if (child_core.exception) |exc| {
-            ffi.incref(exc);
-            break :blk exc;
-        }
-        if (child_core.result) |res| {
-            ffi.incref(res);
-            break :blk res;
-        }
-        break :blk ffi.getNone();
-    };
-    try ffi.listSetItemTake(result_list, @intCast(child_index), ffi.OwnedPy.init(item));
-}
-
 fn gatherResults(children_obj: *PyObject) LoopError!*PyObject {
     const count = try sequenceLen(children_obj);
     const result_list = ffi.listNew(@intCast(count)) catch return error.PythonError;
@@ -3702,7 +3683,6 @@ fn processGatherChildCompletion(slot: *LoopSlot, gather_id: GatherId, child_core
     const outer_obj = gather.outer_obj orelse return;
     const children_obj = gather.children_obj orelse return;
     const outer_core = gather.outer_core orelse return;
-    const result_list = gather.results_obj orelse return;
 
     gather.finished_count += 1;
 
@@ -3722,11 +3702,7 @@ fn processGatherChildCompletion(slot: *LoopSlot, gather_id: GatherId, child_core
             try setFutureExceptionCore(slot, outer_core, exc, null);
         } else if (child_core.exception) |exc| {
             try setFutureExceptionCore(slot, outer_core, exc, child_core.exception_tb);
-        } else {
-            try storeGatherResultItem(result_list, child_index, child_core);
         }
-    } else {
-        try storeGatherResultItem(result_list, child_index, child_core);
     }
 
     if (gather.finished_count == gather.child_count) {
@@ -3736,6 +3712,8 @@ fn processGatherChildCompletion(slot: *LoopSlot, gather_id: GatherId, child_core
                 defer ffi.decref(exc);
                 try setFutureExceptionCore(slot, outer_core, exc, null);
             } else {
+                const result_list = try gatherResults(children_obj);
+                defer ffi.decref(result_list);
                 try setFutureResultCore(slot, outer_core, result_list);
             }
         }
