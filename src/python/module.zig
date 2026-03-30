@@ -55,6 +55,7 @@ pub const SnekModuleState = extern struct {
     module_ref: [256]u8,
     module_ref_len: u16,
     loop_slots: [loop_mod.MAX_LOOPS]loop_mod.LoopSlot,
+    loop_types: loop_mod.TypeState,
 };
 
 /// Temporary global module reference. Set during pyRun so driver.startServer
@@ -464,7 +465,7 @@ fn pyLoopNew(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
         return null;
     };
-    return loop_mod.newLoop(&state.loop_slots) catch |err| {
+    return loop_mod.newLoop(&state.loop_slots, &state.loop_types) catch |err| {
         setRuntimeError(err);
         return null;
     };
@@ -615,6 +616,59 @@ fn pyLoopGetDebug(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     return ffi.boolFromBool(debug);
 }
 
+fn pyLoopReadyCount(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_ready_count(handle) requires 1 argument");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 1) {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_ready_count(handle) requires exactly 1 argument");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const count = loop_mod.readyCount(handle) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.longFromLong(@intCast(count)) catch {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "failed to build ready count");
+        return null;
+    };
+}
+
+fn pyLoopCurrentTask(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_current_task(handle) requires 1 argument");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 1) {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_current_task(handle) requires exactly 1 argument");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const task = loop_mod.currentTask(handle) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return task orelse ffi.getNone();
+}
+
+fn pyLoopAllTasks(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_all_tasks(handle) requires 1 argument");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 1) {
+        c.PyErr_SetString(c.PyExc_TypeError, "loop_all_tasks(handle) requires exactly 1 argument");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    return loop_mod.allTasks(handle) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+}
+
 fn pyLoopCallSoon(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
     const tuple = args orelse {
         c.PyErr_SetString(c.PyExc_TypeError, "loop_call_soon(handle, loop, wrapper, callback, args, context) requires 6 arguments");
@@ -760,6 +814,419 @@ fn pyLoopRunUntilComplete(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObje
     };
 }
 
+fn pyFutureNew(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const mod = self_mod orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
+        return null;
+    };
+    const state = getState(mod) orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
+        return null;
+    };
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_new(handle, loop) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_new(handle, loop) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const loop_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    return loop_mod.createFutureObject(&state.loop_types, handle, loop_obj) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+}
+
+fn pyFutureFree(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_free(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_free(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    loop_mod.freeFuture(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.getNone();
+}
+
+fn pyFutureCancel(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_cancel(handle, token, msg) requires 3 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_cancel(handle, token, msg) requires exactly 3 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const msg = ffi.tupleGetItem(tuple, 2);
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const cancelled = loop_mod.futureCancel(handle, @intCast(token), msg) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.boolFromBool(cancelled);
+}
+
+fn pyFutureCancelled(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_cancelled(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_cancelled(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const cancelled = loop_mod.futureCancelledNative(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.boolFromBool(cancelled);
+}
+
+fn pyFutureDone(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_done(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_done(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const done = loop_mod.futureDone(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.boolFromBool(done);
+}
+
+fn pyFutureResult(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_result(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_result(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    return loop_mod.futureResult(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+}
+
+fn pyFutureException(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_exception(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_exception(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    return loop_mod.futureException(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+}
+
+fn pyFutureAddDoneCallback(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_add_done_callback(handle, token, wrapper, callback, context) requires 5 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 5) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_add_done_callback(handle, token, wrapper, callback, context) requires exactly 5 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const wrapper_obj = ffi.tupleGetItem(tuple, 2) orelse return null;
+    const callback = ffi.tupleGetItem(tuple, 3) orelse return null;
+    const context = ffi.tupleGetItem(tuple, 4);
+    if (!ffi.isCallable(callback)) {
+        c.PyErr_SetString(c.PyExc_TypeError, "callback must be callable");
+        return null;
+    }
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    loop_mod.futureAddDoneCallback(handle, @intCast(token), wrapper_obj, callback, context) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.getNone();
+}
+
+fn pyFutureRemoveDoneCallback(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_remove_done_callback(handle, token, callback) requires 3 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_remove_done_callback(handle, token, callback) requires exactly 3 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const callback = ffi.tupleGetItem(tuple, 2) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const removed = loop_mod.futureRemoveDoneCallback(handle, @intCast(token), callback) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.longFromLong(@intCast(removed)) catch {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "failed to build removal count");
+        return null;
+    };
+}
+
+fn pyFutureSetResult(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_set_result(handle, token, result) requires 3 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_set_result(handle, token, result) requires exactly 3 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const result = ffi.tupleGetItem(tuple, 2) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    loop_mod.futureSetResult(handle, @intCast(token), result) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.getNone();
+}
+
+fn pyFutureSetException(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_set_exception(handle, token, exc) requires 3 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "future_set_exception(handle, token, exc) requires exactly 3 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const exc = ffi.tupleGetItem(tuple, 2) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    loop_mod.futureSetException(handle, @intCast(token), exc) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.getNone();
+}
+
+fn pyGatherRegister(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "gather_register(handle, outer, children, return_exceptions) requires 4 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 4) {
+        c.PyErr_SetString(c.PyExc_TypeError, "gather_register(handle, outer, children, return_exceptions) requires exactly 4 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const outer = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const children = ffi.tupleGetItem(tuple, 2) orelse return null;
+    const return_exceptions_obj = ffi.tupleGetItem(tuple, 3) orelse return null;
+    const truth = c.PyObject_IsTrue(return_exceptions_obj);
+    if (truth < 0) return null;
+    loop_mod.gatherRegister(handle, outer, children, truth == 1) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.getNone();
+}
+
+fn pyTaskNewFast(self_mod: [*c]PyObject, args: [*c]const [*c]PyObject, nargs: isize) callconv(.c) [*c]PyObject {
+    if (self_mod == null) {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
+        return null;
+    }
+    const mod: *PyObject = @ptrCast(self_mod);
+    const state = getState(mod) orelse {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
+        return null;
+    };
+    if (nargs != 5 and nargs != 6) {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_new(handle, loop, coro, context, name[, eager_start]) requires 5-6 arguments");
+        return null;
+    }
+    if (args == null) {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_new(handle, loop, coro, context, name[, eager_start]) requires 5-6 arguments");
+        return null;
+    }
+    const handle: *PyObject = @ptrCast(args[0]);
+    const loop_obj: *PyObject = @ptrCast(args[1]);
+    const coro: *PyObject = @ptrCast(args[2]);
+    const context: ?*PyObject = @ptrCast(args[3]);
+    const name: ?*PyObject = @ptrCast(args[4]);
+    var eager_start = false;
+    if (nargs == 6) {
+        const eager_obj: *PyObject = @ptrCast(args[5]);
+        const none: *PyObject = @ptrCast(&c._Py_NoneStruct);
+        if (eager_obj != none) {
+            const truth = c.PyObject_IsTrue(eager_obj);
+            if (truth < 0) return null;
+            eager_start = truth == 1;
+        }
+    }
+    return loop_mod.createTaskObject(&state.loop_types, handle, loop_obj, coro, context, name, eager_start) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+}
+
+fn pyTaskFree(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_free(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_free(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    loop_mod.freeTask(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.getNone();
+}
+
+fn pyTaskCancel(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_cancel(handle, token, msg) requires 3 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_cancel(handle, token, msg) requires exactly 3 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const msg = ffi.tupleGetItem(tuple, 2);
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const cancelled = loop_mod.taskCancel(handle, @intCast(token), msg) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.boolFromBool(cancelled);
+}
+
+fn pyTaskCancelling(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_cancelling(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_cancelling(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const count = loop_mod.taskCancelling(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.longFromLong(@intCast(count)) catch {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "failed to build cancellation count");
+        return null;
+    };
+}
+
+fn pyTaskUncancel(_: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const tuple = args orelse {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_uncancel(handle, token) requires 2 arguments");
+        return null;
+    };
+    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 2) {
+        c.PyErr_SetString(c.PyExc_TypeError, "task_uncancel(handle, token) requires exactly 2 arguments");
+        return null;
+    }
+    const handle = ffi.tupleGetItem(tuple, 0) orelse return null;
+    const token_obj = ffi.tupleGetItem(tuple, 1) orelse return null;
+    const token = ffi.longAsLong(token_obj) catch {
+        c.PyErr_SetString(c.PyExc_TypeError, "token must be an int");
+        return null;
+    };
+    const count = loop_mod.taskUncancel(handle, @intCast(token)) catch |err| {
+        setRuntimeError(err);
+        return null;
+    };
+    return ffi.longFromLong(@intCast(count)) catch {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "failed to build cancellation count");
+        return null;
+    };
+}
+
 // ── Module definition (multi-phase init, PEP 489) ───────────────────
 
 fn pyGetRouteCountImpl(mod: *PyObject) ffi.PythonError!*PyObject {
@@ -781,12 +1248,32 @@ var methods = [_]c.PyMethodDef{
     ffi.wrapVarArgs("loop_time", &pyLoopTime),
     ffi.wrapVarArgs("loop_set_debug", &pyLoopSetDebug),
     ffi.wrapVarArgs("loop_get_debug", &pyLoopGetDebug),
+    ffi.wrapVarArgs("loop_ready_count", &pyLoopReadyCount),
+    ffi.wrapVarArgs("loop_current_task", &pyLoopCurrentTask),
+    ffi.wrapVarArgs("loop_all_tasks", &pyLoopAllTasks),
     ffi.wrapVarArgs("loop_call_soon", &pyLoopCallSoon),
     ffi.wrapVarArgs("loop_call_at", &pyLoopCallAt),
     ffi.wrapVarArgs("loop_handle_cancel", &pyLoopHandleCancel),
     ffi.wrapVarArgs("loop_handle_repr", &pyLoopHandleRepr),
     ffi.wrapVarArgs("loop_run_forever", &pyLoopRunForever),
     ffi.wrapVarArgs("loop_run_until_complete", &pyLoopRunUntilComplete),
+    ffi.wrapVarArgs("future_new", &pyFutureNew),
+    ffi.wrapVarArgs("future_free", &pyFutureFree),
+    ffi.wrapVarArgs("future_cancel", &pyFutureCancel),
+    ffi.wrapVarArgs("future_cancelled", &pyFutureCancelled),
+    ffi.wrapVarArgs("future_done", &pyFutureDone),
+    ffi.wrapVarArgs("future_result", &pyFutureResult),
+    ffi.wrapVarArgs("future_exception", &pyFutureException),
+    ffi.wrapVarArgs("future_add_done_callback", &pyFutureAddDoneCallback),
+    ffi.wrapVarArgs("future_remove_done_callback", &pyFutureRemoveDoneCallback),
+    ffi.wrapVarArgs("future_set_result", &pyFutureSetResult),
+    ffi.wrapVarArgs("future_set_exception", &pyFutureSetException),
+    ffi.wrapVarArgs("gather_register", &pyGatherRegister),
+    ffi.wrapFastCall("task_new", &pyTaskNewFast),
+    ffi.wrapVarArgs("task_free", &pyTaskFree),
+    ffi.wrapVarArgs("task_cancel", &pyTaskCancel),
+    ffi.wrapVarArgs("task_cancelling", &pyTaskCancelling),
+    ffi.wrapVarArgs("task_uncancel", &pyTaskUncancel),
     std.mem.zeroes(c.PyMethodDef), // sentinel
 };
 
@@ -802,49 +1289,39 @@ fn snekModuleExec(mod: ?*PyObject) callconv(.c) c_int {
     state.module_ref = .{0} ** 256;
     state.module_ref_len = 0;
     loop_mod.initSlots(&state.loop_slots);
+    state.loop_types = .{};
+    loop_mod.initTypes(m, &state.loop_types) catch return -1;
     return 0;
 }
 
 // ── GC callbacks for PyObject references in module state ────────────
+
+fn visitObject(obj: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) c_int {
+    if (obj) |owned| {
+        return visit.?(@ptrCast(@constCast(owned)), arg);
+    }
+    return 0;
+}
 
 fn snekModuleTraverse(mod: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const m = mod orelse return 0;
     const state: *SnekModuleState = getState(m) orelse return 0;
     var i: u32 = 0;
     while (i < state.py_handler_count) : (i += 1) {
-        if (state.py_handlers[i]) |handler| {
-            const vret = visit.?(@ptrCast(@constCast(handler)), arg);
-            if (vret != 0) return vret;
-        }
+        const vret = visitObject(state.py_handlers[i], visit, arg);
+        if (vret != 0) return vret;
     }
-    for (&state.loop_slots) |*slot| {
-        var j: usize = 0;
-        while (j < loop_mod.MAX_HANDLES) : (j += 1) {
-            const native = &slot.handles[j];
-            if (!native.used) continue;
-            if (native.callback) |obj| {
-                const vret = visit.?(@ptrCast(@constCast(obj)), arg);
-                if (vret != 0) return vret;
-            }
-            if (native.args) |obj| {
-                const vret = visit.?(@ptrCast(@constCast(obj)), arg);
-                if (vret != 0) return vret;
-            }
-            if (native.context) |obj| {
-                const vret = visit.?(@ptrCast(@constCast(obj)), arg);
-                if (vret != 0) return vret;
-            }
-            if (native.loop_obj) |obj| {
-                const vret = visit.?(@ptrCast(@constCast(obj)), arg);
-                if (vret != 0) return vret;
-            }
-            if (native.wrapper) |obj| {
-                const vret = visit.?(@ptrCast(@constCast(obj)), arg);
-                if (vret != 0) return vret;
-            }
-        }
+    for ([_]?*PyObject{
+        state.loop_types.future_type,
+        state.loop_types.task_type,
+        state.loop_types.future_iter_type,
+        state.loop_types.register_task,
+        state.loop_types.unregister_task,
+    }) |obj| {
+        const vret = visitObject(obj, visit, arg);
+        if (vret != 0) return vret;
     }
-    return 0;
+    return loop_mod.traverseReadyCallbacks(&state.loop_slots, visit, arg);
 }
 
 fn snekModuleClear(mod: ?*PyObject) callconv(.c) c_int {
@@ -859,6 +1336,7 @@ fn snekModuleClear(mod: ?*PyObject) callconv(.c) c_int {
     }
     state.py_handler_count = 0;
     loop_mod.clearAllSlots(&state.loop_slots);
+    loop_mod.clearTypes(&state.loop_types);
     return 0;
 }
 
@@ -1046,8 +1524,7 @@ test "call stored handler" {
 
     // Call: handler(req)
     const call_args = try ffi.tupleNew(1);
-    ffi.incref(req);
-    try ffi.tupleSetItem(call_args, 0, req); // steals ref
+    try ffi.tupleSetItemTake(call_args, 0, ffi.OwnedPy.increfBorrowed(req));
     const result = try ffi.callObject(handler, call_args);
     defer ffi.decref(result);
     ffi.decref(call_args);

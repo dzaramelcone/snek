@@ -125,6 +125,28 @@ pub fn xdecref(obj: ?*PyObject) void {
     if (obj) |o| c.Py_DecRef(o);
 }
 
+pub const OwnedPy = struct {
+    obj: *PyObject,
+
+    pub fn init(obj: *PyObject) OwnedPy {
+        return .{ .obj = obj };
+    }
+
+    pub fn increfBorrowed(obj: *PyObject) OwnedPy {
+        incref(obj);
+        return .{ .obj = obj };
+    }
+
+    pub fn get(self: OwnedPy) *PyObject {
+        return self.obj;
+    }
+
+    pub fn deinit(self: *OwnedPy) void {
+        decref(self.obj);
+        self.obj = undefined;
+    }
+};
+
 // ── Error handling ──────────────────────────────────────────────────
 
 /// Check if a Python exception is currently set.
@@ -163,6 +185,18 @@ pub fn coroutineClose(coro: *PyObject) void {
     } else {
         c.PyErr_Clear();
     }
+}
+
+pub fn contextCopyCurrent() PythonError!*PyObject {
+    return c.PyContext_CopyCurrent() orelse error.PythonError;
+}
+
+pub fn contextEnter(context: *PyObject) PythonError!void {
+    if (c.PyContext_Enter(context) != 0) return error.PythonError;
+}
+
+pub fn contextExit(context: *PyObject) PythonError!void {
+    if (c.PyContext_Exit(context) != 0) return error.PythonError;
 }
 
 /// Fast coroutine/generator send — bypasses method lookup, tuple creation,
@@ -273,6 +307,15 @@ pub fn tupleSetItem(tuple: *PyObject, index: isize, value: *PyObject) PythonErro
     if (c.PyTuple_SetItem(tuple, index, value) != 0) return error.PythonError;
 }
 
+/// Set item in tuple, consuming an owned reference whether insertion succeeds or fails.
+pub fn tupleSetItemTake(tuple: *PyObject, index: isize, value: OwnedPy) PythonError!void {
+    if (c.PyTuple_SetItem(tuple, index, value.obj) != 0) return error.PythonError;
+}
+
+pub fn listSetItemTake(list: *PyObject, index: isize, value: OwnedPy) PythonError!void {
+    if (c.PyList_SetItem(list, index, value.obj) != 0) return error.PythonError;
+}
+
 // ── Dict operations ─────────────────────────────────────────────────
 
 pub fn dictNew() PythonError!*PyObject {
@@ -331,6 +374,20 @@ pub fn wrapVarArgs(comptime name: [*:0]const u8, comptime func: *const fn (?*PyO
         .ml_name = name,
         .ml_meth = func,
         .ml_flags = c.METH_VARARGS,
+        .ml_doc = null,
+    };
+}
+
+/// Wrap a Zig function as a CPython METH_FASTCALL method definition.
+/// The Zig function signature: fn([*c]PyObject, [*c]const [*c]PyObject, isize) callconv(.c) [*c]PyObject
+pub fn wrapFastCall(
+    comptime name: [*:0]const u8,
+    comptime func: *const fn ([*c]PyObject, [*c]const [*c]PyObject, isize) callconv(.c) [*c]PyObject,
+) c.PyMethodDef {
+    return .{
+        .ml_name = name,
+        .ml_meth = @ptrCast(func),
+        .ml_flags = c.METH_FASTCALL,
         .ml_doc = null,
     };
 }
@@ -398,10 +455,7 @@ pub fn dictNext(dict: *PyObject, pos: *isize, key: *?*PyObject, value: *?*PyObje
 
 /// Get Python object's string representation. Caller must decref.
 pub fn objectStr(obj: *PyObject) PythonError!*PyObject {
-    return c.PyObject_Str(obj) orelse {
-        c.PyErr_Print();
-        return error.ConversionError;
-    };
+    return c.PyObject_Str(obj) orelse error.PythonError;
 }
 
 /// Create a PyModuleDef with the given name and methods table.
