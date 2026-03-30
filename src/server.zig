@@ -229,17 +229,26 @@ pub fn runPipeline(allocator: std.mem.Allocator, server: *const Server) !void {
     var threads: std.ArrayListUnmanaged(std.Thread) = .{};
     defer threads.deinit(allocator);
 
-    for (1..num_threads) |_| {
-        const t = try std.Thread.spawn(.{}, pipelineThreadMain, .{ allocator, server, @as(?Socket, null) });
+    for (1..num_threads) |i| {
+        const t = try std.Thread.spawn(.{}, pipelineThreadMain, .{ allocator, server, @as(?Socket, null), @as(u16, @intCast(i)) });
         try threads.append(allocator, t);
     }
 
-    try pipelineThreadMain(allocator, server, first_socket);
+    try pipelineThreadMain(allocator, server, first_socket, 0);
 
     for (threads.items) |t| t.join();
 }
 
-fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, existing_socket: ?Socket) !void {
+fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, existing_socket: ?Socket, thread_idx: u16) !void {
+    // Pin thread to CPU core (Linux only) — prevents cache thrashing from migration
+    if (comptime @import("builtin").os.tag == .linux) {
+        var set: std.os.linux.cpu_set_t = .{0} ** @typeInfo(std.os.linux.cpu_set_t).array.len;
+        const word_idx = thread_idx / @bitSizeOf(usize);
+        set[word_idx] = @as(usize, 1) << @intCast(thread_idx % @bitSizeOf(usize));
+        std.os.linux.sched_setaffinity(0, &set) catch |err| {
+            log.info("core affinity failed for thread {d}: {}", .{ thread_idx, err });
+        };
+    }
     const listen_socket = if (existing_socket) |s| s else blk: {
         // Additional threads create their own socket with SO_REUSEPORT
         const s = try Socket.initTcp(server.host, server.port);

@@ -55,16 +55,14 @@ pub const Entry = struct {
         self.json_keys_built = true;
     }
 
-    /// Pre-build the Bind+Execute+Sync message sequence for zero-param queries.
-    /// Called once per statement after first prepare on a connection.
+    /// Pre-build the Bind+Execute message sequence for zero-param queries.
+    /// Sync is appended once per batch by the pipeline layer.
     pub fn buildBindTemplate(self: *Entry, stmt_name: []const u8) void {
         var pos: usize = 0;
         const bind = wire.encodeBindWithParams(self.bind_template[pos..], stmt_name, &.{});
         pos += bind.len;
         const exec = wire.encodeExecute(self.bind_template[pos..]);
         pos += exec.len;
-        const sync = wire.encodeSync(self.bind_template[pos..]);
-        pos += sync.len;
         self.bind_template_len = @intCast(pos);
         self.bind_template_built = true;
     }
@@ -118,8 +116,8 @@ pub const StmtCache = struct {
 
     /// Write extended protocol messages for a query into buf.
     /// Returns bytes written.
-    /// If the statement is cached (already prepared), writes Bind+Execute+Sync.
-    /// If uncached, writes Parse+Describe+Bind+Execute+Sync and inserts into cache.
+    /// If the statement is cached (already prepared), writes Bind+Execute.
+    /// If uncached, writes Parse+Describe+Bind+Execute and inserts into cache.
     /// Encode extended protocol messages. `conn_prepared` is a per-connection
     /// bitset tracking which statements have been prepared on that connection.
     pub const MAX_PARAMS = 16;
@@ -156,7 +154,7 @@ pub const StmtCache = struct {
             }
         }
 
-        // Bind + Execute + Sync — use pre-built template for zero-param case
+        // Bind + Execute only — Sync is appended once per batch by the pipeline
         if (params.len == 0 and self.entries[idx].bind_template_built) {
             const tlen = self.entries[idx].bind_template_len;
             @memcpy(buf[pos..][0..tlen], self.entries[idx].bind_template[0..tlen]);
@@ -166,8 +164,6 @@ pub const StmtCache = struct {
             pos += bind.len;
             const exec = wire.encodeExecute(buf[pos..]);
             pos += exec.len;
-            const sync = wire.encodeSync(buf[pos..]);
-            pos += sync.len;
         }
         return .{ .bytes_written = pos, .stmt_idx = idx };
     }

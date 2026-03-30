@@ -202,6 +202,11 @@ pub const PgConn = struct {
         return self.waiters[self.waiter_head];
     }
 
+    fn peekWaiterAt(self: *const PgConn, offset: usize) ?PgWaiter {
+        if (offset >= self.waiter_count) return null;
+        return self.waiters[(self.waiter_head + offset) % PG_WAITER_CAP];
+    }
+
     fn popWaiter(self: *PgConn) ?PgWaiter {
         if (self.waiter_count == 0) return null;
         const w = self.waiters[self.waiter_head];
@@ -1135,9 +1140,12 @@ pub const Pipeline = struct {
                 }
             }
 
-            // 3. Flush pending sends
+            // 3. Flush pending sends — append single Sync for entire batch
             const new_queries = pg.waiter_count - pg.in_flight;
             if (new_queries > 0 and pg.send_state == .idle and pg.send_len > 0) {
+                const wire_mod = @import("db/wire.zig");
+                const sync = wire_mod.encodeSync(pg.send_buf[pg.send_len..]);
+                pg.send_len += sync.len;
                 pg.in_flight += new_queries;
                 pg.send_state = .sending;
                 try self.submitPgSendFor(pg);
@@ -1155,48 +1163,63 @@ pub const Pipeline = struct {
 
     }
 
+    /// Parse PG responses from a batched Sync. Queries complete on CommandComplete
+    /// (not ReadyForQuery). Results are collected first, then all coroutines are
+    /// resumed together after parsing to avoid cascading re-yields.
+    ///
+    /// With batched Sync: N × (BindComplete + DataRow* + CommandComplete) + ReadyForQuery.
+    /// ReadyForQuery may arrive in a later recv — we don't wait for it.
     fn parsePgConnResponses(self: *Pipeline, pg: *PgConn) !void {
-        while (pg.in_flight > 0 and pg.waiter_count > 0) {
-            const status = try self.parseOnePgResponse(pg);
-            if (status == .incomplete) break;
-        }
-    }
-
-    /// Parse one complete postgres response (through ReadyForQuery).
-    /// If any message is incomplete, restores parse_pos and returns .incomplete.
-    fn parseOnePgResponse(self: *Pipeline, pg: *PgConn) !enum { complete, incomplete } {
         const wire = @import("db/wire.zig");
-        const save_pos = pg.parse_pos;
-        const waiter = pg.peekWaiter() orelse return .complete;
 
-        const stmt_entry = self.pg_stmt_cache.get(waiter.stmt_idx);
-        var col_descs: [64]wire.ColumnDesc = undefined;
-        var col_count: u16 = if (stmt_entry.described) stmt_entry.col_count else 0;
+        // Collected completed query results — resumed after parse loop
+        const CompletedQuery = struct { waiter: PgWaiter, result: *ffi.PyObject };
+        var completed: [PG_WAITER_CAP]CompletedQuery = undefined;
+        var completed_count: usize = 0;
+
+        // Per-query accumulation state
         var py_result: ?*ffi.PyObject = null;
         var py_list: ?*ffi.PyObject = null;
+        var waiter_offset: usize = 0;
+        var col_descs: [64]wire.ColumnDesc = undefined;
+        // Save position at the start of current query (not entire batch)
+        var query_save_pos: usize = pg.parse_pos;
 
-        while (true) {
+        while (waiter_offset < pg.waiter_count) {
             const data = pg.recv_buf[pg.parse_pos..pg.recv_len];
             if (data.len < 5) {
-                pg.parse_pos = save_pos;
+                // Incomplete mid-query — rollback current query only
+                pg.parse_pos = query_save_pos;
+                if (py_result) |r| ffi.decref(r);
                 if (py_list) |l| ffi.decref(l);
-                return .incomplete;
+                break;
             }
 
             const hdr = wire.readMessageHeader(data[0..5]) catch {
-                pg.parse_pos = save_pos;
+                pg.parse_pos = query_save_pos;
+                if (py_result) |r| ffi.decref(r);
                 if (py_list) |l| ffi.decref(l);
-                return .incomplete;
+                break;
             };
             const msg_len: usize = @intCast(hdr.length);
             if (data.len < 1 + msg_len) {
-                pg.parse_pos = save_pos;
+                pg.parse_pos = query_save_pos;
+                if (py_result) |r| ffi.decref(r);
                 if (py_list) |l| ffi.decref(l);
-                return .incomplete;
+                break;
             }
 
             const payload = data[5..][0 .. msg_len - 4];
             pg.parse_pos += 1 + msg_len;
+
+            // ReadyForQuery is a batch-level message, not per-query
+            if (hdr.tag == wire.BackendTag.ready_for_query) {
+                continue; // consume it, don't break — there may be more batches
+            }
+
+            const waiter = pg.peekWaiterAt(waiter_offset) orelse break;
+            const stmt_entry = self.pg_stmt_cache.get(waiter.stmt_idx);
+            const col_count: u16 = if (stmt_entry.described) stmt_entry.col_count else 0;
 
             switch (hdr.tag) {
                 wire.BackendTag.parse_complete, wire.BackendTag.bind_complete => continue,
@@ -1208,14 +1231,11 @@ pub const Pipeline = struct {
                     continue;
                 },
                 wire.BackendTag.row_description => {
-                    col_count = wire.parseRowDescription(payload, &col_descs) catch 0;
+                    const parsed_cols = wire.parseRowDescription(payload, &col_descs) catch 0;
                     if (!stmt_entry.described) {
-                        stmt_entry.col_count = col_count;
+                        stmt_entry.col_count = parsed_cols;
                         stmt_entry.described = true;
-                        // Cache Python key objects and serialization strategies.
-                        // Must happen now while col_descs.name slices still
-                        // point into valid recv buffer memory.
-                        for (0..col_count) |ki| {
+                        for (0..parsed_cols) |ki| {
                             stmt_entry.col_keys[ki] = ffi.unicodeFromSlice(col_descs[ki].name.ptr, col_descs[ki].name.len) catch null;
                             stmt_entry.col_strategies[ki] = snek_row.strategyForOid(col_descs[ki].type_oid);
                         }
@@ -1226,7 +1246,6 @@ pub const Pipeline = struct {
                     var values: [64]?[]const u8 = undefined;
                     const field_count = wire.parseDataRow(payload, &values) catch 0;
 
-                    // SnekRow with arena-backed field data
                     const conn_for_arena = self.conns.get_ptr(waiter.conn_idx);
                     const result_obj = if (snek_row.create(
                         &self.pg_stmt_cache,
@@ -1237,7 +1256,6 @@ pub const Pipeline = struct {
                     ) catch null) |row|
                         row
                     else blk: {
-                        // Fallback: build Python dict
                         const dict = try ffi.dictNew();
                         for (0..@min(col_count, field_count)) |i| {
                             const name = stmt_entry.col_keys[i] orelse continue;
@@ -1273,30 +1291,46 @@ pub const Pipeline = struct {
                         }
                         py_result = ffi.longFromLong(count) catch ffi.getNone();
                     }
-                },
-                wire.BackendTag.ready_for_query => {
+
                     const final_result = if (waiter.cmd == .FETCH_ALL)
                         py_list orelse (c.PyList_New(0) orelse return error.PythonError)
                     else
                         py_result orelse ffi.getNone();
 
-                    py_list = null;
+                    completed[completed_count] = .{ .waiter = waiter, .result = final_result };
+                    completed_count += 1;
                     py_result = null;
-
-                    _ = pg.popWaiter();
-                    pg.in_flight -= 1;
-                    try self.resumePgWaiter(waiter, final_result);
-                    return .complete;
+                    py_list = null;
+                    waiter_offset += 1;
+                    query_save_pos = pg.parse_pos; // this query is fully parsed
                 },
                 wire.BackendTag.error_response => {
                     if (py_list) |l| ffi.decref(l);
                     if (py_result) |r| ffi.decref(r);
                     py_list = null;
                     py_result = null;
-                    continue;
+                    // Error aborts remaining queries — fail them all
+                    for (completed[0..completed_count]) |cq| {
+                        ffi.decref(cq.result);
+                    }
+                    for (0..waiter_offset) |_| {
+                        _ = pg.popWaiter();
+                        pg.in_flight -= 1;
+                    }
+                    try self.failPgConnWaiters(pg);
+                    return;
                 },
                 else => continue,
             }
+        }
+
+        // Pop completed waiters and resume coroutines (outside parse loop)
+        for (0..completed_count) |_| {
+            _ = pg.popWaiter();
+            pg.in_flight -= 1;
+        }
+        for (completed[0..completed_count]) |cq| {
+            try self.resumePgWaiter(cq.waiter, cq.result);
         }
     }
 
