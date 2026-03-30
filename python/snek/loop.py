@@ -157,9 +157,6 @@ def _fast_gather(*coros_or_futures, return_exceptions=False):
 
 
 def _fast_gather_existing(*children, return_exceptions=False):
-    if _FUTURE_ADD_TO_AWAITED_BY is None or _FUTURE_DISCARD_FROM_AWAITED_BY is None:
-        return None
-
     loop = asyncio.events._get_running_loop()
     seen = set()
     snek_future_types = (_snek.Future, _snek.Task)
@@ -170,8 +167,8 @@ def _fast_gather_existing(*children, return_exceptions=False):
         if fut in seen:
             return None
         seen.add(fut)
-        child_loop = fut.get_loop()
-        if not isinstance(child_loop, EventLoop):
+        child_loop = fut._loop
+        if type(child_loop) is not EventLoop:
             return None
         if loop is None:
             loop = child_loop
@@ -181,25 +178,22 @@ def _fast_gather_existing(*children, return_exceptions=False):
     if loop is None:
         return None
 
-    cur_task = asyncio.current_task(loop)
     nfuts = len(children)
     nfinished = 0
     done_futs = []
     outer = None
 
-    def _done_callback(fut, cur_task=cur_task):
-        nonlocal nfinished
-        nfinished += 1
+    if not return_exceptions:
 
-        if cur_task is not None:
-            _FUTURE_DISCARD_FROM_AWAITED_BY(fut, cur_task)
+        def _done_callback(fut):
+            nonlocal nfinished
+            nfinished += 1
 
-        if outer is None or outer.done():
-            if fut._exception is not None:
-                fut.exception()
-            return
+            if outer is None or outer.done():
+                if fut._exception is not None:
+                    fut.exception()
+                return
 
-        if not return_exceptions:
             exc = fut._exception
             if exc is not None:
                 outer.set_exception(exc)
@@ -208,12 +202,26 @@ def _fast_gather_existing(*children, return_exceptions=False):
                 outer.set_exception(fut._make_cancelled_error())
                 return
 
-        if nfinished == nfuts:
-            if outer._cancel_requested:
-                outer.set_exception(fut._make_cancelled_error())
-            else:
-                if not return_exceptions:
-                    outer.set_result([child.result() for child in children])
+            if nfinished == nfuts:
+                if outer._cancel_requested:
+                    outer.set_exception(fut._make_cancelled_error())
+                else:
+                    outer.set_result([child._result for child in children])
+
+    else:
+
+        def _done_callback(fut):
+            nonlocal nfinished
+            nfinished += 1
+
+            if outer is None or outer.done():
+                if fut._exception is not None:
+                    fut.exception()
+                return
+
+            if nfinished == nfuts:
+                if outer._cancel_requested:
+                    outer.set_exception(fut._make_cancelled_error())
                     return
 
                 results = []
@@ -233,8 +241,6 @@ def _fast_gather_existing(*children, return_exceptions=False):
         if fut.done():
             done_futs.append(fut)
         else:
-            if cur_task is not None:
-                _FUTURE_ADD_TO_AWAITED_BY(fut, cur_task)
             fut.add_done_callback(_done_callback)
 
     outer = _SnekGatheringFuture(children, loop=loop)
