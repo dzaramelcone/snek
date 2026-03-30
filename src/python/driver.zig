@@ -13,6 +13,7 @@ const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
 const stmt_cache_mod = @import("../db/stmt_cache.zig");
+const snek_row = @import("snek_row.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
 
@@ -235,10 +236,30 @@ pub fn convertPythonResponse(py_result: *PyObject, resp_body_buf: []u8) ffi.Pyth
         }
     }
 
-    // Dict → JSON response
+    // Dict → JSON response (most common path)
     if (ffi.isDict(py_result)) {
         const json_str = try pyDictToJson(py_result, resp_body_buf);
         return response_mod.Response.json(json_str);
+    }
+
+    // SnekRow → SIMD JSON (PG zero-copy path)
+    if (snek_row.isSnekRow(py_result)) {
+        const written = snek_row.serializeOne(py_result, resp_body_buf) catch
+            return error.ConversionError;
+        return response_mod.Response.json(resp_body_buf[0..written]);
+    }
+
+    // List of SnekRows → JSON array
+    if (c.PyList_Check(py_result) != 0) {
+        const size = c.PyList_Size(py_result);
+        if (size > 0) {
+            const first = c.PyList_GetItem(py_result, 0);
+            if (first != null and snek_row.isSnekRow(first.?)) {
+                const written = snek_row.serializeList(py_result, resp_body_buf) catch
+                    return error.ConversionError;
+                return response_mod.Response.json(resp_body_buf[0..written]);
+            }
+        }
     }
 
     // String → text/plain

@@ -258,6 +258,8 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
         tl_py.?.acquireGil();
         const driver = @import("python/driver.zig");
         try driver.initStringCache();
+        const snek_row = @import("python/snek_row.zig");
+        try snek_row.initType();
         tl_py.?.releaseGil();
         tl_py_ctx = .{ .py = &tl_py.? };
         tl_ctx = .{ .py = tl_py.? };

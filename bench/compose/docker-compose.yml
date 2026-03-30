@@ -1,8 +1,12 @@
 services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: snek
+      POSTGRES_PASSWORD: snek
+      POSTGRES_DB: snek
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
   bench:
     build: .
     ports:
@@ -11,9 +15,15 @@ services:
     command: sleep infinity
     privileged: true
     depends_on:
-      - redis
+      - postgres
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: snek
+      PG_PASS: snek
+      PG_DB: snek
     volumes:
       - ../../python:/bench/snek_root
       - ../../zig-out/lib:/bench/snek_lib:ro
       - ./snek_app.py:/bench/snek_app.py:ro
-      - ./snek_redis_app.py:/bench/snek_redis_app.py:ro
+      - ../scenarios:/bench/scenarios:ro

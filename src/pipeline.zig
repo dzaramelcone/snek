@@ -29,6 +29,7 @@ const response_mod = @import("http/response.zig");
 const stmt_cache_mod = @import("db/stmt_cache.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
+const snek_row = @import("python/snek_row.zig");
 const perf = @import("observe/perf.zig");
 
 const log = std.log.scoped(.@"snek/pipeline");
@@ -105,6 +106,12 @@ pub const Conn = struct {
     // Lives until send completes. Eliminates resp_buf[8192].
     body_buf: [4096]u8 = undefined,
 
+    // Per-request arena for SnekRow field data.
+    // SnekRow objects point directly into arena-allocated memory.
+    // Reset after response is sent (in resetRecv).
+    arena: std.heap.ArenaAllocator = undefined,
+    arena_initialized: bool = false,
+
     // Embedded Task for backend udata round-trip.
     // The pipeline recovers Conn via @fieldParentPtr.
     task: Task = undefined,
@@ -114,12 +121,17 @@ pub const Conn = struct {
             self.zc = try ZeroCopy(u8).init(allocator, 4096);
             self.initialized = true;
         }
+        if (!self.arena_initialized) {
+            self.arena = std.heap.ArenaAllocator.init(allocator);
+            self.arena_initialized = true;
+        }
     }
 
     pub fn resetRecv(self: *Conn) void {
         self.zc.clear_retaining_capacity();
         self.head_parser = .{};
         self.head_fed = 0;
+        if (self.arena_initialized) _ = self.arena.reset(.retain_capacity);
         self.recv_slice = self.zc.get_write_area(4096) catch &.{};
     }
 };
@@ -276,8 +288,7 @@ pub const Pipeline = struct {
     pg_conn_count: u8 = 0,
     pg_next_conn: u8 = 0, // round-robin counter
     pg_last_conn: u8 = 0, // last connection selected by pgSendSlice
-    pg_wire_ns: u64 = 0, // wire parsing time (set by stagePostgres)
-    pg_py_ns: u64 = 0, // Python C API time (set by parseOnePgResponse)
+    pg_wire_ns: u64 = 0, // total pg parse+py time (set by stagePostgres)
     pg_stmt_cache: StmtCache = .{},
 
     // Stage timing stats
@@ -388,8 +399,7 @@ pub const Pipeline = struct {
         self.stats.ns_handle += t_handle.since(t_parse);
         self.stats.ns_redis += t_redis.since(t_handle);
         self.stats.ns_pg_wire += self.pg_wire_ns;
-        self.stats.ns_pg_py += self.pg_py_ns;
-        self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_wire_ns -| self.pg_py_ns;
+        self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_wire_ns;
         self.stats.pg_rows += pg_rows_before -| self.totalPgWaiters();
         self.stats.ns_send += t_send.since(t_pg);
 
@@ -408,7 +418,6 @@ pub const Pipeline = struct {
         ns_handle: u64 = 0,
         ns_redis: u64 = 0,
         ns_pg_wire: u64 = 0,
-        ns_pg_py: u64 = 0,
         ns_pg_flush: u64 = 0,
         pg_rows: u64 = 0,
         ns_send: u64 = 0,
@@ -462,7 +471,7 @@ pub const Pipeline = struct {
         }
 
         fn dump(self: *Stats) void {
-            const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_py + self.ns_pg_flush + self.ns_send;
+            const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_flush + self.ns_send;
             const reqs = self.completions;
             const us = struct {
                 fn f(ns: u64) u64 {
@@ -470,8 +479,8 @@ pub const Pipeline = struct {
                 }
             }.f;
             log.info(
-                "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  pg_wire={d}us  pg_py={d}us({d}rows)  pg_flush={d}us  send={d}us",
-                .{ self.cycles, reqs, us(total), us(self.ns_io), us(self.ns_classify), us(self.ns_parse), us(self.ns_handle), us(self.ns_redis), us(self.ns_pg_wire), us(self.ns_pg_py), self.pg_rows, us(self.ns_pg_flush), us(self.ns_send) },
+                "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  pg={d}us({d}rows)  pg_flush={d}us  send={d}us",
+                .{ self.cycles, reqs, us(total), us(self.ns_io), us(self.ns_classify), us(self.ns_parse), us(self.ns_handle), us(self.ns_redis), us(self.ns_pg_wire), self.pg_rows, us(self.ns_pg_flush), us(self.ns_send) },
             );
             if (comptime has_pmu) {
                 if (self.pmu.cpu_cycles > 0) {
@@ -495,7 +504,6 @@ pub const Pipeline = struct {
             self.ns_handle = 0;
             self.ns_redis = 0;
             self.ns_pg_wire = 0;
-            self.ns_pg_py = 0;
             self.ns_pg_flush = 0;
             self.pg_rows = 0;
             self.ns_send = 0;
@@ -1104,7 +1112,6 @@ pub const Pipeline = struct {
     /// GIL is already held from stageHandle.
     fn stagePostgres(self: *Pipeline) !void {
         self.pg_wire_ns = 0;
-        self.pg_py_ns = 0;
         if (self.pg_conn_count == 0) return;
 
         for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
@@ -1116,11 +1123,8 @@ pub const Pipeline = struct {
             // 2. Parse responses
             if (pg.recv_state == .parsing) {
                 const t0 = try std.time.Instant.now();
-                const py_before = self.pg_py_ns;
                 try self.parsePgConnResponses(pg);
-                const elapsed = (try std.time.Instant.now()).since(t0);
-                const py_during = self.pg_py_ns - py_before;
-                self.pg_wire_ns += elapsed -| py_during;
+                self.pg_wire_ns += (try std.time.Instant.now()).since(t0);
 
                 if (pg.in_flight > 0) {
                     pg.compactRecv();
@@ -1208,43 +1212,56 @@ pub const Pipeline = struct {
                     if (!stmt_entry.described) {
                         stmt_entry.col_count = col_count;
                         stmt_entry.described = true;
-                        // Cache Python key objects for column names.
+                        // Cache Python key objects and serialization strategies.
                         // Must happen now while col_descs.name slices still
                         // point into valid recv buffer memory.
                         for (0..col_count) |ki| {
                             stmt_entry.col_keys[ki] = ffi.unicodeFromSlice(col_descs[ki].name.ptr, col_descs[ki].name.len) catch null;
+                            stmt_entry.col_strategies[ki] = snek_row.strategyForOid(col_descs[ki].type_oid);
                         }
-                        stmt_entry.keys_cached = true;
+                        stmt_entry.buildJsonKeys();
                     }
                 },
                 wire.BackendTag.data_row => {
                     var values: [64]?[]const u8 = undefined;
                     const field_count = wire.parseDataRow(payload, &values) catch 0;
 
-                    const py_t0 = try std.time.Instant.now();
-                    const dict = try ffi.dictNew();
-                    for (0..@min(col_count, field_count)) |i| {
-                        const name = stmt_entry.col_keys[i] orelse continue;
-                        if (values[i]) |val| {
-                            const val_obj = try ffi.unicodeFromSlice(val.ptr, val.len);
-                            defer ffi.decref(val_obj);
-                            try ffi.dictSetItem(dict, name, val_obj);
-                        } else {
-                            try ffi.dictSetItem(dict, name, ffi.none());
+                    // SnekRow with arena-backed field data
+                    const conn_for_arena = self.conns.get_ptr(waiter.conn_idx);
+                    const result_obj = if (snek_row.create(
+                        &self.pg_stmt_cache,
+                        waiter.stmt_idx,
+                        @intCast(@min(col_count, field_count)),
+                        values[0..@min(col_count, field_count)],
+                        conn_for_arena.arena.allocator(),
+                    ) catch null) |row|
+                        row
+                    else blk: {
+                        // Fallback: build Python dict
+                        const dict = try ffi.dictNew();
+                        for (0..@min(col_count, field_count)) |i| {
+                            const name = stmt_entry.col_keys[i] orelse continue;
+                            if (values[i]) |val| {
+                                const val_obj = try ffi.unicodeFromSlice(val.ptr, val.len);
+                                defer ffi.decref(val_obj);
+                                try ffi.dictSetItem(dict, name, val_obj);
+                            } else {
+                                try ffi.dictSetItem(dict, name, ffi.none());
+                            }
                         }
-                    }
-                    self.pg_py_ns += (try std.time.Instant.now()).since(py_t0);
+                        break :blk dict;
+                    };
 
                     switch (waiter.cmd) {
                         .FETCH_ONE => {
-                            if (py_result == null) py_result = dict else ffi.decref(dict);
+                            if (py_result == null) py_result = result_obj else ffi.decref(result_obj);
                         },
                         .FETCH_ALL => {
                             if (py_list == null) py_list = c.PyList_New(0) orelse return error.PythonError;
-                            if (c.PyList_Append(py_list.?, dict) != 0) return error.PythonError;
-                            ffi.decref(dict);
+                            if (c.PyList_Append(py_list.?, result_obj) != 0) return error.PythonError;
+                            ffi.decref(result_obj);
                         },
-                        .EXECUTE => ffi.decref(dict),
+                        .EXECUTE => ffi.decref(result_obj),
                     }
                 },
                 wire.BackendTag.command_complete => {
@@ -1268,9 +1285,7 @@ pub const Pipeline = struct {
 
                     _ = pg.popWaiter();
                     pg.in_flight -= 1;
-                    const py_t0 = try std.time.Instant.now();
                     try self.resumePgWaiter(waiter, final_result);
-                    self.pg_py_ns += (try std.time.Instant.now()).since(py_t0);
                     return .complete;
                 },
                 wire.BackendTag.error_response => {

@@ -78,39 +78,11 @@ pub const Client = struct {
         database: []const u8,
         password: ?[]const u8,
     ) !Client {
-        // Resolve address — use IPv4 loopback for "127.0.0.1", otherwise parse
-        const addr = blk: {
-            var sa: posix.sockaddr.in = .{
-                .port = mem.nativeTo(u16, port, .big),
-                .addr = undefined,
-            };
-            // Parse dotted-quad IPv4
-            var octets: [4]u8 = undefined;
-            var octet_idx: usize = 0;
-            var cur: u16 = 0;
-            for (host) |c| {
-                if (c == '.') {
-                    if (octet_idx >= 4) return error.InvalidAddress;
-                    octets[octet_idx] = @intCast(cur);
-                    octet_idx += 1;
-                    cur = 0;
-                } else if (c >= '0' and c <= '9') {
-                    cur = cur * 10 + (c - '0');
-                    if (cur > 255) return error.InvalidAddress;
-                } else {
-                    return error.InvalidAddress;
-                }
-            }
-            if (octet_idx != 3) return error.InvalidAddress;
-            octets[3] = @intCast(cur);
-            sa.addr = @bitCast(octets);
-            break :blk sa;
-        };
-
-        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        const fd = if (host.len > 0 and host[0] == '/')
+            try connectUnix(host, port)
+        else
+            try connectTcp(host, port);
         errdefer posix.close(fd);
-
-        try posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
 
         var client = Client{ .fd = fd, .allocator = allocator };
 
@@ -145,6 +117,26 @@ pub const Client = struct {
     }
 
     // ─── Internal helpers ────────────────────────────────────────────
+
+    /// Connect via Unix domain socket. Path is the socket directory,
+    /// socket file is `.s.PGSQL.<port>` per PG convention.
+    fn connectUnix(dir: []const u8, port: u16) !posix.socket_t {
+        var path_buf: [108]u8 = undefined; // sun_path max
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.s.PGSQL.{d}\x00", .{ dir, port }) catch
+            return error.InvalidAddress;
+        var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+        @memcpy(addr.path[0..path.len], path[0..path.len]);
+        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        errdefer posix.close(fd);
+        try posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        return fd;
+    }
+
+    /// Connect via TCP. Handles both numeric IPs and hostnames.
+    fn connectTcp(host: []const u8, port: u16) !posix.socket_t {
+        const stream = try std.net.tcpConnectToHost(std.heap.page_allocator, host, port);
+        return stream.handle;
+    }
 
     fn sendAll(self: *Client, data: []const u8) !void {
         var sent: usize = 0;
