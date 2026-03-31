@@ -597,6 +597,77 @@ def _find_keyword_at_depth(sql: str, keyword: str, target_depth: int) -> int | N
     return None
 
 
+def _copy_column(
+    col: Column,
+    *,
+    name: str | None = None,
+    is_nullable: bool | None = None,
+) -> Column:
+    return Column(
+        name=name or col.name,
+        pg_type=col.pg_type,
+        python_type=col.python_type,
+        is_array=col.is_array,
+        is_nullable=col.is_nullable if is_nullable is None else is_nullable,
+        has_default=col.has_default,
+        escape_strategy=col.escape_strategy,
+    )
+
+
+def _select_item_field_name(item: SelectItem) -> str | None:
+    if item.as_name:
+        return item.as_name
+    if item.column and item.column != "*":
+        return item.column
+    return None
+
+
+def _resolve_select_item_column(
+    item: SelectItem,
+    joins: list[JoinInfo],
+    tables: dict[str, Table],
+) -> Column | None:
+    alias_to_join = {join.alias: join for join in joins}
+
+    if item.alias and item.column:
+        join = alias_to_join.get(item.alias)
+        if join is None:
+            return None
+        table = tables.get(join.table)
+        if table is None:
+            return None
+        for col in table.columns:
+            if col.name == item.column:
+                return _copy_column(col, is_nullable=col.is_nullable or join.is_left)
+        return None
+
+    if item.column and item.column != "*":
+        matches: list[tuple[JoinInfo, Column]] = []
+        for join in joins:
+            table = tables.get(join.table)
+            if table is None:
+                continue
+            for col in table.columns:
+                if col.name == item.column:
+                    matches.append((join, col))
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous bare column '{item.column}' in SELECT; qualify it with a table alias"
+            )
+        if len(matches) == 1:
+            join, col = matches[0]
+            return _copy_column(col, is_nullable=col.is_nullable or join.is_left)
+
+    return None
+
+
+def _column_annotation(col: Column) -> str:
+    py_type = col.python_type
+    if col.is_nullable and not col.has_default:
+        py_type = f"{py_type} | None"
+    return py_type
+
+
 def _infer_return_columns(
     sql: str, tables: dict[str, Table]
 ) -> tuple[str | None, list[Column], list[SelectItem], list[JoinInfo]]:
@@ -653,32 +724,26 @@ def _infer_return_columns(
             table_name = alias_to_table.get(item.alias)
             if table_name and table_name in tables:
                 for col in tables[table_name].columns:
-                    columns.append(Column(
-                        name=col.name, pg_type=col.pg_type,
-                        python_type=col.python_type, is_array=col.is_array,
-                        is_nullable=col.is_nullable, has_default=col.has_default,
-                        escape_strategy=col.escape_strategy,
-                    ))
+                    columns.append(_copy_column(col))
         elif item.alias and item.column:
             # alias.column → single column from that table
-            table_name = alias_to_table.get(item.alias)
-            if table_name and table_name in tables:
-                for col in tables[table_name].columns:
-                    if col.name == item.column:
-                        columns.append(Column(
-                            name=col.name, pg_type=col.pg_type,
-                            python_type=col.python_type, is_array=col.is_array,
-                            is_nullable=col.is_nullable, has_default=col.has_default,
-                            escape_strategy=col.escape_strategy,
-                        ))
-                        break
-        elif item.as_name:
-            # Expression AS name → infer type from cast if present
-            py_type = _infer_expression_type(item.expression)
-            columns.append(Column(
-                name=item.as_name, pg_type="unknown",
-                python_type=py_type, escape_strategy="raw",
-            ))
+            resolved = _resolve_select_item_column(item, joins, tables)
+            if resolved is not None:
+                columns.append(_copy_column(
+                    resolved,
+                    name=_select_item_field_name(item),
+                ))
+        elif (field_name := _select_item_field_name(item)) is not None:
+            resolved = _resolve_select_item_column(item, joins, tables)
+            if resolved is not None:
+                columns.append(_copy_column(resolved, name=field_name))
+            else:
+                # Expression AS name - infer type from cast if present.
+                py_type = _infer_expression_type(item.expression)
+                columns.append(Column(
+                    name=field_name, pg_type="unknown",
+                    python_type=py_type, escape_strategy="raw",
+                ))
 
     return None, columns, select_items, joins
 
@@ -797,8 +862,41 @@ def _emit_row_type(
         else:
             bare_items.append(item)
 
+    # Track select-order positions for alias-backed nested models and named
+    # scalar expressions so runtime serialization can reconstruct nested JSON
+    # directly from the flat row buffer.
+    alias_positions: dict[str, list[int]] = {}
+    alias_field_names: dict[str, list[str]] = {}
+    scalar_indexes: dict[str, int] = {}
+    select_index = 0
+    for item in query.select_items:
+        if not item.alias:
+            field_name = _select_item_field_name(item)
+            if field_name:
+                scalar_indexes[field_name] = select_index
+            select_index += 1
+            continue
+
+        alias_positions.setdefault(item.alias, [])
+        alias_field_names.setdefault(item.alias, [])
+        join = alias_to_join.get(item.alias)
+        table_name = join.table if join else None
+
+        if item.column == "*" and table_name and table_name in tables:
+            for col in tables[table_name].columns:
+                alias_field_names[item.alias].append(col.name)
+                alias_positions[item.alias].append(select_index)
+                select_index += 1
+            continue
+
+        field_name = item.column or item.as_name or f"col_{select_index}"
+        alias_field_names[item.alias].append(field_name)
+        alias_positions[item.alias].append(select_index)
+        select_index += 1
+
     # Emit partial/nested types for each alias group
     row_fields: list[tuple[str, str]] = []  # (field_name, type_name)
+    nested_entries: list[tuple[str, str, bool, list[str], list[int]]] = []
 
     for alias, items in alias_items.items():
         join = alias_to_join.get(alias)
@@ -825,15 +923,29 @@ def _emit_row_type(
             lines.extend(_emit_model_class(partial_class, partial_cols))
             type_name = partial_class
 
+        base_type_name = type_name
         if is_left:
             type_name = f"{type_name} | None"
         row_fields.append((alias, type_name))
+        nested_entries.append((
+            alias,
+            base_type_name,
+            is_left,
+            alias_field_names.get(alias, []),
+            alias_positions.get(alias, []),
+        ))
 
     # Add bare expression fields (computed columns)
     for item in bare_items:
-        if item.as_name:
+        field_name = _select_item_field_name(item)
+        if not field_name:
+            continue
+        resolved = _resolve_select_item_column(item, query.joins, tables)
+        if resolved is not None:
+            py_type = _column_annotation(resolved)
+        else:
             py_type = _infer_expression_type(item.expression)
-            row_fields.append((item.as_name, py_type))
+        row_fields.append((field_name, py_type))
 
     # Emit the row class
     lines.append("")
@@ -841,6 +953,18 @@ def _emit_row_type(
     if not row_fields:
         lines.append("    pass")
     else:
+        if nested_entries:
+            lines.append("    __snek_nested__ = {")
+            for alias, type_name, is_left, field_names, field_indexes in nested_entries:
+                field_names_tuple = repr(tuple(field_names))
+                index_tuple = repr(tuple(field_indexes))
+                lines.append(
+                    f"        {alias!r}: ({type_name}, {is_left}, {field_names_tuple}, {index_tuple}),"
+                )
+            lines.append("    }")
+            field_order = repr(tuple(field_name for field_name, _field_type in row_fields))
+            lines.append(f"    __snek_field_order__ = {field_order}")
+            lines.append(f"    __snek_scalar_indexes__ = {scalar_indexes!r}")
         for field_name, field_type in row_fields:
             lines.append(f"    {field_name}: {field_type}")
     lines.append("")
@@ -853,8 +977,11 @@ def emit_queries(queries: list[Query], tables: dict[str, Table], models_module: 
     # Collect model imports
     model_names: set[str] = set()
     for q in queries:
-        if q.returns_table and q.returns_table in tables:
-            model_names.add(_to_class_name(q.returns_table))
+        if q.kind not in ("one", "many", "batch"):
+            continue
+        model_name = _return_type_name(q, tables)
+        if model_name != "dict":
+            model_names.add(model_name)
 
     lines: list[str] = [
         "# Generated by snek codegen. DO NOT EDIT.",
@@ -919,6 +1046,11 @@ def _emit_single_method(query: Query, tables: dict[str, Table]) -> list[str]:
     cmd_map = {"one": "FETCH_ONE", "many": "FETCH_ALL", "exec": "EXECUTE", "execrows": "EXECUTE"}
     cmd = cmd_map[query.kind]
     const_name = query.func_name.upper()
+    typed_cmd = None
+    if query.kind == "one" and model_name != "dict":
+        typed_cmd = "FETCH_ONE_MODEL"
+    elif query.kind == "many" and model_name != "dict":
+        typed_cmd = "FETCH_ALL_MODEL"
 
     lines = [
         "",
@@ -926,11 +1058,18 @@ def _emit_single_method(query: Query, tables: dict[str, Table]) -> list[str]:
         f"    def {query.func_name}(self{params_sig}) -> {ret_type}:",
     ]
 
+    emitted_cmd = typed_cmd or cmd
     if query.params:
         param_args = ", ".join(p.name for p in query.params)
-        lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}, {param_args}))")
+        if typed_cmd:
+            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}, {model_name}, {param_args}))")
+        else:
+            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}, {param_args}))")
     else:
-        lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}))")
+        if typed_cmd:
+            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}, {model_name}))")
+        else:
+            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}))")
 
     lines.append("")
     return lines
@@ -941,6 +1080,7 @@ def _emit_batch_method(query: Query, tables: dict[str, Table]) -> list[str]:
     params_class = query.name + "Params"
     model_name = _return_type_name(query, tables)
     const_name = query.func_name.upper()
+    cmd = "FETCH_ALL_MODEL" if model_name != "dict" else "FETCH_ALL"
 
     lines = [
         "",
@@ -952,7 +1092,10 @@ def _emit_batch_method(query: Query, tables: dict[str, Table]) -> list[str]:
         lines.append(f"        _{p.name} = [r.{p.name} for r in rows]")
 
     param_args = ", ".join(f"_{p.name}" for p in query.params)
-    lines.append(f"        return (yield (_DbCmd.FETCH_ALL, {const_name}, {param_args}))")
+    if model_name != "dict":
+        lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}, {model_name}, {param_args}))")
+    else:
+        lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}, {param_args}))")
     lines.append("")
     return lines
 

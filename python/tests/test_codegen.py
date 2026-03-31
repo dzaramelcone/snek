@@ -8,6 +8,7 @@ from snek.codegen import (
     Column,
     Query,
     QueryParam,
+    SelectItem,
     Table,
     _infer_return_columns,
     _rewrite_params,
@@ -494,6 +495,36 @@ class TestEmitQueries:
         code = emit_queries(queries, tables, "models")
         assert "-> list[T]:" in code
 
+    def test_model_methods_emit_typed_pg_sentinels(self):
+        tables = {
+            "users": Table("users", [
+                Column("id", "text", "str", has_default=True),
+                Column("name", "text", "str"),
+            ]),
+        }
+        queries = [Query(
+            "GetUser", "get_user", "one",
+            "SELECT * FROM users WHERE id = {id}",
+            "SELECT * FROM users WHERE id = $1",
+            params=[QueryParam("id", 1)],
+            returns_table="users",
+        )]
+        code = emit_queries(queries, tables, "models")
+        assert "return (yield (_DbCmd.FETCH_ONE_MODEL, GET_USER, User, id))" in code
+
+    def test_row_models_are_imported_for_typed_queries(self):
+        query = Query(
+            "GetStats",
+            "get_stats",
+            "one",
+            "SELECT COUNT(*)::INT AS count",
+            "SELECT COUNT(*)::INT AS count",
+            select_items=[SelectItem(alias="", column="", expression="COUNT(*)::INT", as_name="count")],
+        )
+        code = emit_queries([query], {}, "models")
+        assert "from models import GetStatsRow" in code
+        assert "return (yield (_DbCmd.FETCH_ONE_MODEL, GET_STATS, GetStatsRow))" in code
+
     def test_exec_method(self):
         tables = {"t": Table("t", [Column("id", "text", "str")])}
         queries = [Query(
@@ -606,3 +637,47 @@ class TestEndToEnd:
         )
         assert "$1::text[]" in db
         assert len([l for l in db.split("\n") if "ids" in l and "def " in l]) == 1
+
+    def test_bare_column_scalars_do_not_require_aliases(self):
+        models, db = self._run(
+            "CREATE TABLE ideas (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    description TEXT NOT NULL,\n"
+            "    created_at TIMESTAMPTZ NOT NULL DEFAULT now()\n"
+            ");",
+            "-- name: GetIdeaLite :one\n"
+            "SELECT id, description, created_at FROM ideas WHERE id = {id};",
+        )
+        assert "class GetIdeaLiteRow(Model):" in models
+        assert "    id: str" in models
+        assert "    description: str" in models
+        assert "    created_at: datetime" in models
+        assert "def get_idea_lite(self, *, id: str) -> GetIdeaLiteRow | None:" in db
+
+    def test_mixed_alias_and_bare_scalars_track_field_order(self):
+        schema_sql = (
+            "CREATE TABLE ideas (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    description TEXT NOT NULL\n"
+            ");\n"
+            "CREATE TABLE theses (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    idea_id TEXT NOT NULL REFERENCES ideas(id),\n"
+            "    summary TEXT NOT NULL\n"
+            ");"
+        )
+        query_sql = (
+            "-- name: GetIdeaWithBareSummary :one\n"
+            "SELECT idea.id, idea.description, summary\n"
+            "FROM ideas idea\n"
+            "JOIN theses thesis ON thesis.idea_id = idea.id\n"
+            "WHERE idea.id = {id};"
+        )
+        models, db = self._run(schema_sql, query_sql)
+        assert "class GetIdeaWithBareSummaryRow(Model):" in models
+        assert "class GetIdeaWithBareSummaryRowIdea(Model):" in models
+        assert "    idea: GetIdeaWithBareSummaryRowIdea" in models
+        assert "    summary: str" in models
+        assert "    __snek_field_order__ = ('idea', 'summary')" in models
+        assert "    __snek_scalar_indexes__ = {'summary': 2}" in models
+        assert "def get_idea_with_bare_summary(self, *, id: str) -> GetIdeaWithBareSummaryRow | None:" in db

@@ -141,6 +141,7 @@ fn statusLine(code: u16) []const u8 {
         404 => "HTTP/1.1 404 Not Found\r\n",
         405 => "HTTP/1.1 405 Method Not Allowed\r\n",
         500 => "HTTP/1.1 500 Internal Server Error\r\n",
+        503 => "HTTP/1.1 503 Service Unavailable\r\n",
         else => "HTTP/1.1 200 OK\r\n",
     };
 }

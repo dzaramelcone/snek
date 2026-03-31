@@ -27,3 +27,13 @@ services:
       - ../../zig-out/lib:/bench/snek_lib:ro
       - ./snek_app.py:/bench/snek_app.py:ro
       - ../scenarios:/bench/scenarios:ro
+  may-minihttp:
+    build: ../may-minihttp
+    ports:
+      - "8081:8080"
+    privileged: true
+    cpus: 14
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: "postgres://snek:snek@postgres/snek"

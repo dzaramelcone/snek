@@ -48,63 +48,122 @@ pub fn runString(code: [*:0]const u8) PythonError!void {
     if (c.PyRun_SimpleString(code) != 0) return error.PythonError;
 }
 
+/// Import a Python module by name without printing exceptions.
+pub fn importModuleRaw(name: [*:0]const u8) PythonError!*PyObject {
+    return c.PyImport_ImportModule(name) orelse error.ImportError;
+}
+
 /// Import a Python module by name. Caller must decref the returned object.
 pub fn importModule(name: [*:0]const u8) PythonError!*PyObject {
-    return c.PyImport_ImportModule(name) orelse {
-        c.PyErr_Print();
-        return error.ImportError;
+    return importModuleRaw(name) catch |err| {
+        errPrint();
+        return err;
     };
+}
+
+/// Get an attribute from a Python object without printing exceptions.
+pub fn getAttrRaw(obj: *PyObject, attr: [*:0]const u8) PythonError!*PyObject {
+    return c.PyObject_GetAttrString(obj, attr) orelse error.AttributeError;
 }
 
 /// Get an attribute from a Python object. Caller must decref the result.
 pub fn getAttr(obj: *PyObject, attr: [*:0]const u8) PythonError!*PyObject {
+    return getAttrRaw(obj, attr) catch |err| {
+        errPrint();
+        return err;
+    };
+}
+
+/// Get an attribute if present, clearing AttributeError for missing attrs.
+pub fn getAttrOptional(obj: *PyObject, attr: [*:0]const u8) PythonError!?*PyObject {
     return c.PyObject_GetAttrString(obj, attr) orelse {
-        c.PyErr_Print();
+        if (c.PyErr_ExceptionMatches(c.PyExc_AttributeError) != 0) {
+            c.PyErr_Clear();
+            return null;
+        }
         return error.AttributeError;
     };
+}
+
+/// Set an attribute on a Python object without printing exceptions.
+pub fn setAttrRaw(obj: *PyObject, attr: [*:0]const u8, value: *PyObject) PythonError!void {
+    if (c.PyObject_SetAttrString(obj, attr, value) != 0) return error.AttributeError;
 }
 
 /// Set an attribute on a Python object.
 pub fn setAttr(obj: *PyObject, attr: [*:0]const u8, value: *PyObject) PythonError!void {
-    if (c.PyObject_SetAttrString(obj, attr, value) != 0) {
-        c.PyErr_Print();
-        return error.AttributeError;
-    }
+    return setAttrRaw(obj, attr, value) catch |err| {
+        errPrint();
+        return err;
+    };
+}
+
+/// Call a Python callable with optional args tuple without printing exceptions.
+pub fn callObjectRaw(callable: *PyObject, args: ?*PyObject) PythonError!*PyObject {
+    return c.PyObject_CallObject(callable, args) orelse error.CallError;
 }
 
 /// Call a Python callable with optional args tuple. Caller must decref result.
 pub fn callObject(callable: *PyObject, args: ?*PyObject) PythonError!*PyObject {
-    return c.PyObject_CallObject(callable, args) orelse {
-        c.PyErr_Print();
-        return error.CallError;
+    return callObjectRaw(callable, args) catch |err| {
+        errPrint();
+        return err;
     };
+}
+
+/// Call a Python callable with kwargs without printing exceptions.
+pub fn callObjectKwargsRaw(callable: *PyObject, args: ?*PyObject, kwargs: *PyObject) PythonError!*PyObject {
+    return c.PyObject_Call(callable, args, kwargs) orelse error.CallError;
 }
 
 /// Vectorcall a Python callable with no arguments (PEP 590).
 /// Fastest calling convention — no tuple creation, no method lookup.
 pub fn vectorcallNoArgs(callable: *PyObject) PythonError!*PyObject {
-    return c.PyObject_Vectorcall(callable, null, 0, null) orelse {
-        c.PyErr_Print();
-        return error.CallError;
-    };
+    return c.PyObject_Vectorcall(callable, null, 0, null) orelse error.CallError;
 }
 
 /// Vectorcall a Python callable with a single positional argument (PEP 590).
 /// Avoids tuple creation — passes a stack array directly.
 pub fn vectorcallOneArg(callable: *PyObject, arg: *PyObject) PythonError!*PyObject {
     var args = [1]?*PyObject{arg};
-    return c.PyObject_Vectorcall(callable, @ptrCast(&args), 1, null) orelse {
-        c.PyErr_Print();
-        return error.CallError;
-    };
+    return c.PyObject_Vectorcall(callable, @ptrCast(&args), 1, null) orelse error.CallError;
+}
+
+/// Call a Python callable with no args using the CPython fast path.
+pub fn callNoArgs(callable: *PyObject) PythonError!*PyObject {
+    return c.PyObject_CallNoArgs(callable) orelse error.CallError;
+}
+
+/// Call a Python callable with one positional arg using the CPython fast path.
+pub fn callOneArg(callable: *PyObject, arg: *PyObject) PythonError!*PyObject {
+    return c.PyObject_CallOneArg(callable, arg) orelse error.CallError;
 }
 
 /// Call a Python callable with args tuple and kwargs dict. Caller must decref result.
 pub fn callObjectKwargs(callable: *PyObject, args: ?*PyObject, kwargs: *PyObject) PythonError!*PyObject {
-    return c.PyObject_Call(callable, args, kwargs) orelse {
-        c.PyErr_Print();
-        return error.CallError;
+    return callObjectKwargsRaw(callable, args, kwargs) catch |err| {
+        errPrint();
+        return err;
     };
+}
+
+pub fn callMethodNoArgs(obj: *PyObject, method: [*:0]const u8) PythonError!*PyObject {
+    const callable = try getAttrRaw(obj, method);
+    defer decref(callable);
+    return callNoArgs(callable);
+}
+
+pub fn callOptionalNoArgs(obj: *PyObject, method: [*:0]const u8) PythonError!?*PyObject {
+    const callable = try getAttrOptional(obj, method);
+    if (callable == null) return null;
+    defer decref(callable.?);
+    return callNoArgs(callable.?);
+}
+
+pub fn callMethodOneArg(obj: *PyObject, method: [*:0]const u8, arg: *PyObject) PythonError!*PyObject {
+    const callable = try getAttrRaw(obj, method);
+    defer decref(callable);
+    return callOneArg(callable, arg);
 }
 
 // ── Reference counting ──────────────────────────────────────────────
@@ -115,6 +174,11 @@ pub fn incref(obj: *PyObject) void {
 
 pub fn decref(obj: *PyObject) void {
     c.Py_DecRef(obj);
+}
+
+pub fn increfBorrowed(obj: *PyObject) *PyObject {
+    incref(obj);
+    return obj;
 }
 
 pub fn xincref(obj: ?*PyObject) void {
@@ -207,10 +271,7 @@ pub fn unicodeFromSlice(ptr: [*]const u8, len: usize) PythonError!*PyObject {
 }
 
 pub fn unicodeAsUTF8(obj: *PyObject) PythonError![*:0]const u8 {
-    return c.PyUnicode_AsUTF8(obj) orelse {
-        c.PyErr_Print();
-        return error.ConversionError;
-    };
+    return c.PyUnicode_AsUTF8(obj) orelse error.ConversionError;
 }
 
 pub fn boolFromBool(v: bool) *PyObject {
@@ -286,6 +347,11 @@ pub fn dictSetItemString(dict: *PyObject, key: [*:0]const u8, value: *PyObject) 
 /// Set a dict item using a PyObject key (avoids temporary string creation).
 pub fn dictSetItem(dict: *PyObject, key: *PyObject, value: *PyObject) PythonError!void {
     if (c.PyDict_SetItem(dict, key, value) != 0) return error.PythonError;
+}
+
+/// Returns a borrowed reference (do not decref).
+pub fn dictGetItem(dict: *PyObject, key: *PyObject) ?*PyObject {
+    return c.PyDict_GetItem(dict, key);
 }
 
 /// Returns a borrowed reference (do not decref).
@@ -398,10 +464,13 @@ pub fn dictNext(dict: *PyObject, pos: *isize, key: *?*PyObject, value: *?*PyObje
 
 /// Get Python object's string representation. Caller must decref.
 pub fn objectStr(obj: *PyObject) PythonError!*PyObject {
-    return c.PyObject_Str(obj) orelse {
-        c.PyErr_Print();
-        return error.ConversionError;
-    };
+    return c.PyObject_Str(obj) orelse error.ConversionError;
+}
+
+pub fn objectIsTrue(obj: *PyObject) PythonError!bool {
+    const result = c.PyObject_IsTrue(obj);
+    if (result < 0) return error.ConversionError;
+    return result == 1;
 }
 
 /// Create a PyModuleDef with the given name and methods table.

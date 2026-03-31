@@ -39,3 +39,17 @@ Use the Dockerfile for consistent environments:
 docker build -t snek-bench bench/
 docker run --rm snek-bench
 ```
+
+## Linux Container Note
+
+When building the Python extension locally for the Linux `bench/compose` container,
+use the GNU target triple:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+```
+
+Using `aarch64-linux` produced an ELF with `libc.so` as a direct dependency,
+which does not load in the Debian-based bench container. The `-gnu` target
+produces the expected `libc.so.6` dependency and can be copied or mounted into
+the container directly.

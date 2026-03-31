@@ -17,6 +17,10 @@ COPY app.py /bench/app.py
 # After building, extract with:
 #   docker compose run --rm bench tar czf - -C / usr/local/include/python3.14 usr/local/lib/libpython3.14.so | \
 #     tar xzf - -C sysroot/linux-aarch64 --strip-components=2
+# When cross-building the extension for this container on macOS, prefer:
+#   zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+# Plain `aarch64-linux` can emit a `.so` with a `libc.so` dependency that
+# will not load in this Debian userspace.
 RUN mkdir -p /sysroot/include /sysroot/lib && \
     cp -r /usr/local/include/python3.14 /sysroot/include/ && \
     cp /usr/local/lib/libpython3.14.so /sysroot/lib/ 2>/dev/null || \

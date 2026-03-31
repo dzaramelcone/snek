@@ -7,11 +7,90 @@ Schema generation stays in Python (introspecting annotations).
 from __future__ import annotations
 
 import inspect
+import types
+import typing
 from datetime import datetime
 from typing import Any, ClassVar, get_type_hints
 
 # Registry of all Model subclasses, keyed by qualified name.
 _model_registry: dict[str, type[Model]] = {}
+
+
+class _RowState:
+    __slots__ = ("dirty",)
+
+    def __init__(self) -> None:
+        self.dirty = False
+
+
+class _TrackedList(list[Any]):
+    __slots__ = ("_snek_state",)
+
+    def __init__(self, values: list[Any], state: _RowState) -> None:
+        super().__init__(values)
+        self._snek_state = state
+
+    def _mark_dirty(self) -> None:
+        self._snek_state.dirty = True
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        if isinstance(index, slice):
+            value = [_track_mutable_value(item, self._snek_state) for item in value]
+        else:
+            value = _track_mutable_value(value, self._snek_state)
+        super().__setitem__(index, value)
+        self._mark_dirty()
+
+    def __delitem__(self, index: Any) -> None:
+        super().__delitem__(index)
+        self._mark_dirty()
+
+    def __iadd__(self, values: Any) -> "_TrackedList":
+        values = [_track_mutable_value(item, self._snek_state) for item in values]
+        result = super().__iadd__(values)
+        self._mark_dirty()
+        return result
+
+    def __imul__(self, count: int) -> "_TrackedList":
+        result = super().__imul__(count)
+        self._mark_dirty()
+        return result
+
+    def append(self, value: Any) -> None:
+        value = _track_mutable_value(value, self._snek_state)
+        super().append(value)
+        self._mark_dirty()
+
+    def clear(self) -> None:
+        super().clear()
+        self._mark_dirty()
+
+    def extend(self, values: Any) -> None:
+        values = [_track_mutable_value(item, self._snek_state) for item in values]
+        super().extend(values)
+        self._mark_dirty()
+
+    def insert(self, index: int, value: Any) -> None:
+        value = _track_mutable_value(value, self._snek_state)
+        super().insert(index, value)
+        self._mark_dirty()
+
+    def pop(self, index: int = -1) -> Any:
+        value = super().pop(index)
+        self._mark_dirty()
+        return value
+
+    def remove(self, value: Any) -> None:
+        super().remove(value)
+        self._mark_dirty()
+
+    def reverse(self) -> None:
+        super().reverse()
+        self._mark_dirty()
+
+    def sort(self, /, *args: Any, **kwargs: Any) -> None:
+        super().sort(*args, **kwargs)
+        self._mark_dirty()
 
 
 class Model:
@@ -26,24 +105,101 @@ class Model:
     """
 
     _schema_cache: ClassVar[dict | None] = None
+    _field_hints_cache: ClassVar[dict[str, Any] | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         qualname = f"{cls.__module__}.{cls.__qualname__}"
         _model_registry[qualname] = cls
         cls._schema_cache = None
+        cls._field_hints_cache = None
         # Trigger schema compilation in Zig at import time.
         # The C extension walks cls.__annotations__ via get_type_hints
         # and builds a SchemaNode tree for fused decode+validate.
         _compile_schema_in_zig(cls)
 
+    @classmethod
+    def _model_fields(cls) -> dict[str, Any]:
+        if cls._field_hints_cache is None:
+            module = inspect.getmodule(cls)
+            namespace = dict(vars(module)) if module is not None else {}
+            namespace.setdefault("Any", Any)
+            namespace.setdefault("ClassVar", ClassVar)
+            namespace.setdefault("typing", typing)
+            hints = get_type_hints(cls, globalns=namespace, localns=namespace, include_extras=True)
+            cls._field_hints_cache = {
+                name: hint
+                for name, hint in hints.items()
+                if not name.startswith("_") and not _is_classvar(hint)
+            }
+        return cls._field_hints_cache
+
     def __init__(self, **data: Any) -> None:
-        hints = get_type_hints(self.__class__, include_extras=True)
+        hints = self.__class__._model_fields()
         for name, _hint in hints.items():
             value = data.get(name, getattr(self.__class__, name, _MISSING))
             if value is _MISSING:
                 raise ValueError(f"missing required field: {name}")
             object.__setattr__(self, name, value)
+
+    @classmethod
+    def _snek_from_row(cls, row: Any, state: _RowState | None = None) -> "Model":
+        obj = cls.__new__(cls)
+        object.__setattr__(obj, "_snek_row", row)
+        object.__setattr__(obj, "_snek_state", state or _RowState())
+        return obj
+
+    def _snek_is_clean(self) -> bool:
+        state = self.__dict__.get("_snek_state")
+        return state is None or not state.dirty
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if not name.startswith("_"):
+            state = self.__dict__.get("_snek_state")
+            if state is not None:
+                state.dirty = True
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if not name.startswith("_"):
+            state = self.__dict__.get("_snek_state")
+            if state is not None:
+                state.dirty = True
+        object.__delattr__(self, name)
+
+    def __getattr__(self, name: str) -> Any:
+        row = self.__dict__.get("_snek_row")
+        if row is None:
+            raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!r}")
+
+        nested = getattr(self.__class__, "__snek_nested__", None)
+        if nested and name in nested:
+            model_cls, nullable, field_names, field_indexes = nested[name]
+            subrow = row.subrow(field_names, field_indexes, nullable)
+            if subrow is None:
+                object.__setattr__(self, name, None)
+                return None
+            value = model_cls._snek_from_row(subrow, self.__dict__.get("_snek_state"))
+            object.__setattr__(self, name, value)
+            return value
+
+        hint = self.__class__._model_fields().get(name, _MISSING)
+        if hint is _MISSING:
+            raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!r}")
+
+        value = getattr(row, name)
+        coerced = _coerce_model_value(hint, value, self.__dict__.get("_snek_state"))
+        object.__setattr__(self, name, coerced)
+        return coerced
+
+    def raw(self, name: str) -> memoryview:
+        row = self.__dict__.get("_snek_row")
+        if row is None:
+            raise AttributeError("raw() is only available for PG-backed model instances")
+        state = self.__dict__.get("_snek_state")
+        if state is not None and state.dirty:
+            raise RuntimeError("raw() is unavailable after the model has been mutated")
+        return row.raw(name)
 
     @classmethod
     def model_json_schema(cls) -> dict:
@@ -58,7 +214,7 @@ class Model:
         if cls._schema_cache is not None:
             return cls._schema_cache
 
-        hints = get_type_hints(cls, include_extras=True)
+        hints = cls._model_fields()
         properties: dict[str, Any] = {}
         required: list[str] = []
 
@@ -92,7 +248,7 @@ class Model:
 
     def model_dump(self) -> dict:
         """Serialize this model instance to a plain dict."""
-        hints = get_type_hints(self.__class__, include_extras=True)
+        hints = self.__class__._model_fields()
         out: dict[str, Any] = {}
         for name in hints:
             value = getattr(self, name)
@@ -130,6 +286,142 @@ def _compile_schema_in_zig(cls: type) -> None:
     # Stub: import _snek and call _snek.register_model(cls)
     # Silently no-op if the C extension isn't loaded yet (pure-Python mode).
     ...
+
+
+def _is_classvar(hint: Any) -> bool:
+    return typing.get_origin(hint) is ClassVar
+
+
+def _coerce_model_value(hint: Any, value: Any, state: _RowState | None = None) -> Any:
+    if value is None or hint is Any:
+        return value
+
+    origin = typing.get_origin(hint)
+    if origin is typing.Annotated:
+        return _coerce_model_value(typing.get_args(hint)[0], value, state)
+
+    if origin in (typing.Union, types.UnionType):
+        args = typing.get_args(hint)
+        non_none = [arg for arg in args if arg is not type(None)]
+        if len(non_none) != len(args) and value is None:
+            return None
+        for arg in non_none:
+            try:
+                return _coerce_model_value(arg, value, state)
+            except (TypeError, ValueError):
+                continue
+        return value
+
+    if origin is list:
+        (item_hint,) = typing.get_args(hint) or (Any,)
+        if isinstance(value, list):
+            return _track_mutable_value(
+                [_coerce_model_value(item_hint, item, state) for item in value],
+                state,
+            )
+        items = _parse_pg_array_text(_to_text_value(value))
+        return _track_mutable_value(
+            [_coerce_model_value(item_hint, item, state) for item in items],
+            state,
+        )
+
+    if isinstance(hint, type) and issubclass(hint, Model):
+        if isinstance(value, hint):
+            return value
+        if isinstance(value, dict):
+            return hint.model_validate(value)
+        return value
+
+    text = _to_text_value(value)
+
+    if hint is str:
+        return text
+    if hint is int:
+        return int(text)
+    if hint is float:
+        return float(text)
+    if hint is bool:
+        lowered = text.lower()
+        if lowered in {"t", "true", "1"}:
+            return True
+        if lowered in {"f", "false", "0"}:
+            return False
+        raise ValueError(f"invalid boolean literal: {text!r}")
+    if hint is datetime:
+        return datetime.fromisoformat(text)
+
+    return value
+
+
+def _track_mutable_value(value: Any, state: _RowState | None) -> Any:
+    if state is None:
+        return value
+    if isinstance(value, _TrackedList):
+        return value
+    if isinstance(value, list):
+        return _TrackedList([_track_mutable_value(item, state) for item in value], state)
+    return value
+
+
+def _to_text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, memoryview):
+        return value.tobytes().decode()
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
+def _parse_pg_array_text(value: str) -> list[Any]:
+    if len(value) < 2 or value[0] != "{" or value[-1] != "}":
+        return [value]
+    if value == "{}":
+        return []
+
+    items: list[Any] = []
+    buf: list[str] = []
+    in_quotes = False
+    escape = False
+    item_was_quoted = False
+
+    def flush() -> None:
+        nonlocal buf, item_was_quoted
+        item = "".join(buf)
+        if not item_was_quoted and item == "NULL":
+            items.append(None)
+        else:
+            items.append(item)
+        buf = []
+        item_was_quoted = False
+
+    for ch in value[1:-1]:
+        if escape:
+            buf.append(ch)
+            escape = False
+            continue
+        if in_quotes:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_quotes = False
+                item_was_quoted = True
+            else:
+                buf.append(ch)
+            continue
+        if ch == '"':
+            in_quotes = True
+            item_was_quoted = True
+            continue
+        if ch == ",":
+            flush()
+            continue
+        buf.append(ch)
+
+    if buf or item_was_quoted:
+        flush()
+
+    return items
 
 
 class Field:

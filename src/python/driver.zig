@@ -13,6 +13,8 @@ const response_mod = @import("../http/response.zig");
 const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
 const stmt_cache_mod = @import("../db/stmt_cache.zig");
+const SlabPool = @import("../db/result_lease.zig").SlabPool;
+const json_serialize = @import("../json/serialize.zig");
 const snek_row = @import("snek_row.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
@@ -236,30 +238,10 @@ pub fn convertPythonResponse(py_result: *PyObject, resp_body_buf: []u8) ffi.Pyth
         }
     }
 
-    // Dict → JSON response (most common path)
-    if (ffi.isDict(py_result)) {
-        const json_str = try pyDictToJson(py_result, resp_body_buf);
+    // Dicts, lists, SnekRows, and Model-like objects serialize as JSON.
+    if (try isJsonResponseType(py_result)) {
+        const json_str = try pyObjToJson(py_result, resp_body_buf);
         return response_mod.Response.json(json_str);
-    }
-
-    // SnekRow → SIMD JSON (PG zero-copy path)
-    if (snek_row.isSnekRow(py_result)) {
-        const written = snek_row.serializeOne(py_result, resp_body_buf) catch
-            return error.ConversionError;
-        return response_mod.Response.json(resp_body_buf[0..written]);
-    }
-
-    // List of SnekRows → JSON array
-    if (c.PyList_Check(py_result) != 0) {
-        const size = c.PyList_Size(py_result);
-        if (size > 0) {
-            const first = c.PyList_GetItem(py_result, 0);
-            if (first != null and snek_row.isSnekRow(first.?)) {
-                const written = snek_row.serializeList(py_result, resp_body_buf) catch
-                    return error.ConversionError;
-                return response_mod.Response.json(resp_body_buf[0..written]);
-            }
-        }
     }
 
     // String → text/plain
@@ -294,15 +276,215 @@ fn pyObjToString(obj: *PyObject, buf: []u8) ffi.PythonError![]const u8 {
     return buf[0..span.len];
 }
 
-/// Minimal JSON serialization for Python dicts.
-/// Handles nested dicts, lists, strings, ints, floats, bools, None.
-fn pyDictToJson(dict: *PyObject, buf: []u8) ffi.PythonError![]const u8 {
+const NestedLayout = struct {
+    field_order: *PyObject,
+    nested: *PyObject,
+    scalar_indexes: *PyObject,
+
+    fn deinit(self: NestedLayout) void {
+        ffi.decref(self.field_order);
+        ffi.decref(self.nested);
+        ffi.decref(self.scalar_indexes);
+    }
+};
+
+fn modelIsClean(obj: *PyObject) ffi.PythonError!bool {
+    const clean = try ffi.callOptionalNoArgs(obj, "_snek_is_clean");
+    if (clean == null) return true;
+    defer ffi.decref(clean.?);
+    return try ffi.objectIsTrue(clean.?);
+}
+
+fn getBackingRow(obj: *PyObject) ffi.PythonError!?*PyObject {
+    if (snek_row.isSnekRow(obj)) return ffi.increfBorrowed(obj);
+
+    const backing = try ffi.getAttrOptional(obj, "_snek_row");
+    if (backing == null) return null;
+    if (!try modelIsClean(obj)) {
+        ffi.decref(backing.?);
+        return null;
+    }
+    if (!snek_row.isSnekRow(backing.?)) {
+        ffi.decref(backing.?);
+        return null;
+    }
+    return backing.?;
+}
+
+fn hasNestedShape(obj: *PyObject) ffi.PythonError!bool {
+    const nested = try ffi.getAttrOptional(obj, "__snek_nested__");
+    if (nested == null) return false;
+    defer ffi.decref(nested.?);
+    return ffi.isDict(nested.?) and ffi.dictSize(nested.?) > 0;
+}
+
+fn getNestedLayout(obj: *PyObject) ffi.PythonError!?NestedLayout {
+    const nested = try ffi.getAttrOptional(obj, "__snek_nested__");
+    if (nested == null) return null;
+    errdefer ffi.xdecref(nested);
+    if (!ffi.isDict(nested.?) or ffi.dictSize(nested.?) == 0) {
+        ffi.decref(nested.?);
+        return null;
+    }
+
+    const field_order = try ffi.getAttrOptional(obj, "__snek_field_order__");
+    if (field_order == null) {
+        ffi.decref(nested.?);
+        return null;
+    }
+    errdefer ffi.xdecref(field_order);
+    if (!ffi.isTuple(field_order.?)) {
+        ffi.decref(field_order.?);
+        ffi.decref(nested.?);
+        return null;
+    }
+
+    const scalar_indexes = try ffi.getAttrOptional(obj, "__snek_scalar_indexes__");
+    if (scalar_indexes == null) {
+        ffi.decref(field_order.?);
+        ffi.decref(nested.?);
+        return null;
+    }
+    if (!ffi.isDict(scalar_indexes.?)) {
+        ffi.decref(scalar_indexes.?);
+        ffi.decref(field_order.?);
+        ffi.decref(nested.?);
+        return null;
+    }
+
+    return .{
+        .field_order = field_order.?,
+        .nested = nested.?,
+        .scalar_indexes = scalar_indexes.?,
+    };
+}
+
+fn isJsonResponseType(obj: *PyObject) ffi.PythonError!bool {
+    if (ffi.isDict(obj) or c.PyList_Check(obj) != 0) return true;
+
+    const backing = try getBackingRow(obj);
+    if (backing) |row| {
+        ffi.decref(row);
+        return true;
+    }
+
+    const dumped = try ffi.callOptionalNoArgs(obj, "model_dump");
+    if (dumped) |value| {
+        ffi.decref(value);
+        return true;
+    }
+
+    return false;
+}
+
+/// Minimal JSON serialization for Python dicts, lists, row-backed models, and
+/// nested values reachable from them.
+fn pyObjToJson(obj: *PyObject, buf: []u8) ffi.PythonError![]const u8 {
     var pos: usize = 0;
-    try writeJsonValue(dict, buf, &pos);
+    try writeJsonValue(obj, buf, &pos);
     return buf[0..pos];
 }
 
+fn writeJsonObjectKey(name_obj: *PyObject, first: bool, buf: []u8, pos: *usize) (ffi.PythonError || snek_row.SerializeError)!void {
+    if (!first) {
+        if (pos.* >= buf.len) return error.BufferTooSmall;
+        buf[pos.*] = ',';
+        pos.* += 1;
+    }
+    if (pos.* >= buf.len) return error.BufferTooSmall;
+    buf[pos.*] = '"';
+    pos.* += 1;
+
+    const key = try ffi.unicodeAsUTF8(name_obj);
+    const span = std.mem.span(key);
+    const written = json_serialize.writeJsonEscaped(buf[pos.*..], span) catch
+        return error.BufferTooSmall;
+    pos.* += written;
+
+    if (pos.* + 2 > buf.len) return error.BufferTooSmall;
+    buf[pos.*] = '"';
+    buf[pos.* + 1] = ':';
+    pos.* += 2;
+}
+
+fn serializeNestedModel(row: *PyObject, layout: NestedLayout, buf: []u8) (ffi.PythonError || snek_row.SerializeError)!usize {
+    var pos: usize = 0;
+    if (pos >= buf.len) return error.BufferTooSmall;
+    buf[pos] = '{';
+    pos += 1;
+
+    const field_count = ffi.tupleSize(layout.field_order);
+    var i: isize = 0;
+    while (i < field_count) : (i += 1) {
+        const field_name = ffi.tupleGetItem(layout.field_order, i) orelse return error.ConversionError;
+        try writeJsonObjectKey(field_name, i == 0, buf, &pos);
+
+        if (ffi.dictGetItem(layout.nested, field_name)) |nested_entry| {
+            if (!ffi.isTuple(nested_entry) or ffi.tupleSize(nested_entry) != 4) return error.ConversionError;
+
+            const nullable_obj = ffi.tupleGetItem(nested_entry, 1) orelse return error.ConversionError;
+            const field_names_obj = ffi.tupleGetItem(nested_entry, 2) orelse return error.ConversionError;
+            const indexes_obj = ffi.tupleGetItem(nested_entry, 3) orelse return error.ConversionError;
+            const nullable = try ffi.objectIsTrue(nullable_obj);
+            const child = try snek_row.createSubrow(row, field_names_obj, indexes_obj, nullable);
+            if (child == null) return error.ConversionError;
+            defer ffi.decref(child.?);
+
+            if (ffi.isNone(child.?)) {
+                if (pos + 4 > buf.len) return error.BufferTooSmall;
+                @memcpy(buf[pos..][0..4], "null");
+                pos += 4;
+            } else {
+                const written = try snek_row.serializeOne(child.?, buf[pos..]);
+                pos += written;
+            }
+            continue;
+        }
+
+        const scalar_index_obj = ffi.dictGetItem(layout.scalar_indexes, field_name) orelse return error.ConversionError;
+        const scalar_index_long = try ffi.longAsLong(scalar_index_obj);
+        if (scalar_index_long < 0) return error.ConversionError;
+        const written = try snek_row.serializeFieldValue(row, @intCast(scalar_index_long), buf[pos..]);
+        pos += written;
+    }
+
+    if (pos >= buf.len) return error.BufferTooSmall;
+    buf[pos] = '}';
+    pos += 1;
+    return pos;
+}
+
+fn tryWriteRowBackedJson(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!bool {
+    const backing = try getBackingRow(obj);
+    if (backing == null) return false;
+    defer ffi.decref(backing.?);
+
+    if (try hasNestedShape(obj)) {
+        const layout = try getNestedLayout(obj);
+        if (layout == null) return false;
+        defer layout.?.deinit();
+
+        const written = serializeNestedModel(backing.?, layout.?, buf[pos.*..]) catch |err| switch (err) {
+            error.BufferTooSmall => return error.ConversionError,
+            else => {
+                if (ffi.errOccurred()) ffi.errClear();
+                return false;
+            },
+        };
+        pos.* += written;
+        return true;
+    }
+
+    const written = snek_row.serializeOne(backing.?, buf[pos.*..]) catch return error.ConversionError;
+    pos.* += written;
+    return true;
+}
+
 fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
+    if (try tryWriteRowBackedJson(obj, buf, pos)) {
+        return;
+    }
+
     // None
     if (c.Py_IsNone(obj) != 0) {
         const s = "null";
@@ -465,6 +647,12 @@ fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
         return;
     }
 
+    if (try ffi.callOptionalNoArgs(obj, "model_dump")) |dumped| {
+        defer ffi.decref(dumped);
+        try writeJsonValue(dumped, buf, pos);
+        return;
+    }
+
     // Fallback: str() then quote
     const str_obj = try ffi.objectStr(obj);
     defer ffi.decref(str_obj);
@@ -494,6 +682,7 @@ pub const InvokeResult = union(enum) {
         bytes_written: usize,
         cmd: PgCmd,
         stmt_idx: u16,
+        model_cls: ?*PyObject,
     };
 };
 
@@ -604,6 +793,16 @@ pub const PgCmd = enum(u8) {
     EXECUTE = 100,
     FETCH_ONE = 101,
     FETCH_ALL = 102,
+    FETCH_ONE_MODEL = 103,
+    FETCH_ALL_MODEL = 104,
+
+    pub fn normalize(self: PgCmd) PgCmd {
+        return switch (self) {
+            .FETCH_ONE_MODEL => .FETCH_ONE,
+            .FETCH_ALL_MODEL => .FETCH_ALL,
+            else => self,
+        };
+    }
 };
 
 /// Classified sentinel — either redis or postgres.
@@ -639,26 +838,43 @@ pub fn classifySentinel(
         return .{ .redis = .{ .py_coro = py_coro, .bytes_written = n } };
     }
 
-    // Postgres: command IDs 100-102
-    // Sentinel format: (cmd_id, sql_string, param1, param2, ...)
-    if (id >= 100 and id <= 102) {
+    // Postgres: command IDs 100-104
+    // Generic format: (cmd_id, sql_string, param1, param2, ...)
+    // Typed format:   (cmd_id, sql_string, model_cls, param1, param2, ...)
+    if (id >= 100 and id <= 104) {
         const buf = pg_buf orelse return error.NoPgBuffer;
         const cache = pg_stmt_cache orelse return error.NoPgStmtCache;
         const cmd: PgCmd = @enumFromInt(@as(u8, @intCast(id)));
+        var model_cls: ?*PyObject = null;
+        errdefer ffi.xdecref(model_cls);
         if (size < 2) return error.SentinelMissingSql;
         const sql_obj = ffi.tupleGetItem(sentinel, 1) orelse return error.SentinelMissingSql;
         if (!ffi.isString(sql_obj)) return error.SentinelSqlNotString;
         const sql_str = try ffi.unicodeAsUTF8(sql_obj);
         const sql = std.mem.span(sql_str);
 
-        // Extract params from tuple indices 2..size
-        const num_params: usize = @intCast(size - 2);
+        const param_start: isize = switch (cmd) {
+            .FETCH_ONE_MODEL, .FETCH_ALL_MODEL => blk: {
+                if (size < 3) return error.SentinelMissingModel;
+                const model_obj = ffi.tupleGetItem(sentinel, 2) orelse return error.SentinelMissingModel;
+                const row_factory = try ffi.getAttrOptional(model_obj, "_snek_from_row");
+                if (row_factory == null) return error.SentinelModelFactoryMissing;
+                ffi.decref(row_factory.?);
+                model_cls = ffi.increfBorrowed(model_obj);
+                break :blk 3;
+            },
+            else => 2,
+        };
+
+        // Extract params from tuple indices param_start..size
+        const num_params: usize = @intCast(size - param_start);
         var param_bufs: [StmtCache.MAX_PARAMS]?[]const u8 = .{null} ** StmtCache.MAX_PARAMS;
         // Backing storage for str() conversions of non-string params
         var str_bufs: [StmtCache.MAX_PARAMS][64]u8 = undefined;
 
         for (0..num_params) |pi| {
-            const param_obj = ffi.tupleGetItem(sentinel, @intCast(pi + 2)) orelse continue;
+            const param_index: isize = @intCast(pi);
+            const param_obj = ffi.tupleGetItem(sentinel, param_index + param_start) orelse continue;
             if (ffi.isNone(param_obj)) {
                 param_bufs[pi] = null; // SQL NULL
             } else if (ffi.isString(param_obj)) {
@@ -681,7 +897,13 @@ pub fn classifySentinel(
 
         const prepared = pg_conn_prepared orelse return error.NoPgConnPrepared;
         const result = try cache.encodeExtendedWithParams(buf, sql, prepared, param_bufs[0..num_params]);
-        return .{ .pg = .{ .py_coro = py_coro, .bytes_written = result.bytes_written, .cmd = cmd, .stmt_idx = result.stmt_idx } };
+        return .{ .pg = .{
+            .py_coro = py_coro,
+            .bytes_written = result.bytes_written,
+            .cmd = cmd,
+            .stmt_idx = result.stmt_idx,
+            .model_cls = model_cls,
+        } };
     }
 
     return error.UnknownSentinelId;
@@ -919,7 +1141,7 @@ test "json serialization of nested dict" {
     defer ffi.decref(test_dict);
 
     var body_buf: [4096]u8 = undefined;
-    const json_str = try pyDictToJson(test_dict, &body_buf);
+    const json_str = try pyObjToJson(test_dict, &body_buf);
 
     // Verify key parts are present
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"user\"") != null);
@@ -927,4 +1149,120 @@ test "json serialization of nested dict" {
     try std.testing.expect(std.mem.indexOf(u8, json_str, "\"snek\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "42") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "true") != null);
+}
+
+fn initJoinedRowTestClass() !*PyObject {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const python_path = try std.fs.cwd().realpath("python", &path_buf);
+    var code_buf: [2048]u8 = undefined;
+    const code = try std.fmt.bufPrintZ(&code_buf,
+        \\import sys
+        \\if "{s}" not in sys.path:
+        \\    sys.path.insert(0, "{s}")
+        \\from snek.models import Model
+        \\class Idea(Model):
+        \\    id: int
+        \\    name: str
+        \\class Thesis(Model):
+        \\    id: int
+        \\    title: str
+        \\class JoinedRow(Model):
+        \\    __snek_nested__ = {{
+        \\        "idea": (Idea, False, ("id", "name"), (0, 1)),
+        \\        "thesis": (Thesis, False, ("id", "title"), (2, 3)),
+        \\    }}
+        \\    __snek_field_order__ = ("idea", "thesis", "thesis_count")
+        \\    __snek_scalar_indexes__ = {{"thesis_count": 4}}
+        \\    idea: Idea
+        \\    thesis: Thesis
+        \\    thesis_count: int
+    , .{ python_path, python_path });
+    try ffi.runString(code);
+
+    const main_mod = try ffi.importModule("__main__");
+    defer ffi.decref(main_mod);
+    return try ffi.getAttr(main_mod, "JoinedRow");
+}
+
+fn deinitJoinedRowTestCache(cache: *StmtCache, stmt_idx: u16) void {
+    const entry = cache.get(stmt_idx);
+    for (0..entry.col_count) |i| {
+        if (entry.col_keys[i]) |key| ffi.decref(key);
+    }
+}
+
+fn createJoinedRowTestBacking() !struct { cache: StmtCache, pool: SlabPool, row: *PyObject, stmt_idx: u16 } {
+    snek_row.resetTypeForTesting();
+    try snek_row.initType();
+
+    var cache = std.mem.zeroes(StmtCache);
+    var pool = try SlabPool.init(std.testing.allocator, 8, 8);
+    const stmt_idx: u16 = 0;
+    const entry = cache.get(stmt_idx);
+    entry.col_count = 5;
+    entry.col_keys[0] = try ffi.unicodeFromString("id");
+    entry.col_keys[1] = try ffi.unicodeFromString("name");
+    entry.col_keys[2] = try ffi.unicodeFromString("id");
+    entry.col_keys[3] = try ffi.unicodeFromString("title");
+    entry.col_keys[4] = try ffi.unicodeFromString("thesis_count");
+    entry.col_strategies[0] = .numeric;
+    entry.col_strategies[1] = .text_escape;
+    entry.col_strategies[2] = .numeric;
+    entry.col_strategies[3] = .text_escape;
+    entry.col_strategies[4] = .numeric;
+    entry.buildJsonKeys();
+
+    const values = [_]?[]const u8{ "1", "idea", "2", "thesis", "7" };
+    const row = try snek_row.create(&cache, stmt_idx, entry.col_count, values[0..], &pool);
+    return .{ .cache = cache, .pool = pool, .row = row, .stmt_idx = stmt_idx };
+}
+
+test "clean nested row-backed model uses compact JSON fast path" {
+    ffi.init();
+    defer ffi.deinit();
+
+    const joined_cls = try initJoinedRowTestClass();
+    defer ffi.decref(joined_cls);
+
+    var backing = try createJoinedRowTestBacking();
+    defer backing.pool.deinit();
+    defer deinitJoinedRowTestCache(&backing.cache, backing.stmt_idx);
+    defer ffi.decref(backing.row);
+
+    const model = try ffi.callMethodOneArg(joined_cls, "_snek_from_row", backing.row);
+    defer ffi.decref(model);
+
+    var body_buf: [4096]u8 = undefined;
+    const json_str = try pyObjToJson(model, &body_buf);
+    try std.testing.expectEqualStrings(
+        "{\"idea\":{\"id\":1,\"name\":\"idea\"},\"thesis\":{\"id\":2,\"title\":\"thesis\"},\"thesis_count\":7}",
+        json_str,
+    );
+}
+
+test "mutated nested model falls back to generic model serialization" {
+    ffi.init();
+    defer ffi.deinit();
+
+    const joined_cls = try initJoinedRowTestClass();
+    defer ffi.decref(joined_cls);
+
+    var backing = try createJoinedRowTestBacking();
+    defer backing.pool.deinit();
+    defer deinitJoinedRowTestCache(&backing.cache, backing.stmt_idx);
+    defer ffi.decref(backing.row);
+
+    const model = try ffi.callMethodOneArg(joined_cls, "_snek_from_row", backing.row);
+    defer ffi.decref(model);
+
+    const changed = try ffi.longFromLong(8);
+    defer ffi.decref(changed);
+    try ffi.setAttr(model, "thesis_count", changed);
+
+    var body_buf: [4096]u8 = undefined;
+    const json_str = try pyObjToJson(model, &body_buf);
+    try std.testing.expectEqualStrings(
+        "{\"idea\": {\"id\": 1, \"name\": \"idea\"}, \"thesis\": {\"id\": 2, \"title\": \"thesis\"}, \"thesis_count\": 8}",
+        json_str,
+    );
 }

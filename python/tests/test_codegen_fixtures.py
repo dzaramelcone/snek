@@ -96,6 +96,11 @@ class TestJoins:
         # SELECT idea.*, thesis.* → Row with idea: Idea, thesis: Thesis
         assert "idea: Idea" in self.models or "idea: Idea" in self.db
         assert "thesis: Thesis" in self.models or "thesis: Thesis" in self.db
+        assert "__snek_nested__" in self.models
+        assert "__snek_field_order__" in self.models
+        assert "__snek_scalar_indexes__" in self.models
+        assert "'idea': (Idea, False" in self.models
+        assert "'thesis': (Thesis, False" in self.models
 
     def test_left_join_nullable(self):
         # LEFT JOIN → thesis field should be optional

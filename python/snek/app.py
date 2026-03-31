@@ -91,7 +91,7 @@ class Redis:
 
 class _DbCmd(IntEnum):
     """Command IDs — must match PgCmd in driver.zig."""
-    EXECUTE = 100; FETCH_ONE = 101; FETCH_ALL = 102
+    EXECUTE = 100; FETCH_ONE = 101; FETCH_ALL = 102; FETCH_ONE_MODEL = 103; FETCH_ALL_MODEL = 104
 
 
 class Db:
