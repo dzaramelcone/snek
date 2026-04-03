@@ -436,7 +436,7 @@ fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
 /// Uses the thread-local redis connection and tardy runtime for async I/O.
 /// Bulk string responses are received directly into PyBytes (zero-copy).
 fn pyRedisCommand(_: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
-    // TODO: async redis via Task context swap (RedisCtx)
+    // TODO: async redis support for Python handlers
     c.PyErr_SetString(c.PyExc_RuntimeError, "redis_command: async path not yet implemented");
     return null;
 }

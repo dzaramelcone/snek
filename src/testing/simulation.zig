@@ -4,8 +4,7 @@
 //! a single u64 seed. Every failure is reproducible. Supports swarm testing
 //! with randomized fault parameters across many seeds.
 //!
-//! Self-contained: defines minimal IO types for testing. The production
-//! FakeBackend (src/aio/fake.zig) uses the real IoOp/Task types.
+//! Self-contained: defines minimal IO types for testing.
 //!
 //! Sources:
 //!   - VOPR-style from TigerBeetle (refs/tigerbeetle/INSIGHTS.md,
@@ -14,50 +13,43 @@
 
 const std = @import("std");
 
-// ── Minimal IO types (mirrors src/aio/io_op.zig, src/task.zig) ──
+// ── Minimal IO types for simulation-only scheduling tests ──
 
 pub const IoResult = i32;
 
-pub const OpTag = enum {
-    accept,
-    connect,
-    recv,
-    send,
-    sendv,
-    close,
-    timer,
-};
-
 pub const IoOp = union(enum) {
     accept: struct { socket: i32 },
+    accept_multishot: struct { socket: i32 },
     connect: struct { socket: i32 },
     recv: struct { socket: i32, buffer: []u8 },
+    recv_fixed: struct { socket: i32, buffer_id: u16, len: u32, offset: u32 = 0 },
+    recv_multishot: struct { socket: i32, buffer_group: u16, flags: u32 = 0 },
     send: struct { socket: i32, buffer: []const u8 },
+    send_zc: struct { socket: i32, buffer: []const u8, send_flags: u32 = 0, zc_flags: u16 = 0 },
     sendv: struct { socket: i32 },
     close: i32,
     timer: struct { seconds: u63, nanos: u32 },
+};
 
-    pub fn tag(self: IoOp) OpTag {
-        return switch (self) {
-            .accept => .accept,
-            .connect => .connect,
-            .recv => .recv,
-            .send => .send,
-            .sendv => .sendv,
-            .close => .close,
-            .timer => .timer,
-        };
-    }
+pub const OpTag = std.meta.Tag(IoOp);
+
+pub const Completion = struct {
+    op_tag: OpTag,
+    result: IoResult,
+    flags: u32 = 0,
+    buffer_id: ?u16 = null,
+    more: bool = false,
+    notification: bool = false,
+    buffer_more: bool = false,
 };
 
 pub const Task = struct {
-    step: *const fn (*Task, IoResult) ?IoOp,
+    step: *const fn (*Task, Completion) ?IoOp,
     ctx: *anyopaque,
-    pending_op: IoOp = .{ .close = 0 },
     next: ?*Task = null,
 };
 
-fn noopStep(_: *Task, _: IoResult) ?IoOp {
+fn noopStep(_: *Task, _: Completion) ?IoOp {
     return null;
 }
 
@@ -74,7 +66,11 @@ pub const FaultRule = struct {
 
 pub const FakeBackend = struct {
     const PendingOp = struct { task: *Task, op: IoOp };
-    const CompletionEntry = struct { task: *Task, result: IoResult };
+    const CompletionEntry = struct {
+        task: *Task,
+        op_tag: OpTag,
+        result: IoResult,
+    };
 
     pending: [MAX_OPS]PendingOp = undefined,
     pending_count: usize = 0,
@@ -86,7 +82,7 @@ pub const FakeBackend = struct {
     fault_count: usize = 0,
 
     tasks_buf: []*Task,
-    result_buf: []IoResult,
+    completion_buf: []Completion,
 
     prng: std.Random.DefaultPrng,
 
@@ -96,32 +92,32 @@ pub const FakeBackend = struct {
     pub fn init(allocator: std.mem.Allocator, max_events: u16) !FakeBackend {
         return .{
             .tasks_buf = try allocator.alloc(*Task, max_events),
-            .result_buf = try allocator.alloc(IoResult, max_events),
+            .completion_buf = try allocator.alloc(Completion, max_events),
             .prng = std.Random.DefaultPrng.init(0),
         };
     }
 
     pub fn deinit(self: *FakeBackend, allocator: std.mem.Allocator) void {
         allocator.free(self.tasks_buf);
-        allocator.free(self.result_buf);
+        allocator.free(self.completion_buf);
     }
 
     pub fn queue(self: *FakeBackend, task: *Task, op: IoOp) !void {
         if (self.pending_count >= MAX_OPS) return error.Overflow;
-        task.pending_op = op;
         self.pending[self.pending_count] = .{ .task = task, .op = op };
         self.pending_count += 1;
         self.total_queued += 1;
     }
 
-    pub fn submitAndWait(self: *FakeBackend, wait_nr: u32) !struct { tasks: []*Task, results: []IoResult } {
+    pub fn submitAndWait(self: *FakeBackend, wait_nr: u32) !struct { tasks: []*Task, completions: []Completion } {
         _ = wait_nr;
 
         // Auto-complete close ops
         var i: usize = 0;
         while (i < self.pending_count) {
-            if (self.pending[i].op.tag() == .close) {
-                self.stageCompletion(self.pending[i].task, 0);
+            const tag = std.meta.activeTag(self.pending[i].op);
+            if (tag == .close) {
+                self.stageCompletion(self.pending[i].task, tag, 0);
                 self.removePending(i);
             } else {
                 i += 1;
@@ -131,8 +127,9 @@ pub const FakeBackend = struct {
         // Apply fault rules
         i = 0;
         while (i < self.pending_count) {
-            if (self.matchFaultRule(self.pending[i].op.tag())) |result| {
-                self.stageCompletion(self.pending[i].task, result);
+            const tag = std.meta.activeTag(self.pending[i].op);
+            if (self.matchFaultRule(tag)) |result| {
+                self.stageCompletion(self.pending[i].task, tag, result);
                 self.removePending(i);
             } else {
                 i += 1;
@@ -142,7 +139,10 @@ pub const FakeBackend = struct {
         const count = @min(self.completion_count, self.tasks_buf.len);
         for (0..count) |j| {
             self.tasks_buf[j] = self.completions[j].task;
-            self.result_buf[j] = self.completions[j].result;
+            self.completion_buf[j] = .{
+                .op_tag = self.completions[j].op_tag,
+                .result = self.completions[j].result,
+            };
         }
         self.total_completed += count;
 
@@ -158,7 +158,7 @@ pub const FakeBackend = struct {
 
         return .{
             .tasks = self.tasks_buf[0..count],
-            .results = self.result_buf[0..count],
+            .completions = self.completion_buf[0..count],
         };
     }
 
@@ -168,14 +168,14 @@ pub const FakeBackend = struct {
 
     pub fn completeNext(self: *FakeBackend, result: IoResult) void {
         if (self.pending_count == 0) return;
-        self.stageCompletion(self.pending[0].task, result);
+        self.stageCompletion(self.pending[0].task, std.meta.activeTag(self.pending[0].op), result);
         self.removePending(0);
     }
 
     pub fn completeNextByTag(self: *FakeBackend, op_tag: OpTag, result: IoResult) bool {
         for (0..self.pending_count) |j| {
-            if (self.pending[j].op.tag() == op_tag) {
-                self.stageCompletion(self.pending[j].task, result);
+            if (std.meta.activeTag(self.pending[j].op) == op_tag) {
+                self.stageCompletion(self.pending[j].task, op_tag, result);
                 self.removePending(j);
                 return true;
             }
@@ -185,7 +185,7 @@ pub const FakeBackend = struct {
 
     pub fn completeAll(self: *FakeBackend, result: IoResult) void {
         for (0..self.pending_count) |j| {
-            self.stageCompletion(self.pending[j].task, result);
+            self.stageCompletion(self.pending[j].task, std.meta.activeTag(self.pending[j].op), result);
         }
         self.pending_count = 0;
     }
@@ -212,12 +212,12 @@ pub const FakeBackend = struct {
 
     pub fn pendingTag(self: *const FakeBackend, idx: usize) ?OpTag {
         if (idx >= self.pending_count) return null;
-        return self.pending[idx].op.tag();
+        return std.meta.activeTag(self.pending[idx].op);
     }
 
-    fn stageCompletion(self: *FakeBackend, task: *Task, result: IoResult) void {
+    fn stageCompletion(self: *FakeBackend, task: *Task, op_tag: OpTag, result: IoResult) void {
         if (self.completion_count >= MAX_OPS) return;
-        self.completions[self.completion_count] = .{ .task = task, .result = result };
+        self.completions[self.completion_count] = .{ .task = task, .op_tag = op_tag, .result = result };
         self.completion_count += 1;
     }
 
@@ -589,7 +589,7 @@ test "FakeBackend: queue and complete" {
     backend.completeNext(42);
     const result = try backend.submitAndWait(0);
     try std.testing.expectEqual(@as(usize, 1), result.tasks.len);
-    try std.testing.expectEqual(@as(IoResult, 42), result.results[0]);
+    try std.testing.expectEqual(@as(IoResult, 42), result.completions[0].result);
     try std.testing.expectEqual(@as(usize, 0), backend.pendingCount());
 }
 
@@ -607,7 +607,7 @@ test "FakeBackend: fault injection" {
     try backend.queue(&task, IoOp{ .recv = .{ .socket = 5, .buffer = &buf } });
     const result = try backend.submitAndWait(0);
     try std.testing.expectEqual(@as(usize, 1), result.tasks.len);
-    try std.testing.expectEqual(@as(IoResult, -104), result.results[0]);
+    try std.testing.expectEqual(@as(IoResult, -104), result.completions[0].result);
     try std.testing.expectEqual(@as(usize, 0), backend.pendingCount());
 }
 
@@ -622,7 +622,7 @@ test "FakeBackend: close auto-completes" {
     try backend.queue(&task, IoOp{ .close = 5 });
     const result = try backend.submitAndWait(0);
     try std.testing.expectEqual(@as(usize, 1), result.tasks.len);
-    try std.testing.expectEqual(@as(IoResult, 0), result.results[0]);
+    try std.testing.expectEqual(@as(IoResult, 0), result.completions[0].result);
 }
 
 test "FakeBackend: completeNextByTag" {
@@ -646,7 +646,7 @@ test "FakeBackend: completeNextByTag" {
     const result = try backend.submitAndWait(0);
     try std.testing.expectEqual(@as(usize, 1), result.tasks.len);
     try std.testing.expectEqual(&task2, result.tasks[0]);
-    try std.testing.expectEqual(@as(IoResult, 64), result.results[0]);
+    try std.testing.expectEqual(@as(IoResult, 64), result.completions[0].result);
 }
 
 test "FakeBackend: fault rule with count" {
@@ -662,7 +662,7 @@ test "FakeBackend: fault rule with count" {
 
     try backend.queue(&task, IoOp{ .recv = .{ .socket = 5, .buffer = &buf } });
     const r1 = try backend.submitAndWait(0);
-    try std.testing.expectEqual(@as(IoResult, -1), r1.results[0]);
+    try std.testing.expectEqual(@as(IoResult, -1), r1.completions[0].result);
 
     try backend.queue(&task, IoOp{ .recv = .{ .socket = 5, .buffer = &buf } });
     const r2 = try backend.submitAndWait(0);
@@ -826,9 +826,9 @@ test "connection drop: FakeBackend recv fault closes connection" {
 
     const result = try backend.submitAndWait(0);
     try std.testing.expectEqual(@as(usize, 1), result.tasks.len);
-    try std.testing.expectEqual(@as(IoResult, -104), result.results[0]);
+    try std.testing.expectEqual(@as(IoResult, -104), result.completions[0].result);
 
-    if (result.results[0] <= 0) {
+    if (result.completions[0].result <= 0) {
         tracker.close(3);
     }
     try std.testing.expect(!tracker.isActive(3));
@@ -865,7 +865,7 @@ test "deterministic replay: FakeBackend with same seed produces same faults" {
             }
 
             const result = try backend.submitAndWait(0);
-            if (result.results[0] < 0) total_error_results += 1;
+            if (result.completions[0].result < 0) total_error_results += 1;
         }
 
         counts[round] = total_error_results;

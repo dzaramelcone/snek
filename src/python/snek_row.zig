@@ -13,7 +13,6 @@ const ffi = @import("ffi.zig");
 const serialize = @import("../json/serialize.zig");
 const StmtCache = @import("../db/stmt_cache.zig").StmtCache;
 const result_lease = @import("../db/result_lease.zig");
-const Slab = result_lease.Slab;
 const SlabPool = result_lease.SlabPool;
 const ResultLease = result_lease.ResultLease;
 
@@ -514,15 +513,42 @@ fn createWithLease(
 
 // ── Construction ────────────────────────────────────────────────────
 
-/// Create a SnekRow by borrowing field data from an existing slab lease.
-pub fn createBorrowed(
+pub fn createCopied(
+    comptime CopyCtx: type,
     cache: *StmtCache,
     stmt_idx: u16,
     field_count: u16,
-    values: []const ?[]const u8,
-    slab: *Slab,
-) ffi.PythonError!*PyObject {
-    return createWithLease(cache, stmt_idx, field_count, values, ResultLease.initBorrowed(slab));
+    pool: *SlabPool,
+    ctx: CopyCtx,
+    comptime fieldLenFn: fn (CopyCtx, usize) ?usize,
+    comptime copyFieldFn: fn (CopyCtx, usize, []u8) void,
+) CreateError!*PyObject {
+    const count = @min(field_count, MAX_FIELDS);
+
+    var total: usize = 0;
+    for (0..count) |i| {
+        if (fieldLenFn(ctx, i)) |len| {
+            if (len > std.math.maxInt(u16)) return error.RowTooLarge;
+            total += len;
+            if (total > result_lease.CAPACITY) return error.RowTooLarge;
+        }
+    }
+
+    var lease = try ResultLease.initOwned(pool);
+    errdefer lease.release();
+
+    var copied_values: [MAX_FIELDS]?[]const u8 = .{null} ** MAX_FIELDS;
+    var offset: usize = 0;
+    for (0..count) |i| {
+        if (fieldLenFn(ctx, i)) |len| {
+            const dest = lease.bytes()[offset..][0..len];
+            copyFieldFn(ctx, i, dest);
+            copied_values[i] = lease.constBytes()[offset..][0..len];
+            offset += len;
+        }
+    }
+
+    return createWithLease(cache, stmt_idx, count, copied_values[0..count], lease);
 }
 
 /// Create a SnekRow by copying field data into a dedicated slab.
@@ -540,31 +566,23 @@ pub fn create(
     values: []const ?[]const u8,
     pool: *SlabPool,
 ) CreateError!*PyObject {
-    const count = @min(field_count, MAX_FIELDS);
+    const SliceCopyCtx = struct {
+        values: []const ?[]const u8,
+    };
 
-    var total: usize = 0;
-    for (0..count) |i| {
-        if (values[i]) |v| {
-            if (v.len > std.math.maxInt(u16)) return error.RowTooLarge;
-            total += v.len;
-            if (total > result_lease.CAPACITY) return error.RowTooLarge;
+    const sliceFieldLen = struct {
+        fn f(ctx: SliceCopyCtx, idx: usize) ?usize {
+            return if (ctx.values[idx]) |v| v.len else null;
         }
-    }
+    }.f;
 
-    var lease = try ResultLease.initOwned(pool);
-
-    var offset: u16 = 0;
-    var copied_values: [MAX_FIELDS]?[]const u8 = .{null} ** MAX_FIELDS;
-    for (0..count) |i| {
-        if (values[i]) |v| {
-            const len: u16 = @intCast(v.len);
-            @memcpy(lease.bytes()[offset..][0..len], v);
-            copied_values[i] = lease.constBytes()[offset..][0..len];
-            offset += len;
+    const copySliceField = struct {
+        fn f(ctx: SliceCopyCtx, idx: usize, dest: []u8) void {
+            @memcpy(dest, ctx.values[idx].?);
         }
-    }
+    }.f;
 
-    return createWithLease(cache, stmt_idx, field_count, copied_values[0..count], lease);
+    return createCopied(SliceCopyCtx, cache, stmt_idx, field_count, pool, .{ .values = values }, sliceFieldLen, copySliceField);
 }
 
 // ── SIMD JSON serialization ─────────────────────────────────────────

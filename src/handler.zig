@@ -1,6 +1,6 @@
 //! Shared request handler: route matching, Python invocation, response serialization.
 //!
-//! Used by both server.zig (tardy/stackful) and connection.zig (stackless).
+//! Used by the active staged server pipelines.
 //! Takes a parsed http1.Request, returns serialized response bytes.
 
 const std = @import("std");

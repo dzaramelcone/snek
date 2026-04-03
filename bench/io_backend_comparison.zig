@@ -39,7 +39,7 @@ const CompletionEntry = struct {
     flags: u32,
 };
 
-// ── Inlined Kqueue adapter (from src/core/kqueue.zig) ────────────────
+// ── Inlined legacy kqueue adapter ────────────────────────────────────
 
 const KqOpType = enum { read, write, accept, connect, close, send, recv, timeout, cancel };
 

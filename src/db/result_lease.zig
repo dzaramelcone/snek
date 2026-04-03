@@ -175,10 +175,6 @@ pub const ResultLease = struct {
         return self.slab == null;
     }
 
-    pub fn initBorrowed(slab: *Slab) ResultLease {
-        return .{ .slab = slab.retain() };
-    }
-
     pub fn initOwned(pool: *SlabPool) !ResultLease {
         return .{ .slab = try pool.acquire() };
     }

@@ -1010,7 +1010,7 @@ pub fn startServer(host: []const u8, port: u16, threads: usize, backlog: u16) !v
     }
 
     _ = gil.PyEval_SaveThread();
-    try server_mod.runPipeline(std.heap.smp_allocator, &server);
+    try server_mod.run(std.heap.smp_allocator, &server);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

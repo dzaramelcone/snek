@@ -1,10 +1,6 @@
 //! snek — high-performance Python web framework with a Zig backend.
 //! Top-level module re-exporting the public API surface.
 
-pub const core = struct {
-    pub const kqueue = @import("core/kqueue.zig");
-};
-
 pub const net = struct {
     pub const tcp = @import("net/tcp.zig");
     pub const tls = @import("net/tls.zig");
@@ -26,21 +22,13 @@ pub const python = struct {
 
 pub const db = struct {
     pub const wire = @import("db/wire.zig");
-    pub const pool = @import("db/pool.zig");
     pub const query = @import("db/query.zig");
-    pub const schema = @import("db/schema.zig");
     pub const types = @import("db/types.zig");
     pub const auth = @import("db/auth.zig");
-    pub const pipeline = @import("db/pipeline.zig");
-    pub const notify = @import("db/notify.zig");
 };
 
 pub const redis = struct {
     pub const protocol = @import("redis/protocol.zig");
-    pub const reader = @import("redis/reader.zig");
-    pub const commands = @import("redis/commands.zig");
-    pub const pubsub = @import("redis/pubsub.zig");
-    pub const lua = @import("redis/lua.zig");
 };
 
 pub const http = struct {
@@ -66,19 +54,12 @@ pub const security = struct {
 
 pub const observe = struct {
     pub const log = @import("observe/log.zig");
-    pub const metrics = @import("observe/metrics.zig");
     pub const health = @import("observe/health.zig");
-    pub const trace = @import("observe/trace.zig");
 };
 
 pub const config = struct {
     pub const toml = @import("config/toml.zig");
     pub const env = @import("config/env.zig");
-};
-
-pub const serve = struct {
-    pub const static = @import("serve/static.zig");
-    pub const client = @import("serve/client.zig");
 };
 
 pub const cli = struct {

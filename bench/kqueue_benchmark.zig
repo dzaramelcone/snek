@@ -29,7 +29,7 @@ fn nsPerOp(total_ns: u64, ops: u64) f64 {
     return @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(ops));
 }
 
-// ── Inlined Kqueue adapter (from src/core/kqueue.zig) ────────────────
+// ── Inlined legacy kqueue adapter ────────────────────────────────────
 
 const CompletionEntry = struct {
     user_data: u64,

@@ -53,3 +53,32 @@ Using `aarch64-linux` produced an ELF with `libc.so` as a direct dependency,
 which does not load in the Debian-based bench container. The `-gnu` target
 produces the expected `libc.so.6` dependency and can be copied or mounted into
 the container directly.
+
+## Docker Benchmarking
+
+For throughput numbers, do not benchmark the compose app through the host
+published port on Docker Desktop. That path mixes in Docker Desktop NAT and
+host/container networking overhead and can produce badly misleading numbers.
+
+Use the internal Docker network with a separate loadgen container instead:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu
+bash bench/compose/run_scenario.sh hello_min
+bash bench/compose/run_scenario.sh db_param_one
+```
+
+You can override the main knobs with environment variables:
+
+```sh
+CONCURRENCY=256 THREADS=7 DURATION=10s bash bench/compose/run_scenario.sh db_param_one
+PROJECT=basebench COMPOSE_FILE=/tmp/snek-baseline/bench/compose/docker-compose.yml \
+  bash bench/compose/run_scenario.sh hello_min
+```
+
+The runner:
+- starts `postgres` and `bench`
+- restarts the `bench` service to clear any previous app process
+- starts the selected scenario inside `bench`
+- waits for readiness from inside the container
+- runs `oha` from a separate container on the same compose network

@@ -9,6 +9,8 @@ services:
       POSTGRES_INITDB_ARGS: "--auth-host=md5"
   bench:
     build: .
+    # Convenience only. Do not use this published port for throughput numbers on
+    # Docker Desktop; benchmark over the internal compose network instead.
     ports:
       - "8080:8080"
     working_dir: /bench
