@@ -1,6 +1,4 @@
-const builtin = @import("builtin");
 const std = @import("std");
-const posix = std.posix;
 
 pub const CAPACITY: usize = 64 * 1024;
 pub const DEFAULT_BUFFER_COUNT: usize = 64;
@@ -9,27 +7,20 @@ const page_align = std.mem.Alignment.fromByteUnits(std.heap.page_size_min);
 
 /// Worker-local fixed transport buffers.
 ///
-/// Buffers are allocated once at startup from the page allocator so their
-/// addresses stay stable for the lifetime of the worker. On Linux, the pool
-/// registers the buffers with io_uring so callers can issue fixed-buffer recv
-/// operations. Other backends use the same preallocated pages without any
-/// registration.
+/// This is the readiness-path transport pool used by kqueue. Linux uring now
+/// uses its own leased receive-buffer group instead of the older fixed-buffer
+/// registration path.
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     buffers: []Buffer,
-    iovecs: []posix.iovec,
     free_stack: []u16,
     free_len: usize,
-    registered: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, buffer_count: usize) !Pool {
         if (buffer_count > std.math.maxInt(u16)) return error.TransportPoolTooLarge;
 
         const buffers = try allocator.alloc(Buffer, buffer_count);
         errdefer allocator.free(buffers);
-
-        const iovecs = try allocator.alloc(posix.iovec, buffer_count);
-        errdefer allocator.free(iovecs);
 
         const free_stack = try allocator.alloc(u16, buffer_count);
         errdefer allocator.free(free_stack);
@@ -48,45 +39,24 @@ pub const Pool = struct {
                 .id = @intCast(idx),
                 .data = data,
             };
-            iovecs[idx] = .{
-                .base = data.ptr,
-                .len = data.len,
-            };
             free_stack[idx] = @intCast(buffer_count - idx - 1);
         }
 
         return .{
             .allocator = allocator,
             .buffers = buffers,
-            .iovecs = iovecs,
             .free_stack = free_stack,
             .free_len = buffer_count,
         };
     }
 
     pub fn deinit(self: *Pool) void {
-        if (self.registered) {
-            @panic("transport pool must be unregistered before deinit");
-        }
         for (self.buffers) |buf| {
             std.heap.page_allocator.free(buf.data);
         }
         self.allocator.free(self.buffers);
-        self.allocator.free(self.iovecs);
         self.allocator.free(self.free_stack);
         self.* = undefined;
-    }
-
-    pub fn register(self: *Pool, backend: anytype) !void {
-        if (builtin.os.tag != .linux or self.registered or self.iovecs.len == 0) return;
-        try backend.registerFixedBuffers(self.iovecs);
-        self.registered = true;
-    }
-
-    pub fn unregister(self: *Pool, backend: anytype) void {
-        if (builtin.os.tag != .linux or !self.registered) return;
-        backend.unregisterFixedBuffers() catch {};
-        self.registered = false;
     }
 
     pub fn acquire(self: *Pool) !*Buffer {

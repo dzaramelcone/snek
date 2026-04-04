@@ -13,6 +13,8 @@ const c = ffi.c;
 const PyObject = ffi.PyObject;
 const driver = @import("driver.zig");
 const server_mod = @import("../server.zig");
+const response_hint_mod = @import("../response_hint.zig");
+const ResponseHint = response_hint_mod.ResponseHint;
 
 // ── Module state ────────────────────────────────────────────────────
 
@@ -31,6 +33,8 @@ pub const HandlerFlags = extern struct {
     no_args: bool = false,
     /// Handler is async def (pre-computed, saves per-call check)
     is_async: bool = false,
+    /// Cached response conversion hint.
+    response_hint: u8 = @intFromEnum(ResponseHint.any),
 };
 
 /// Route metadata stored alongside handlers for server setup.
@@ -118,6 +122,7 @@ pub fn getModuleRef(mod: *PyObject) ?[]const u8 {
 ///   - fallback → needs_request
 fn inspectHandlerFlags(handler_obj: *PyObject) HandlerFlags {
     var flags = HandlerFlags{};
+    flags.response_hint = @intFromEnum(inspectResponseHint(handler_obj));
 
     // Detect async: check if the handler is a coroutine function
     flags.is_async = c.PyCoro_CheckExact(handler_obj) != 0 or isCoroutineFunction(handler_obj);
@@ -183,6 +188,87 @@ fn inspectHandlerFlags(handler_obj: *PyObject) HandlerFlags {
     flags.needs_params = true;
     flags.needs_request = false;
     return flags;
+}
+
+fn inspectResponseHint(handler_obj: *PyObject) ResponseHint {
+    const return_obj = resolvedReturnAnnotation(handler_obj) orelse return .any;
+    defer ffi.decref(return_obj);
+    return classifyResponseHint(return_obj);
+}
+
+fn resolvedReturnAnnotation(handler_obj: *PyObject) ?*PyObject {
+    if (resolvedReturnAnnotationViaTyping(handler_obj)) |resolved| return resolved;
+    if (resolvedReturnAnnotationFromDict(handler_obj)) |raw| return raw;
+    return null;
+}
+
+fn resolvedReturnAnnotationViaTyping(handler_obj: *PyObject) ?*PyObject {
+    const typing_mod = ffi.importModuleRaw("typing") catch return null;
+    defer ffi.decref(typing_mod);
+    const get_type_hints = ffi.getAttrRaw(typing_mod, "get_type_hints") catch return null;
+    defer ffi.decref(get_type_hints);
+    const hints = ffi.callOneArg(get_type_hints, handler_obj) catch {
+        ffi.errClear();
+        return null;
+    };
+    defer ffi.decref(hints);
+    if (!ffi.isDict(hints)) return null;
+    const return_obj = ffi.dictGetItemString(hints, "return") orelse return null;
+    return ffi.increfBorrowed(return_obj);
+}
+
+fn resolvedReturnAnnotationFromDict(handler_obj: *PyObject) ?*PyObject {
+    const annotations = ffi.getAttrOptional(handler_obj, "__annotations__") catch return null;
+    if (annotations == null) return null;
+    defer ffi.decref(annotations.?);
+    if (!ffi.isDict(annotations.?)) return null;
+    const return_obj = ffi.dictGetItemString(annotations.?, "return") orelse return null;
+    return ffi.increfBorrowed(return_obj);
+}
+
+fn classifyResponseHint(return_obj: *PyObject) ResponseHint {
+    if (isStrAnnotation(return_obj)) return .str;
+    if (isRowBackedAnnotation(return_obj)) return .row_json;
+    return .any;
+}
+
+fn normalizedAnnotationString(obj: *PyObject) ?[]const u8 {
+    if (!ffi.isString(obj)) return null;
+    const value = ffi.unicodeAsUTF8(obj) catch return null;
+    var span: []const u8 = std.mem.span(value);
+    if (span.len >= 2) {
+        const first = span[0];
+        const last = span[span.len - 1];
+        if ((first == '\'' and last == '\'') or (first == '"' and last == '"')) {
+            span = span[1 .. span.len - 1];
+        }
+    }
+    return span;
+}
+
+fn isStrAnnotation(return_obj: *PyObject) bool {
+    if (normalizedAnnotationString(return_obj)) |span| {
+        return std.mem.eql(u8, span, "str");
+    }
+
+    const builtins = ffi.importModuleRaw("builtins") catch return false;
+    defer ffi.decref(builtins);
+    const str_type = ffi.getAttrRaw(builtins, "str") catch return false;
+    defer ffi.decref(str_type);
+    return return_obj == str_type;
+}
+
+fn isRowBackedAnnotation(return_obj: *PyObject) bool {
+    if (normalizedAnnotationString(return_obj)) |span| {
+        return std.mem.eql(u8, span, "snek.Row");
+    }
+
+    const row_factory = ffi.getAttrOptional(return_obj, "_snek_from_row") catch return false;
+    if (row_factory) |value| {
+        ffi.decref(value);
+        return true;
+    }
+    return false;
 }
 
 /// Check if a callable is an async def (coroutine function).
@@ -604,6 +690,74 @@ test "add_route stores handler" {
     const entry = state.route_entries[0];
     try std.testing.expect(std.mem.eql(u8, entry.method[0..entry.method_len], "GET"));
     try std.testing.expect(std.mem.eql(u8, entry.path[0..entry.path_len], "/test"));
+}
+
+test "add_route stores str response hint from annotation" {
+    registerBuiltin();
+    ffi.init();
+    defer ffi.deinit();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
+
+    try ffi.runString(
+        \\import _snek
+        \\def hello() -> str:
+        \\    return "ok"
+        \\_snek.add_route("GET", "/text", hello)
+    );
+
+    const state = getState(mod).?;
+    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
+    try std.testing.expectEqual(@intFromEnum(ResponseHint.str), state.handler_flags[0].response_hint);
+}
+
+test "add_route stores stringified str response hint from annotation" {
+    registerBuiltin();
+    ffi.init();
+    defer ffi.deinit();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
+
+    try ffi.runString(
+        \\from __future__ import annotations
+        \\import _snek
+        \\def hello() -> "str":
+        \\    return "ok"
+        \\_snek.add_route("GET", "/text", hello)
+    );
+
+    const state = getState(mod).?;
+    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
+    try std.testing.expectEqual(@intFromEnum(ResponseHint.str), state.handler_flags[0].response_hint);
+}
+
+test "add_route stores row_json response hint from model annotation" {
+    registerBuiltin();
+    ffi.init();
+    defer ffi.deinit();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
+
+    try ffi.runString(
+        \\import _snek
+        \\class MyModel:
+        \\    @classmethod
+        \\    def _snek_from_row(cls, row):
+        \\        return cls()
+        \\def hello() -> MyModel:
+        \\    return MyModel()
+        \\_snek.add_route("GET", "/model", hello)
+    );
+
+    const state = getState(mod).?;
+    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
+    try std.testing.expectEqual(@intFromEnum(ResponseHint.row_json), state.handler_flags[0].response_hint);
 }
 
 test "add_route rejects non-callable" {

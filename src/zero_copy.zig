@@ -5,6 +5,22 @@ const testing = std.testing;
 pub fn ZeroCopy(comptime T: type) type {
     return struct {
         const Self = @This();
+        pub const Owned = struct {
+            allocator: std.mem.Allocator,
+            ptr: [*]T,
+            len: usize,
+            capacity: usize,
+
+            pub fn asSlice(self: *const Owned) []const T {
+                return self.ptr[0..self.len];
+            }
+
+            pub fn deinit(self: *Owned) void {
+                self.allocator.free(self.ptr[0..self.capacity]);
+                self.* = undefined;
+            }
+        };
+
         allocator: std.mem.Allocator,
         ptr: [*]T,
         len: usize,
@@ -110,6 +126,18 @@ pub fn ZeroCopy(comptime T: type) type {
             self.allocator.free(self.ptr[0..self.capacity]);
             self.len = 0;
             self.capacity = 0;
+        }
+
+        pub fn swapOwned(self: *Self, replacement_capacity: usize) !Owned {
+            const replacement = try Self.init(self.allocator, replacement_capacity);
+            const owned = Owned{
+                .allocator = self.allocator,
+                .ptr = self.ptr,
+                .len = self.len,
+                .capacity = self.capacity,
+            };
+            self.* = replacement;
+            return owned;
         }
     };
 }

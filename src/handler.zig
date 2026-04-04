@@ -9,16 +9,26 @@ const router_mod = @import("http/router.zig");
 const response_mod = @import("http/response.zig");
 const driver = @import("python/driver.zig");
 const subinterp = @import("python/subinterp.zig");
+const response_hint_mod = @import("response_hint.zig");
 
 const log = std.log.scoped(.@"snek/handler");
 
 pub const HandlerFn = *const fn (*const http1.Request) response_mod.Response;
+
+pub const PyHandlerFlags = extern struct {
+    needs_request: bool = true,
+    needs_params: bool = false,
+    no_args: bool = false,
+    is_async: bool = false,
+    response_hint: u8 = @intFromEnum(response_hint_mod.ResponseHint.any),
+};
 
 /// Everything needed to handle a request. Shared across server implementations.
 pub const RequestContext = struct {
     router: *const router_mod.Router,
     handlers: *const [64]?HandlerFn,
     py_handler_ids: *const [64]?u32,
+    py_handler_flags: ?*const [64]PyHandlerFlags = null,
     py_ctx: ?*PyContext = null,
 };
 
@@ -58,13 +68,24 @@ pub fn handleRequestRaw(
                 if (ctx.py_ctx) |py| {
                     py.py.acquireGil();
                     const invoke_result = driver.invokePythonHandler(
-                        py.py.snek_module, py_id, req,
-                        found.params[0..found.param_count], body_buf,
+                        py.py.snek_module,
+                        py_id,
+                        req,
+                        found.params[0..found.param_count],
+                        body_buf,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
                     );
                     switch (invoke_result) {
-                        .response => |py_resp| {
+                        .response => |owned| {
                             py.py.releaseGil();
-                            return .{ .response = py_resp };
+                            var py_resp = owned;
+                            defer py_resp.deinit();
+                            return .{ .response = py_resp.response };
                         },
                         .redis_yield => |ry| {
                             py.py.releaseGil();
@@ -111,15 +132,26 @@ pub fn handleRequest(
                     var py_body_buf: [4096]u8 = undefined;
                     py.py.acquireGil();
                     const invoke_result = driver.invokePythonHandler(
-                        py.py.snek_module, py_id, req,
-                        found.params[0..found.param_count], &py_body_buf,
+                        py.py.snek_module,
+                        py_id,
+                        req,
+                        found.params[0..found.param_count],
+                        &py_body_buf,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
                     );
 
                     switch (invoke_result) {
-                        .response => |py_resp| {
+                        .response => |owned| {
                             py.py.releaseGil();
-                            log.debug("python handler returned status={d}", .{py_resp.status});
-                            var resp = py_resp;
+                            var py_resp = owned;
+                            defer py_resp.deinit();
+                            log.debug("python handler returned status={d}", .{py_resp.response.status});
+                            var resp = py_resp.response;
                             const len = resp.serialize(resp_buf) catch {
                                 log.err("response serialization failed", .{});
                                 return .{ .response = "HTTP/1.1 500\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" };
@@ -167,9 +199,14 @@ pub fn handleRequest(
 pub fn errorResponse(err: anyerror) []const u8 {
     log.debug("error response for {}", .{err});
     return switch (err) {
-        error.MalformedRequest, error.BadMethod, error.BadVersion,
-        error.UriTooLong, error.BadHeaderLine, error.TooManyHeaders,
-        error.HeaderTooLarge, error.BufferFull,
+        error.MalformedRequest,
+        error.BadMethod,
+        error.BadVersion,
+        error.UriTooLong,
+        error.BadHeaderLine,
+        error.TooManyHeaders,
+        error.HeaderTooLarge,
+        error.BufferFull,
         => "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         else => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     };

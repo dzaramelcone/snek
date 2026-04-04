@@ -45,6 +45,7 @@ pub const ParseError = error{
 
 pub const Request = struct {
     method: ?Method = null,
+    method_bytes: ?[]const u8 = null,
     uri: ?[]const u8 = null,
     headers: [MAX_HEADERS]Header = undefined,
     header_count: usize = 0,
@@ -64,6 +65,7 @@ pub const Request = struct {
 
         const method_str = chunks.next() orelse return error.MalformedRequest;
         req.method = Method.fromBytes(method_str) orelse return error.BadMethod;
+        req.method_bytes = method_str;
 
         const uri = chunks.next() orelse return error.MalformedRequest;
         req.uri = uri;

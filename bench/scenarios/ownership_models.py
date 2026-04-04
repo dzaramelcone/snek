@@ -76,6 +76,64 @@ async def reset():
     return {"ok": True}
 
 
+@app.post("/request/inspect/{slug}")
+async def request_inspect(req):
+    return helpers._request_summary(req)
+
+
+@app.post("/request/copy-mutate/{slug}")
+async def request_copy_mutate(req):
+    original_body = None if req.body is None else req.body.decode("utf-8")
+    body_copy = None
+    body_bytearray = None
+    if req.body is not None:
+        body_copy = bytes(req.body)
+        body_bytearray = bytearray(req.body)
+        if body_bytearray:
+            body_bytearray[0] = ord("X")
+
+    headers_copy = dict(req.headers)
+    if headers_copy:
+        first_key = next(iter(headers_copy))
+        headers_copy[first_key] = headers_copy[first_key] + "-copy"
+
+    params_copy = dict(req.params)
+    if params_copy:
+        first_key = next(iter(params_copy))
+        params_copy[first_key] = params_copy[first_key] + "-copy"
+
+    return {
+        "original": helpers._request_summary(req),
+        "body_copy": None if body_copy is None else body_copy.decode("utf-8"),
+        "body_bytearray": None if body_bytearray is None else body_bytearray.decode("utf-8"),
+        "headers_copy": headers_copy,
+        "params_copy": params_copy,
+    }
+
+
+@app.post("/request/await-inspect/{slug}")
+async def request_await_inspect(req):
+    return await helpers.inspect_request(req)
+
+
+@app.post("/request/mutate-fail/{slug}")
+async def request_mutate_fail(req):
+    errors: dict[str, str] = {}
+    try:
+        req.method[0] = "P"
+    except Exception as exc:  # noqa: BLE001
+        errors["method"] = f"{type(exc).__name__}: {exc}"
+    try:
+        req.headers["x-test-header"] = "changed"
+    except Exception as exc:  # noqa: BLE001
+        errors["headers"] = f"{type(exc).__name__}: {exc}"
+    try:
+        req.params["slug"] = "changed"
+    except Exception as exc:  # noqa: BLE001
+        errors["params"] = f"{type(exc).__name__}: {exc}"
+    return errors
+
+
 @app.get("/clean")
 async def clean():
     return await db.get_idea_lite(id="idea-1")

@@ -14,10 +14,34 @@ const http1 = @import("../net/http1.zig");
 const router_mod = @import("../http/router.zig");
 const stmt_cache_mod = @import("../db/stmt_cache.zig");
 const SlabPool = @import("../db/result_lease.zig").SlabPool;
+const ResultLease = @import("../db/result_lease.zig").ResultLease;
+const result_lease = @import("../db/result_lease.zig");
 const json_serialize = @import("../json/serialize.zig");
 const snek_row = @import("snek_row.zig");
+const response_hint_mod = @import("../response_hint.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
+const ResponseHint = response_hint_mod.ResponseHint;
+
+pub const OwnedResponse = struct {
+    response: response_mod.Response,
+    body_lease: ResultLease = .{},
+
+    pub fn fromResponse(response: response_mod.Response) OwnedResponse {
+        return .{ .response = response };
+    }
+
+    pub fn takeBodyLease(self: *OwnedResponse) ResultLease {
+        const lease = self.body_lease;
+        self.body_lease = .{};
+        return lease;
+    }
+
+    pub fn deinit(self: *OwnedResponse) void {
+        self.body_lease.release();
+        self.* = undefined;
+    }
+};
 
 // ── Cached Python strings ────────────────────────────────────────────
 // Pre-created PyObject strings for dict keys and HTTP method values.
@@ -238,6 +262,10 @@ pub fn convertPythonResponse(py_result: *PyObject, resp_body_buf: []u8) ffi.Pyth
         }
     }
 
+    if (try tryConvertRowBackedResponse(py_result, resp_body_buf)) |resp| {
+        return resp;
+    }
+
     // Dicts, lists, SnekRows, and Model-like objects serialize as JSON.
     if (try isJsonResponseType(py_result)) {
         const json_str = try pyObjToJson(py_result, resp_body_buf);
@@ -257,6 +285,87 @@ pub fn convertPythonResponse(py_result: *PyObject, resp_body_buf: []u8) ffi.Pyth
     return response_mod.Response.text(text);
 }
 
+const OwnedResponseError = ffi.PythonError || error{
+    SlabPoolClosed,
+    SlabPoolExhausted,
+    OutOfMemory,
+};
+
+pub fn convertPythonResponseOwned(py_result: *PyObject, pool: *SlabPool) OwnedResponseError!OwnedResponse {
+    if (c.Py_IsNone(py_result) != 0) {
+        return .{ .response = response_mod.Response.init(204) };
+    }
+
+    if (ffi.isTuple(py_result)) {
+        const size = ffi.tupleSize(py_result);
+        if (size >= 2) {
+            const status_obj = ffi.tupleGetItem(py_result, 0) orelse return error.ConversionError;
+            const body_obj = ffi.tupleGetItem(py_result, 1) orelse return error.ConversionError;
+
+            const status_long = try ffi.longAsLong(status_obj);
+            if (status_long < 100 or status_long > 599) return error.ConversionError;
+            const status: u16 = @intCast(status_long);
+
+            const owned_body = try pyObjToOwnedString(body_obj, pool);
+            errdefer releaseOwnedBody(&owned_body);
+
+            var resp = response_mod.Response.init(status);
+            _ = resp.setContentType("text/plain");
+            _ = resp.setBody(owned_body.bytes);
+            return .{ .response = resp, .body_lease = owned_body.lease };
+        }
+    }
+
+    {
+        var lease = ResultLease.initOwned(pool) catch null;
+        if (lease) |*owned_lease| {
+            var pos: usize = 0;
+            const wrote = tryWriteRowBackedJson(py_result, owned_lease.bytes(), &pos) catch false;
+            if (wrote) {
+                return .{
+                    .response = response_mod.Response.json(owned_lease.constBytes()[0..pos]),
+                    .body_lease = owned_lease.*,
+                };
+            }
+            owned_lease.release();
+        }
+    }
+
+    if (try isJsonResponseType(py_result)) {
+        const owned_body = try pyObjToOwnedJson(py_result, pool);
+        errdefer releaseOwnedBody(&owned_body);
+        const resp = response_mod.Response.json(owned_body.bytes);
+        return .{ .response = resp, .body_lease = owned_body.lease };
+    }
+
+    if (ffi.isString(py_result)) {
+        const owned_body = try pyObjToOwnedString(py_result, pool);
+        errdefer releaseOwnedBody(&owned_body);
+        const resp = response_mod.Response.text(owned_body.bytes);
+        return .{ .response = resp, .body_lease = owned_body.lease };
+    }
+
+    const str_result = try ffi.objectStr(py_result);
+    defer ffi.decref(str_result);
+    const owned_body = try pyObjToOwnedString(str_result, pool);
+    errdefer releaseOwnedBody(&owned_body);
+    const resp = response_mod.Response.text(owned_body.bytes);
+    return .{ .response = resp, .body_lease = owned_body.lease };
+}
+
+pub fn convertPythonResponseWithLeaseFallback(
+    py_result: *PyObject,
+    resp_body_buf: []u8,
+    pool: *SlabPool,
+) OwnedResponseError!OwnedResponse {
+    if (convertPythonResponse(py_result, resp_body_buf)) |resp| {
+        return OwnedResponse.fromResponse(resp);
+    } else |err| switch (err) {
+        error.ConversionError => return convertPythonResponseOwned(py_result, pool),
+        else => return err,
+    }
+}
+
 /// Convert a Python str object to a Zig slice, copying into the provided buffer.
 fn pyObjToString(obj: *PyObject, buf: []u8) ffi.PythonError![]const u8 {
     if (ffi.isString(obj)) {
@@ -274,6 +383,44 @@ fn pyObjToString(obj: *PyObject, buf: []u8) ffi.PythonError![]const u8 {
     if (span.len > buf.len) return error.ConversionError;
     @memcpy(buf[0..span.len], span);
     return buf[0..span.len];
+}
+
+const OwnedBody = struct {
+    lease: ResultLease,
+    bytes: []const u8,
+};
+
+fn releaseOwnedBody(body: *const OwnedBody) void {
+    var lease = body.lease;
+    lease.release();
+}
+
+fn pyObjToOwnedString(obj: *PyObject, pool: *SlabPool) OwnedResponseError!OwnedBody {
+    const string_obj = if (ffi.isString(obj)) null else try ffi.objectStr(obj);
+    defer ffi.xdecref(string_obj);
+
+    const source = string_obj orelse obj;
+    const s = try ffi.unicodeAsUTF8(source);
+    const span = std.mem.span(s);
+    if (span.len > result_lease.CAPACITY) return error.ConversionError;
+
+    var lease = try ResultLease.initOwned(pool);
+    errdefer lease.release();
+    @memcpy(lease.bytes()[0..span.len], span);
+    return .{
+        .lease = lease,
+        .bytes = lease.constBytes()[0..span.len],
+    };
+}
+
+fn pyObjToOwnedJson(obj: *PyObject, pool: *SlabPool) OwnedResponseError!OwnedBody {
+    var lease = try ResultLease.initOwned(pool);
+    errdefer lease.release();
+    const json = try pyObjToJson(obj, lease.bytes());
+    return .{
+        .lease = lease,
+        .bytes = json,
+    };
 }
 
 const NestedLayout = struct {
@@ -664,7 +811,7 @@ fn writeJsonValue(obj: *PyObject, buf: []u8, pos: *usize) ffi.PythonError!void {
 /// Result of invoking a Python handler — either completed or needs async I/O.
 pub const InvokeResult = union(enum) {
     /// Handler completed synchronously — response is ready.
-    response: response_mod.Response,
+    response: OwnedResponse,
     /// Handler yielded a redis sentinel — needs async I/O.
     /// py_coro is owned by caller. RESP written directly into send buffer.
     redis_yield: RedisYield,
@@ -686,6 +833,117 @@ pub const InvokeResult = union(enum) {
     };
 };
 
+pub const InvokeMetrics = struct {
+    invocations: u64 = 0,
+    coroutines: u64 = 0,
+    sync_responses: u64 = 0,
+    async_immediate_returns: u64 = 0,
+    redis_yields: u64 = 0,
+    pg_yields: u64 = 0,
+    ns_call: u64 = 0,
+    ns_resume: u64 = 0,
+    ns_convert: u64 = 0,
+    ns_sentinel: u64 = 0,
+    str_hint_hits: u64 = 0,
+    str_hint_misses: u64 = 0,
+    row_hint_hits: u64 = 0,
+    row_hint_misses: u64 = 0,
+    row_fast_path_hits: u64 = 0,
+};
+
+fn nowInstant() ?std.time.Instant {
+    return std.time.Instant.now() catch null;
+}
+
+fn accumElapsed(total: *u64, start: ?std.time.Instant) void {
+    const t0 = start orelse return;
+    const t1 = std.time.Instant.now() catch return;
+    total.* += t1.since(t0);
+}
+
+pub fn convertPythonResponseHinted(
+    py_result: *PyObject,
+    resp_body_buf: []u8,
+    response_pool: ?*SlabPool,
+    response_hint: ResponseHint,
+    metrics: ?*InvokeMetrics,
+) OwnedResponse {
+    if (response_hint == .str) {
+        if (ffi.isString(py_result)) {
+            if (metrics) |m| m.str_hint_hits += 1;
+            return if (response_pool) |pool|
+                convertHintedStringResponseOwned(py_result, resp_body_buf, pool)
+            else
+                OwnedResponse.fromResponse(convertHintedStringResponse(py_result, resp_body_buf));
+        }
+        if (metrics) |m| m.str_hint_misses += 1;
+    }
+
+    if (tryConvertRowBackedOwnedResponse(py_result, resp_body_buf, response_pool)) |owned| {
+        if (metrics) |m| {
+            m.row_fast_path_hits += 1;
+            if (response_hint == .row_json) {
+                m.row_hint_hits += 1;
+            }
+        }
+        return owned;
+    }
+    if (response_hint == .row_json) {
+        if (metrics) |m| m.row_hint_misses += 1;
+    }
+
+    return if (response_pool) |pool|
+        convertPythonResponseWithLeaseFallback(py_result, resp_body_buf, pool) catch OwnedResponse.fromResponse(response_mod.Response.init(500))
+    else
+        OwnedResponse.fromResponse(convertPythonResponse(py_result, resp_body_buf) catch response_mod.Response.init(500));
+}
+
+fn convertHintedStringResponse(py_result: *PyObject, resp_body_buf: []u8) response_mod.Response {
+    const text = pyObjToString(py_result, resp_body_buf) catch return response_mod.Response.init(500);
+    return response_mod.Response.text(text);
+}
+
+fn convertHintedStringResponseOwned(py_result: *PyObject, resp_body_buf: []u8, pool: *SlabPool) OwnedResponse {
+    if (pyObjToString(py_result, resp_body_buf)) |text| {
+        return OwnedResponse.fromResponse(response_mod.Response.text(text));
+    } else |_| {}
+
+    const owned_body = pyObjToOwnedString(py_result, pool) catch return OwnedResponse.fromResponse(response_mod.Response.init(500));
+    return .{
+        .response = response_mod.Response.text(owned_body.bytes),
+        .body_lease = owned_body.lease,
+    };
+}
+
+fn tryConvertRowBackedResponse(obj: *PyObject, buf: []u8) ffi.PythonError!?response_mod.Response {
+    var pos: usize = 0;
+    if (!try tryWriteRowBackedJson(obj, buf, &pos)) return null;
+    return response_mod.Response.json(buf[0..pos]);
+}
+
+fn tryConvertRowBackedOwnedResponse(
+    obj: *PyObject,
+    resp_body_buf: []u8,
+    response_pool: ?*SlabPool,
+) ?OwnedResponse {
+    if (tryConvertRowBackedResponse(obj, resp_body_buf) catch null) |resp| {
+        return OwnedResponse.fromResponse(resp);
+    }
+    const pool = response_pool orelse return null;
+    var lease = ResultLease.initOwned(pool) catch return null;
+
+    var pos: usize = 0;
+    const wrote = tryWriteRowBackedJson(obj, lease.bytes(), &pos) catch false;
+    if (!wrote) {
+        lease.release();
+        return null;
+    }
+    return .{
+        .response = response_mod.Response.json(lease.constBytes()[0..pos]),
+        .body_lease = lease,
+    };
+}
+
 /// Invoke a Python handler. Caller must hold the GIL and provide the _snek module.
 /// On redis/pg yield, writes protocol bytes directly into the provided send buffers.
 /// Returns InvokeResult — either a response or a lightweight yield descriptor.
@@ -695,61 +953,116 @@ pub fn invokePythonHandler(
     req: *const http1.Request,
     params: []const router_mod.PathParam,
     resp_body_buf: []u8,
+    response_pool: ?*SlabPool,
     redis_send_buf: ?[]u8,
     pg_send_buf: ?[]u8,
     pg_stmt_cache: ?*StmtCache,
     pg_conn_prepared: ?*[MAX_PG_STMTS]bool,
+    metrics: ?*InvokeMetrics,
 ) !InvokeResult {
-    const handler = module.getHandler(mod, handler_id) orelse
-        return .{ .response = response_mod.Response.init(500) };
     const flags = module.getHandlerFlags(mod, handler_id);
+    const req_obj = if (!flags.no_args and !flags.needs_params)
+        buildRequestDict(req, params) catch return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) }
+    else
+        null;
+    defer ffi.xdecref(req_obj);
 
-    const call_result = if (flags.no_args) blk: {
+    return invokePythonHandlerWithKnownFlags(
+        mod,
+        handler_id,
+        flags.no_args,
+        flags.needs_params,
+        @enumFromInt(flags.response_hint),
+        req_obj,
+        params,
+        resp_body_buf,
+        response_pool,
+        redis_send_buf,
+        pg_send_buf,
+        pg_stmt_cache,
+        pg_conn_prepared,
+        metrics,
+    );
+}
+
+pub fn invokePythonHandlerWithKnownFlags(
+    mod: *PyObject,
+    handler_id: u32,
+    no_args: bool,
+    needs_params: bool,
+    response_hint: ResponseHint,
+    req_obj: ?*PyObject,
+    params: []const router_mod.PathParam,
+    resp_body_buf: []u8,
+    response_pool: ?*SlabPool,
+    redis_send_buf: ?[]u8,
+    pg_send_buf: ?[]u8,
+    pg_stmt_cache: ?*StmtCache,
+    pg_conn_prepared: ?*[MAX_PG_STMTS]bool,
+    metrics: ?*InvokeMetrics,
+) !InvokeResult {
+    if (metrics) |m| m.invocations += 1;
+    const handler = module.getHandler(mod, handler_id) orelse
+        return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
+
+    const t_call = nowInstant();
+    const call_result = if (no_args) blk: {
         break :blk ffi.vectorcallNoArgs(handler) catch {
             if (ffi.errOccurred()) ffi.errPrint();
-            return .{ .response = response_mod.Response.init(500) };
+            return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
         };
-    } else if (flags.needs_params) blk: {
+    } else if (needs_params) blk: {
         if (params.len > 0) {
-            const kwargs = buildParamsKwargs(params) catch return .{ .response = response_mod.Response.init(500) };
+            const kwargs = buildParamsKwargs(params) catch return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
             defer ffi.decref(kwargs);
-            const empty_args = ffi.tupleNew(0) catch return .{ .response = response_mod.Response.init(500) };
+            const empty_args = ffi.tupleNew(0) catch return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
             defer ffi.decref(empty_args);
             break :blk ffi.callObjectKwargs(handler, empty_args, kwargs) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
-                return .{ .response = response_mod.Response.init(500) };
+                return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
             };
         } else {
             break :blk ffi.vectorcallNoArgs(handler) catch {
                 if (ffi.errOccurred()) ffi.errPrint();
-                return .{ .response = response_mod.Response.init(500) };
+                return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
             };
         }
     } else blk: {
-        const req_dict = buildRequestDict(req, params) catch return .{ .response = response_mod.Response.init(500) };
-        defer ffi.decref(req_dict);
-        break :blk ffi.vectorcallOneArg(handler, req_dict) catch {
+        const request = req_obj orelse return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
+        break :blk ffi.vectorcallOneArg(handler, request) catch {
             if (ffi.errOccurred()) ffi.errPrint();
-            return .{ .response = response_mod.Response.init(500) };
+            return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
         };
     };
+    if (metrics) |m| accumElapsed(&m.ns_call, t_call);
 
     // Drive coroutines (async def) — first yield may require async I/O.
     // Uses PyIter_Send for fast path: no method lookup, no args tuple,
     // no StopIteration exception on return.
     if (ffi.isCoroutine(call_result)) {
+        if (metrics) |m| m.coroutines += 1;
+        const t_resume = nowInstant();
         const send = ffi.iterSend(call_result, ffi.none());
+        if (metrics) |m| accumElapsed(&m.ns_resume, t_resume);
         switch (send.status) {
             .next => {
                 // Coroutine yielded — classify as redis or postgres
                 const sentinel = send.result.?;
                 defer ffi.decref(sentinel);
 
+                const t_sentinel = nowInstant();
                 const yield = classifySentinel(sentinel, call_result, redis_send_buf, pg_send_buf, pg_stmt_cache, pg_conn_prepared) catch {
                     ffi.coroutineClose(call_result);
                     ffi.decref(call_result);
-                    return .{ .response = response_mod.Response.init(503) };
+                    return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(503)) };
                 };
+                if (metrics) |m| {
+                    accumElapsed(&m.ns_sentinel, t_sentinel);
+                    switch (yield) {
+                        .redis => m.redis_yields += 1,
+                        .pg => m.pg_yields += 1,
+                    }
+                }
                 return switch (yield) {
                     .redis => |ry| .{ .redis_yield = ry },
                     .pg => |pg| .{ .pg_yield = pg },
@@ -758,32 +1071,62 @@ pub fn invokePythonHandler(
             .@"return" => {
                 // Coroutine returned immediately (async def with no await)
                 ffi.decref(call_result);
-                const result = send.result orelse return .{ .response = response_mod.Response.init(500) };
+                const result = send.result orelse return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
                 defer ffi.decref(result);
-                return .{ .response = convertPythonResponse(result, resp_body_buf) catch response_mod.Response.init(500) };
+                const t_convert = nowInstant();
+                const response = convertPythonResponseHinted(result, resp_body_buf, response_pool, response_hint, metrics);
+                if (metrics) |m| {
+                    m.async_immediate_returns += 1;
+                    accumElapsed(&m.ns_convert, t_convert);
+                }
+                return .{
+                    .response = response,
+                };
             },
             .@"error" => {
                 ffi.decref(call_result);
                 if (ffi.errOccurred()) ffi.errPrint();
-                return .{ .response = response_mod.Response.init(500) };
+                return .{ .response = OwnedResponse.fromResponse(response_mod.Response.init(500)) };
             },
         }
     }
 
     // Sync handler — not a coroutine
     defer ffi.decref(call_result);
-    return .{ .response = convertPythonResponse(call_result, resp_body_buf) catch response_mod.Response.init(500) };
+    const t_convert = nowInstant();
+    const response = convertPythonResponseHinted(call_result, resp_body_buf, response_pool, response_hint, metrics);
+    if (metrics) |m| {
+        m.sync_responses += 1;
+        accumElapsed(&m.ns_convert, t_convert);
+    }
+    return .{
+        .response = response,
+    };
 }
 
 /// Redis command IDs — must match _Cmd in app.py.
 pub const RedisCmd = enum(u8) {
-    GET, SET, DEL, INCR, EXPIRE, TTL, EXISTS, PING, SETEX,
+    GET,
+    SET,
+    DEL,
+    INCR,
+    EXPIRE,
+    TTL,
+    EXISTS,
+    PING,
+    SETEX,
 
     pub fn name(self: RedisCmd) []const u8 {
         return switch (self) {
-            .GET => "GET", .SET => "SET", .DEL => "DEL",
-            .INCR => "INCR", .EXPIRE => "EXPIRE", .TTL => "TTL",
-            .EXISTS => "EXISTS", .PING => "PING", .SETEX => "SETEX",
+            .GET => "GET",
+            .SET => "SET",
+            .DEL => "DEL",
+            .INCR => "INCR",
+            .EXPIRE => "EXPIRE",
+            .TTL => "TTL",
+            .EXISTS => "EXISTS",
+            .PING => "PING",
+            .SETEX => "SETEX",
         };
     }
 };
@@ -1006,7 +1349,15 @@ pub fn startServer(host: []const u8, port: u16, threads: usize, backlog: u16) !v
     while (i < state.py_handler_count) : (i += 1) {
         const entry = state.route_entries[i];
         const method = router_mod.Method.fromString(entry.method[0..entry.method_len]) orelse continue;
+        const route_id = server.handler_count;
         server.addPythonRoute(method, entry.path[0..entry.path_len], i) catch continue;
+        server.py_handler_flags[route_id] = .{
+            .needs_request = state.handler_flags[i].needs_request,
+            .needs_params = state.handler_flags[i].needs_params,
+            .no_args = state.handler_flags[i].no_args,
+            .is_async = state.handler_flags[i].is_async,
+            .response_hint = state.handler_flags[i].response_hint,
+        };
     }
 
     _ = gil.PyEval_SaveThread();

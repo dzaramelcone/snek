@@ -23,6 +23,7 @@ pub const Server = struct {
     handlers: [64]?HandlerFn,
     handler_count: u32,
     py_handler_ids: [64]?u32,
+    py_handler_flags: [64]handler.PyHandlerFlags,
     host: []const u8,
     port: u16,
     num_threads: usize,
@@ -36,6 +37,7 @@ pub const Server = struct {
             .handlers = .{null} ** 64,
             .handler_count = 0,
             .py_handler_ids = .{null} ** 64,
+            .py_handler_flags = .{handler.PyHandlerFlags{}} ** 64,
             .host = host,
             .port = port,
             .num_threads = 1,
@@ -60,6 +62,8 @@ pub const Server = struct {
         const id = self.handler_count;
         if (id >= 64) return error.TooManyHandlers;
         self.handlers[id] = h;
+        self.py_handler_ids[id] = null;
+        self.py_handler_flags[id] = .{};
         self.handler_count = id + 1;
         try self.router.addRoute(method, path, id);
     }
@@ -69,6 +73,7 @@ pub const Server = struct {
         if (id >= 64) return error.TooManyHandlers;
         self.handlers[id] = null;
         self.py_handler_ids[id] = py_handler_id;
+        self.py_handler_flags[id] = .{};
         self.handler_count = id + 1;
         try self.router.addRoute(method, path, id);
     }
@@ -161,10 +166,10 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
         const ref = server.module_ref[0..server.module_ref_len];
         tl_py = try subinterp.WorkerPyContext.init(ref);
         tl_py.?.acquireGil();
-        const driver = @import("python/driver.zig");
-        try driver.initStringCache();
         const snek_row = @import("python/snek_row.zig");
+        const snek_request = @import("python/snek_request.zig");
         try snek_row.initType();
+        try snek_request.initType();
         tl_py.?.releaseGil();
         tl_py_ctx = .{ .py = &tl_py.? };
         tl_ctx = .{ .py = tl_py.? };
@@ -174,6 +179,7 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
         .router = &server.router,
         .handlers = &server.handlers,
         .py_handler_ids = &server.py_handler_ids,
+        .py_handler_flags = &server.py_handler_flags,
         .py_ctx = if (tl_py_ctx) |*p| p else null,
     };
 
@@ -183,7 +189,7 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
 
     const pl = try allocator.create(pipeline_mod.Pipeline);
     defer allocator.destroy(pl);
-    pl.* = try pipeline_mod.Pipeline.init(allocator, &conns, 1024);
+    try pl.init(allocator, &conns, 1024);
 
     pl.req_ctx = if (tl_req_ctx) |*ctx| ctx else null;
 

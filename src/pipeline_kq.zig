@@ -345,19 +345,22 @@ pub const Pipeline = struct {
     // Stage timing stats
     stats: Stats = .{},
 
-    pub fn init(allocator: std.mem.Allocator, conns: *Pool(Conn), entries: u16) !Pipeline {
+    pub fn init(self: *Pipeline, allocator: std.mem.Allocator, conns: *Pool(Conn), entries: u16) !void {
         var backend = try kqueue.Kqueue.init(allocator, entries);
         errdefer backend.deinit(allocator);
 
         var pg_transport_pool = try TransportPool.init(allocator, TRANSPORT_BUFFER_COUNT);
         errdefer pg_transport_pool.deinit();
 
-        return .{
+        var result_pool = try ResultSlabPool.init(allocator, RESULT_SLAB_CACHE, RESULT_SLAB_MAX_LIVE);
+        errdefer result_pool.deinit();
+
+        self.* = .{
             .backend = backend,
             .conns = conns,
             .allocator = allocator,
             .pg_transport_pool = pg_transport_pool,
-            .pg_result_pool = try ResultSlabPool.init(allocator, RESULT_SLAB_CACHE, RESULT_SLAB_MAX_LIVE),
+            .pg_result_pool = result_pool,
         };
     }
 
@@ -716,10 +719,12 @@ pub const Pipeline = struct {
                                         &http1.Request{},
                                         &.{},
                                         &conn.body_buf,
+                                        null,
                                         self.redisSendSlice(),
                                         self.pgSendSlice(),
                                         self.pgStmtCache(),
                                         self.pgConnPrepared(),
+                                        null,
                                     );
                                     try self.handleResult(ht.conn, result);
                                     continue;
@@ -734,10 +739,12 @@ pub const Pipeline = struct {
                                     &req,
                                     found.params[0..found.param_count],
                                     &conn.body_buf,
+                                    null,
                                     self.redisSendSlice(),
                                     self.pgSendSlice(),
                                     self.pgStmtCache(),
                                     self.pgConnPrepared(),
+                                    null,
                                 ) catch {
                                     try self.send_q.push(makeErrorSend(ht.conn, 500));
                                     continue;
@@ -788,10 +795,12 @@ pub const Pipeline = struct {
                                 &req,
                                 found.params[0..found.param_count],
                                 &conn.body_buf,
+                                null,
                                 self.redisSendSlice(),
                                 self.pgSendSlice(),
                                 self.pgStmtCache(),
                                 self.pgConnPrepared(),
+                                null,
                             );
                             try self.handleResult(ht.conn, result);
                         } else {
@@ -816,7 +825,11 @@ pub const Pipeline = struct {
     /// Handle an InvokeResult: response goes to send_q, yields update send buffers + push waiters.
     fn handleResult(self: *Pipeline, conn: u16, result: driver.InvokeResult) !void {
         switch (result) {
-            .response => |resp| try self.send_q.push(makeResponseSend(conn, resp)),
+            .response => |owned| {
+                var resp = owned;
+                defer resp.deinit();
+                try self.send_q.push(makeResponseSend(conn, resp.response));
+            },
             .redis_yield => |ry| {
                 self.redis_send_len += ry.bytes_written;
                 try self.pushRedisWaiter(conn, ry.py_coro);
@@ -1576,12 +1589,6 @@ pub const Pipeline = struct {
             posix.close(conn.fd);
             self.conns.release(index);
         }
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────
-
-    pub fn pushSendTask(self: *Pipeline, task: SendTask) !void {
-        try self.send_q.push(task);
     }
 };
 

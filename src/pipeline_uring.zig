@@ -1,40 +1,40 @@
 //! Staged event-driven pipeline.
 //!
-//! Connections are pure data (fd + recv buffer). Each stage defines its own
+//! Connections are pure data (fd + leased recv queue). Each stage defines its own
 //! typed task. The stage processor IS the state machine.
 //!
 //! DAG:
-//!   [kernel recv] → ParseTask → HandleTask ─┬→ SendTask → [kernel sendv] → recv
+//!   [kernel recv] → ParseTask → HandleTask ─┬→ SendTask → [kernel send/sendmsg_zc] → recv
 //!                                            └→ RedisTask ··· → SendTask
 //!
 //! Response headers use a cached per-second prefix (Server + Date) shared
-//! across all responses. sendv scatter-gathers prefix + per-response headers + body.
+//! across all responses. The uring path uses connection-owned send state so
+//! response buffers stay valid across partial sends and zerocopy notifications.
 
 const std = @import("std");
 const posix = std.posix;
 const io_uring = @import("aio/io_uring.zig");
 const Completion = io_uring.Completion;
 const Pool = @import("pool.zig").Pool;
-const ZeroCopy = @import("zero_copy.zig").ZeroCopy;
 const http1 = @import("net/http1.zig");
 const handler_mod = @import("handler.zig");
 const driver = @import("python/driver.zig");
 const ffi = @import("python/ffi.zig");
+const snek_request = @import("python/snek_request.zig");
+const response_hint_mod = @import("response_hint.zig");
 const c = ffi.c;
-const module = @import("python/module.zig");
 const router_mod = @import("http/router.zig");
 const response_mod = @import("http/response.zig");
 const stmt_cache_mod = @import("db/stmt_cache.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
-const pg_stream = @import("db/pg_stream.zig");
+const pg_stream = @import("db/pg_stream_uring.zig");
 const result_lease = @import("db/result_lease.zig");
 const ResultSlabPool = result_lease.SlabPool;
-const transport_pool = @import("aio/transport_pool.zig");
-const TransportPool = transport_pool.Pool;
-const transport_ring = @import("aio/transport_ring.zig");
-const TransportRing = transport_ring.Ring;
-const dispatch = @import("pipeline_uring_dispatch.zig");
+const uring_recv_group = @import("aio/uring_recv_group.zig");
+const UringRecvGroup = uring_recv_group.Group;
+const uring_recv_queue = @import("aio/uring_recv_queue.zig");
+const UringRecvQueue = uring_recv_queue.Queue;
 const snek_row = @import("python/snek_row.zig");
 const perf = @import("observe/perf.zig");
 
@@ -42,7 +42,22 @@ const log = std.log.scoped(.@"snek/pipeline");
 
 const MAX_BATCH = 1024;
 const MAX_IOVECS = 4; // status | common | per-response | body
-const TRANSPORT_BUFFER_COUNT = transport_pool.DEFAULT_BUFFER_COUNT;
+const SEND_HDR_CAP = 128;
+const HTTP_RECV_BUFFER_COUNT: u16 = 256;
+const HTTP_RECV_BUFFER_SIZE: u32 = 16 * 1024;
+const HTTP_RECV_GROUP_ID: u16 = 1;
+const HTTP_RECV_MAX_BYTES: usize = 64 * 1024;
+// sendmsg_zc has extra notification overhead. Keep tiny responses on sendv and
+// reserve zerocopy sends for bodies large enough to amortize it.
+const HTTP_SEND_ZC_MIN_BYTES: usize = 4 * 1024;
+const PG_RECV_BUFFER_COUNT = uring_recv_group.DEFAULT_BUFFER_COUNT;
+const PG_RECV_BUFFER_SIZE = uring_recv_group.DEFAULT_BUFFER_SIZE;
+const PG_RECV_GROUP_ID: u16 = 2;
+const PG_RECV_MAX_BYTES = @as(usize, PG_RECV_BUFFER_SIZE) * @as(usize, PG_RECV_BUFFER_COUNT);
+const REQUEST_SLAB_CACHE = 128;
+const REQUEST_SLAB_MAX_LIVE = 512;
+const RESPONSE_SLAB_CACHE = 128;
+const RESPONSE_SLAB_MAX_LIVE = 1024;
 const RESULT_SLAB_CACHE = 128;
 const RESULT_SLAB_MAX_LIVE = 1024;
 
@@ -105,10 +120,11 @@ fn commonHeaders() []const u8 {
 
 pub const Token = struct {
     _align: usize = 0,
-    tag: Tag = .conn,
+    tag: Tag = .conn_recv,
 
     pub const Tag = enum(u8) {
-        conn,
+        conn_recv,
+        conn_send,
         accept,
         redis_send,
         redis_recv,
@@ -120,9 +136,10 @@ pub const Token = struct {
 pub const Conn = struct {
     fd: posix.socket_t = undefined,
     pool_index: u16 = 0,
-    zc: ZeroCopy(u8) = undefined,
-    recv_slice: []u8 = &.{},
-    initialized: bool = false,
+    recv_queue: UringRecvQueue = .{ .max_bytes = HTTP_RECV_MAX_BYTES },
+    recv_armed: bool = false,
+    parse_queued: bool = false,
+    inflight_request_len: usize = 0,
 
     // Streaming SIMD header parser from stdlib
     head_parser: std.http.HeadParser = .{},
@@ -132,23 +149,37 @@ pub const Conn = struct {
     // Lives until send completes. Eliminates resp_buf[8192].
     body_buf: [4096]u8 = undefined,
 
-    // Embedded token for backend user_data round-trip.
-    // The pipeline recovers Conn via @fieldParentPtr.
-    token: Token = .{},
+    send_hdr: [SEND_HDR_CAP]u8 = undefined,
+    send_hdr_len: usize = 0,
+    send_iovecs: [MAX_IOVECS]posix.iovec_const = undefined,
+    send_iov_count: usize = 0,
+    send_msg: posix.msghdr_const = std.mem.zeroes(posix.msghdr_const),
+    send_body: ?[]const u8 = null,
+    send_body_from_conn: bool = false,
+    send_body_lease: result_lease.ResultLease = .{},
+    send_total_len: usize = 0,
+    send_sent: usize = 0,
+    send_mode: enum { idle, sendv, sendmsg_zc } = .idle,
+    zc_hold: ?ZcHold = null,
+    zc_notif_pending: bool = false,
+    close_after_notif: bool = false,
 
-    pub fn ensureInit(self: *Conn, allocator: std.mem.Allocator) !void {
-        if (!self.initialized) {
-            self.zc = try ZeroCopy(u8).init(allocator, 4096);
-            self.initialized = true;
-        }
-    }
+    recv_token: Token = .{ .tag = .conn_recv },
+    send_token: Token = .{ .tag = .conn_send },
 
-    pub fn resetRecv(self: *Conn) void {
-        self.zc.clear_retaining_capacity();
+    pub fn resetRecv(self: *Conn, group: *UringRecvGroup) void {
+        self.recv_queue.clear(group);
+        self.recv_armed = false;
+        self.parse_queued = false;
+        self.inflight_request_len = 0;
         self.head_parser = .{};
         self.head_fed = 0;
-        self.recv_slice = self.zc.get_write_area(4096) catch &.{};
     }
+};
+
+const ZcHold = struct {
+    hdr: [SEND_HDR_CAP]u8 = undefined,
+    hdr_len: usize = 0,
 };
 
 // ── Typed tasks ───────────────────────────────────────────────────
@@ -161,14 +192,31 @@ pub const HandleTask = struct {
     content_length: usize,
 };
 
+const PythonHandleKind = enum(u8) {
+    no_args,
+    params_only,
+    request,
+};
+
+pub const PythonHandleTask = struct {
+    conn: u16,
+    py_id: u32,
+    kind: PythonHandleKind,
+    response_hint: response_hint_mod.ResponseHint = .any,
+    request_backing: ?snek_request.Backing = null,
+    params: [8]router_mod.PathParam = undefined,
+    param_count: u8 = 0,
+};
+
 pub const SendTask = struct {
     conn: u16,
     // Per-response header fragment: "Content-Type: ...\r\nContent-Length: N\r\n\r\n"
-    hdr: [128]u8,
+    hdr: [SEND_HDR_CAP]u8,
     hdr_len: usize,
     // Pointers for sendv iovecs
     status_line: []const u8, // static string
     body: ?[]const u8, // points into conn.body_buf or static
+    body_lease: result_lease.ResultLease = .{},
 };
 
 const RedisWaiter = struct {
@@ -195,8 +243,11 @@ pub const PgConn = struct {
     send_len: usize = 0,
     send_state: enum { idle, sending } = .idle,
     send_offset: usize = 0,
-    transport: TransportRing = .{},
-    recv_state: enum { idle, receiving, parsing, err } = .idle,
+    recv_queue: UringRecvQueue = .{ .max_bytes = PG_RECV_MAX_BYTES },
+    recv_state: enum { idle, parsing, err } = .idle,
+    recv_armed: bool = false,
+    fail_status: u16 = 500,
+    fail_body: ?[]const u8 = null,
     in_flight: usize = 0,
     prepared: [MAX_PG_STMTS]bool = .{false} ** MAX_PG_STMTS,
     waiters: [PG_WAITER_CAP]PgWaiter = undefined,
@@ -303,16 +354,15 @@ pub const Pipeline = struct {
     running: bool = true,
     listen_fd: posix.socket_t = undefined,
     accept_token: Token = .{ .tag = .accept },
+    accept_armed: bool = false,
     req_ctx: ?*const handler_mod.RequestContext = null,
 
     // Typed stage queues
     parse_q: Queue(ParseTask) = .{},
     handle_q: Queue(HandleTask) = .{},
+    py_handle_q: Queue(PythonHandleTask) = .{},
     send_q: Queue(SendTask) = .{},
     close_q: Queue(u16) = .{},
-
-    // iovecs storage — one set of MAX_IOVECS per send task, reused each cycle
-    iovecs_buf: [MAX_BATCH][MAX_IOVECS]posix.iovec_const = undefined,
 
     // ── Redis state (full-duplex: independent send/recv) ───────
     redis_fd: ?posix.socket_t = null,
@@ -339,42 +389,84 @@ pub const Pipeline = struct {
     pg_last_conn: u8 = 0, // last connection selected by pgSendSlice
     pg_wire_ns: u64 = 0, // total pg parse+py time (set by stagePostgres)
     pg_stmt_cache: StmtCache = .{},
-    pg_transport_pool: TransportPool,
+    http_recv_group: UringRecvGroup,
+    pg_recv_group: UringRecvGroup,
+    request_pool: ResultSlabPool,
+    response_pool: ResultSlabPool,
     pg_result_pool: ResultSlabPool,
 
     // Stage timing stats
     stats: Stats = .{},
 
-    pub fn init(allocator: std.mem.Allocator, conns: *Pool(Conn), entries: u16) !Pipeline {
+    pub fn init(self: *Pipeline, allocator: std.mem.Allocator, conns: *Pool(Conn), entries: u16) !void {
         var backend = try io_uring.IoUring.init(allocator, entries);
         errdefer backend.deinit(allocator);
 
-        var pg_transport_pool = try TransportPool.init(allocator, TRANSPORT_BUFFER_COUNT);
-        errdefer pg_transport_pool.deinit();
-        try pg_transport_pool.register(&backend);
-        errdefer pg_transport_pool.unregister(&backend);
+        const http_recv_group = try UringRecvGroup.init(
+            backend.ring.fd,
+            allocator,
+            HTTP_RECV_GROUP_ID,
+            HTTP_RECV_BUFFER_SIZE,
+            HTTP_RECV_BUFFER_COUNT,
+        );
+        errdefer {
+            var group = http_recv_group;
+            group.deinit();
+        }
 
-        return .{
+        const pg_recv_group = try UringRecvGroup.init(
+            backend.ring.fd,
+            allocator,
+            PG_RECV_GROUP_ID,
+            PG_RECV_BUFFER_SIZE,
+            PG_RECV_BUFFER_COUNT,
+        );
+        errdefer {
+            var group = pg_recv_group;
+            group.deinit();
+        }
+
+        var request_pool = try ResultSlabPool.init(allocator, REQUEST_SLAB_CACHE, REQUEST_SLAB_MAX_LIVE);
+        errdefer request_pool.deinit();
+
+        var response_pool = try ResultSlabPool.init(allocator, RESPONSE_SLAB_CACHE, RESPONSE_SLAB_MAX_LIVE);
+        errdefer response_pool.deinit();
+
+        var result_pool = try ResultSlabPool.init(allocator, RESULT_SLAB_CACHE, RESULT_SLAB_MAX_LIVE);
+        errdefer result_pool.deinit();
+
+        self.* = .{
             .backend = backend,
             .conns = conns,
             .allocator = allocator,
-            .pg_transport_pool = pg_transport_pool,
-            .pg_result_pool = try ResultSlabPool.init(allocator, RESULT_SLAB_CACHE, RESULT_SLAB_MAX_LIVE),
+            .http_recv_group = http_recv_group,
+            .pg_recv_group = pg_recv_group,
+            .request_pool = request_pool,
+            .response_pool = response_pool,
+            .pg_result_pool = result_pool,
         };
     }
 
     pub fn deinit(self: *Pipeline, allocator: std.mem.Allocator) void {
-        for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
-            pg.transport.deinit(&self.pg_transport_pool);
+        var conn_iter = self.conns.iterator();
+        while (conn_iter.next_ptr()) |conn| {
+            conn.recv_queue.deinit(&self.http_recv_group);
         }
-        self.pg_transport_pool.unregister(&self.backend);
-        self.pg_transport_pool.deinit();
+        for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
+            pg.recv_queue.deinit(&self.pg_recv_group);
+        }
+        self.http_recv_group.deinit();
+        self.pg_recv_group.deinit();
+        self.request_pool.deinit();
+        self.response_pool.deinit();
         self.pg_result_pool.deinit();
         self.backend.deinit(allocator);
     }
 
     pub fn start(self: *Pipeline, listen_fd: posix.socket_t) !void {
-        try dispatch.start(self, listen_fd);
+        self.listen_fd = listen_fd;
+        self.accept_token = .{ .tag = .accept };
+        try self.armAccept();
     }
 
     // ── Main loop ─────────────────────────────────────────────────
@@ -391,7 +483,8 @@ pub const Pipeline = struct {
 
     fn cycle(self: *Pipeline, wait_nr: u32) !bool {
         const t0 = try std.time.Instant.now();
-        const completions = try self.backend.submitAndWait(wait_nr);
+        try self.backend.publish();
+        const completions = try self.backend.reap(wait_nr);
         if (completions.tokens.len == 0) return false;
         const t_io = try std.time.Instant.now();
 
@@ -406,12 +499,13 @@ pub const Pipeline = struct {
         // Reset queues
         self.parse_q.len = 0;
         self.handle_q.len = 0;
+        self.py_handle_q.len = 0;
         self.send_q.len = 0;
         self.close_q.len = 0;
 
-        // Classify
+        // CQE-driven completion routing
         for (completions.tokens, completions.completions) |token, completion| {
-            try dispatch.classifyCompletion(self, token, completion);
+            try self.handleCompletion(token, completion);
         }
         const t_classify = try std.time.Instant.now();
 
@@ -419,14 +513,18 @@ pub const Pipeline = struct {
         try self.stageParse();
         const t_parse = try std.time.Instant.now();
 
-        // GIL held across handle + redis + postgres stages (one acquire for all Python work)
+        const http_requests = self.handle_q.len;
+        try self.stageHandlePrep();
+        const t_handle_prep = try std.time.Instant.now();
+
+        // GIL held across Python invoke + redis + postgres stages (one acquire for all Python work)
         const py_ctx = if (self.req_ctx) |ctx| ctx.py_ctx else null;
-        const need_gil = py_ctx != null and (self.handle_q.len > 0 or self.redis_recv_state == .parsing or self.redis_recv_state == .err or self.anyPgNeedsGil());
+        const need_gil = py_ctx != null and (self.py_handle_q.len > 0 or self.redis_recv_state == .parsing or self.redis_recv_state == .err or self.anyPgNeedsGil());
         if (need_gil) py_ctx.?.py.acquireGil();
         defer if (need_gil) py_ctx.?.py.releaseGil();
 
-        try self.stageHandle();
-        const t_handle = try std.time.Instant.now();
+        try self.stageHandlePython();
+        const t_handle_py = try std.time.Instant.now();
         try self.stageRedis();
         const t_redis = try std.time.Instant.now();
         const pg_rows_before = self.totalPgWaiters();
@@ -436,6 +534,7 @@ pub const Pipeline = struct {
         try self.stageSerializeAndSend();
         const t_send = try std.time.Instant.now();
         self.stageClose();
+        try self.backend.publish();
 
         // PMU snapshot — end
         if (comptime Stats.has_pmu) {
@@ -445,11 +544,13 @@ pub const Pipeline = struct {
         // Accumulate timing stats
         self.stats.cycles += 1;
         self.stats.completions += completions.tokens.len;
+        self.stats.http_requests += http_requests;
         self.stats.ns_io += t_io.since(t0);
         self.stats.ns_classify += t_classify.since(t_io);
         self.stats.ns_parse += t_parse.since(t_classify);
-        self.stats.ns_handle += t_handle.since(t_parse);
-        self.stats.ns_redis += t_redis.since(t_handle);
+        self.stats.ns_handle_prep += t_handle_prep.since(t_parse);
+        self.stats.ns_handle_py += t_handle_py.since(t_handle_prep);
+        self.stats.ns_redis += t_redis.since(t_handle_py);
         self.stats.ns_pg_wire += self.pg_wire_ns;
         self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_wire_ns;
         self.stats.pg_rows += pg_rows_before -| self.totalPgWaiters();
@@ -464,10 +565,30 @@ pub const Pipeline = struct {
     const Stats = struct {
         cycles: u64 = 0,
         completions: u64 = 0,
+        http_requests: u64 = 0,
         ns_io: u64 = 0,
         ns_classify: u64 = 0,
         ns_parse: u64 = 0,
-        ns_handle: u64 = 0,
+        ns_handle_prep: u64 = 0,
+        ns_handle_py: u64 = 0,
+        ns_py_call: u64 = 0,
+        ns_py_resume: u64 = 0,
+        ns_py_convert: u64 = 0,
+        ns_py_sentinel: u64 = 0,
+        py_no_args: u64 = 0,
+        py_params_only: u64 = 0,
+        py_request: u64 = 0,
+        py_invocations: u64 = 0,
+        py_coroutines: u64 = 0,
+        py_sync_responses: u64 = 0,
+        py_async_immediate_returns: u64 = 0,
+        py_redis_yields: u64 = 0,
+        py_pg_yields: u64 = 0,
+        py_str_hint_hits: u64 = 0,
+        py_str_hint_misses: u64 = 0,
+        py_row_hint_hits: u64 = 0,
+        py_row_hint_misses: u64 = 0,
+        py_row_fast_path_hits: u64 = 0,
         ns_redis: u64 = 0,
         ns_pg_wire: u64 = 0,
         ns_pg_flush: u64 = 0,
@@ -524,24 +645,81 @@ pub const Pipeline = struct {
             self.pmu.tlb_misses += d.tlb_misses;
         }
 
+        fn accumInvokeMetrics(self: *Stats, metrics: *const driver.InvokeMetrics) void {
+            self.py_invocations += metrics.invocations;
+            self.py_coroutines += metrics.coroutines;
+            self.py_sync_responses += metrics.sync_responses;
+            self.py_async_immediate_returns += metrics.async_immediate_returns;
+            self.py_redis_yields += metrics.redis_yields;
+            self.py_pg_yields += metrics.pg_yields;
+            self.py_str_hint_hits += metrics.str_hint_hits;
+            self.py_str_hint_misses += metrics.str_hint_misses;
+            self.py_row_hint_hits += metrics.row_hint_hits;
+            self.py_row_hint_misses += metrics.row_hint_misses;
+            self.py_row_fast_path_hits += metrics.row_fast_path_hits;
+            self.ns_py_call += metrics.ns_call;
+            self.ns_py_resume += metrics.ns_resume;
+            self.ns_py_convert += metrics.ns_convert;
+            self.ns_py_sentinel += metrics.ns_sentinel;
+        }
+
+        fn resetWindow(self: *Stats) void {
+            self.completions = 0;
+            self.http_requests = 0;
+            self.ns_io = 0;
+            self.ns_classify = 0;
+            self.ns_parse = 0;
+            self.ns_handle_prep = 0;
+            self.ns_handle_py = 0;
+            self.ns_py_call = 0;
+            self.ns_py_resume = 0;
+            self.ns_py_convert = 0;
+            self.ns_py_sentinel = 0;
+            self.py_no_args = 0;
+            self.py_params_only = 0;
+            self.py_request = 0;
+            self.py_invocations = 0;
+            self.py_coroutines = 0;
+            self.py_sync_responses = 0;
+            self.py_async_immediate_returns = 0;
+            self.py_redis_yields = 0;
+            self.py_pg_yields = 0;
+            self.py_str_hint_hits = 0;
+            self.py_str_hint_misses = 0;
+            self.py_row_hint_hits = 0;
+            self.py_row_hint_misses = 0;
+            self.py_row_fast_path_hits = 0;
+            self.ns_redis = 0;
+            self.ns_pg_wire = 0;
+            self.ns_pg_flush = 0;
+            self.pg_rows = 0;
+            self.ns_send = 0;
+            self.pg_recv_ops = 0;
+            self.pg_recv_bytes = 0;
+        }
+
         fn dump(self: *Stats) void {
-            const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_flush + self.ns_send;
-            const reqs = self.completions;
+            const ns_handle = self.ns_handle_prep + self.ns_handle_py;
+            const total = self.ns_io + self.ns_classify + self.ns_parse + ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_flush + self.ns_send;
+            const cqes = self.completions;
             const us = struct {
                 fn f(ns: u64) u64 {
                     return ns / 1000;
                 }
             }.f;
             log.info(
-                "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  pg={d}us({d}rows)  pg_flush={d}us  send={d}us  pg_recv={d}/{d}B",
+                "PROFILE  cycles={d}  cqes={d}  http={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us(prep={d} py={d})  redis={d}us  pg={d}us({d}rows)  pg_flush={d}us  send={d}us  pg_recv={d}/{d}B",
                 .{
                     self.cycles,
-                    reqs,
+                    cqes,
+                    self.http_requests,
                     us(total),
                     us(self.ns_io),
                     us(self.ns_classify),
                     us(self.ns_parse),
-                    us(self.ns_handle),
+                    us(ns_handle),
+                    us(self.ns_handle_prep),
+                    us(self.ns_handle_py),
                     us(self.ns_redis),
                     us(self.ns_pg_wire),
                     self.pg_rows,
@@ -551,6 +729,31 @@ pub const Pipeline = struct {
                     self.pg_recv_bytes,
                 },
             );
+            if (self.py_invocations > 0) {
+                log.info(
+                    "PYPROFILE  invocations={d}  coro={d}  noargs={d}  params={d}  request={d}  sync={d}  async_return={d}  yield_redis={d}  yield_pg={d}  hint_str={d}/{d}  hint_row={d}/{d}  row_fast={d}  call={d}us  resume={d}us  convert={d}us  sentinel={d}us",
+                    .{
+                        self.py_invocations,
+                        self.py_coroutines,
+                        self.py_no_args,
+                        self.py_params_only,
+                        self.py_request,
+                        self.py_sync_responses,
+                        self.py_async_immediate_returns,
+                        self.py_redis_yields,
+                        self.py_pg_yields,
+                        self.py_str_hint_hits,
+                        self.py_str_hint_misses,
+                        self.py_row_hint_hits,
+                        self.py_row_hint_misses,
+                        self.py_row_fast_path_hits,
+                        us(self.ns_py_call),
+                        us(self.ns_py_resume),
+                        us(self.ns_py_convert),
+                        us(self.ns_py_sentinel),
+                    },
+                );
+            }
             if (comptime has_pmu) {
                 if (self.pmu.cpu_cycles > 0) {
                     log.info(
@@ -565,68 +768,131 @@ pub const Pipeline = struct {
                 }
                 self.pmu = .{ .backend = self.pmu.backend };
             }
-            self.completions = 0;
-            self.ns_io = 0;
-            self.ns_classify = 0;
-            self.ns_parse = 0;
-            self.ns_handle = 0;
-            self.ns_redis = 0;
-            self.ns_pg_wire = 0;
-            self.ns_pg_flush = 0;
-            self.pg_rows = 0;
-            self.ns_send = 0;
-            self.pg_recv_ops = 0;
-            self.pg_recv_bytes = 0;
+            self.resetWindow();
         }
     };
 
     // ── Classify ──────────────────────────────────────────────────
 
-    pub fn onAccept(self: *Pipeline, result: i32) void {
-        if (result < 0) return;
-        const client_fd: posix.socket_t = @intCast(result);
+    pub fn onAccept(self: *Pipeline, completion: Completion) void {
+        if (completion.result < 0) return;
+        const client_fd: posix.socket_t = @intCast(completion.result);
 
         const idx = self.conns.borrow() catch {
             posix.close(client_fd);
             return;
         };
         const conn = self.conns.get_ptr(idx);
-        conn.fd = client_fd;
-        conn.pool_index = @intCast(idx);
-        conn.token = .{ .tag = .conn };
-        conn.ensureInit(self.allocator) catch {
-            posix.close(client_fd);
-            self.conns.release(idx);
-            return;
+        conn.* = .{
+            .fd = client_fd,
+            .pool_index = @intCast(idx),
+            .recv_token = .{ .tag = .conn_recv },
+            .send_token = .{ .tag = .conn_send },
         };
-        conn.resetRecv();
-
-        dispatch.submitConnRecv(self, conn);
+        conn.resetRecv(&self.http_recv_group);
+        self.submitConnRecv(conn) catch {
+            posix.close(client_fd);
+            conn.recv_queue.clear(&self.http_recv_group);
+            self.conns.release(idx);
+        };
     }
 
-    pub fn onConnCompletion(self: *Pipeline, token: *Token, completion: Completion) !void {
-        const conn: *Conn = @fieldParentPtr("token", token);
-        const index = conn.pool_index;
+    pub fn onConnRecvCompletion(self: *Pipeline, token: *Token, completion: Completion) !void {
+        const conn: *Conn = @fieldParentPtr("recv_token", token);
+        if (completion.result == 0) {
+            try self.close_q.push(conn.pool_index);
+            return;
+        }
+        if (completion.result < 0) {
+            conn.recv_armed = completion.more;
+            if (cqeErrno(completion.result) == .NOBUFS) {
+                if (!conn.recv_armed) try self.submitConnRecv(conn);
+                if (!conn.parse_queued and conn.recv_queue.queuedBytes() > conn.head_fed) {
+                    conn.parse_queued = true;
+                    try self.parse_q.push(.{ .conn = conn.pool_index });
+                }
+                return;
+            }
+            try self.close_q.push(conn.pool_index);
+            return;
+        }
 
-        switch (completion.op_tag) {
-            .recv => {
-                if (completion.result <= 0) {
-                    try self.close_q.push(index);
-                    return;
-                }
-                conn.zc.mark_written(@intCast(completion.result));
-                try self.parse_q.push(.{ .conn = index });
+        const lease = self.http_recv_group.take(completion) catch {
+            try self.close_q.push(conn.pool_index);
+            return;
+        };
+        conn.recv_queue.append(&self.http_recv_group, lease) catch |err| switch (err) {
+            error.TransportQueueFull, error.TransportSegmentQueueFull => {
+                self.http_recv_group.release(lease);
+                try self.close_q.push(conn.pool_index);
+                return;
             },
-            .send, .sendv => {
-                if (completion.result < 0) {
-                    try self.close_q.push(index);
-                    return;
-                }
-                // Send complete — keepalive
-                conn.resetRecv();
-                dispatch.submitConnRecv(self, conn);
-            },
-            else => {},
+        };
+
+        conn.recv_armed = completion.more;
+        if (!conn.recv_armed) try self.submitConnRecv(conn);
+        if (!conn.parse_queued) {
+            conn.parse_queued = true;
+            try self.parse_q.push(.{ .conn = conn.pool_index });
+        }
+    }
+
+    pub fn onConnSendCompletion(self: *Pipeline, token: *Token, completion: Completion) !void {
+        const conn: *Conn = @fieldParentPtr("send_token", token);
+        if (completion.notification) {
+            conn.zc_hold = null;
+            conn.zc_notif_pending = false;
+            if (conn.send_mode == .idle and conn.send_total_len == 0) {
+                conn.send_body_lease.release();
+                conn.send_body = null;
+            }
+            if (conn.close_after_notif and conn.send_mode == .idle) {
+                conn.close_after_notif = false;
+                conn.recv_queue.clear(&self.http_recv_group);
+                self.conns.release(conn.pool_index);
+            }
+            return;
+        }
+        if (completion.result < 0) {
+            try self.close_q.push(conn.pool_index);
+            return;
+        }
+        if (conn.send_mode == .idle) return;
+
+        const sent_now: usize = @intCast(completion.result);
+        if (sent_now == 0) {
+            try self.close_q.push(conn.pool_index);
+            return;
+        }
+
+        conn.send_sent += sent_now;
+        if (conn.send_sent < conn.send_total_len) {
+            advanceIovecs(&conn.send_iovecs, &conn.send_iov_count, sent_now);
+            if (conn.send_mode == .sendmsg_zc) conn.send_mode = .sendv;
+            try self.submitConnSend(conn);
+            return;
+        }
+
+        conn.send_mode = .idle;
+        conn.send_total_len = 0;
+        conn.send_sent = 0;
+        conn.send_iov_count = 0;
+        if (!conn.zc_notif_pending) conn.send_body_lease.release();
+        conn.send_body = null;
+        conn.send_body_from_conn = false;
+
+        conn.recv_queue.setParseOffset(conn.inflight_request_len);
+        _ = conn.recv_queue.consumeParsed(&self.http_recv_group);
+        conn.inflight_request_len = 0;
+        conn.head_parser = .{};
+        conn.head_fed = 0;
+        if (conn.recv_queue.queuedBytes() > 0) {
+            if (!conn.parse_queued) {
+                conn.parse_queued = true;
+                try self.parse_q.push(.{ .conn = conn.pool_index });
+            }
+        } else if (!conn.recv_armed) {
+            try self.submitConnRecv(conn);
         }
     }
 
@@ -635,37 +901,34 @@ pub const Pipeline = struct {
     fn stageParse(self: *Pipeline) !void {
         for (self.parse_q.slice()) |pt| {
             const conn = self.conns.get_ptr(pt.conn);
-            const data = conn.zc.as_slice();
+            conn.parse_queued = false;
 
-            const new_bytes = data[conn.head_fed..];
-            const consumed = conn.head_parser.feed(new_bytes);
-            conn.head_fed += consumed;
+            var feed_off = conn.head_fed;
+            while (feed_off < conn.recv_queue.queuedBytes() and conn.head_parser.state != .finished) {
+                const chunk = conn.recv_queue.contiguousFrom(feed_off) orelse break;
+                if (chunk.len == 0) break;
+                const consumed = conn.head_parser.feed(chunk);
+                feed_off += consumed;
+                if (consumed < chunk.len) break;
+            }
+            conn.head_fed = feed_off;
 
             if (conn.head_parser.state != .finished) {
-                conn.recv_slice = conn.zc.get_write_area(4096) catch {
-                    try self.close_q.push(pt.conn);
-                    continue;
-                };
-                dispatch.submitConnRecv(self, conn);
+                if (!conn.recv_armed) try self.submitConnRecv(conn);
                 continue;
             }
 
             const header_end = conn.head_fed;
-            const content_length = quickContentLength(data[0..header_end]);
+            const content_length = quickContentLengthQueue(&conn.recv_queue, header_end);
             if (content_length > 0) {
-                const body_received = data.len - header_end;
+                const body_received = conn.recv_queue.queuedBytes() - header_end;
                 if (body_received < content_length) {
-                    conn.recv_slice = conn.zc.get_write_area(
-                        content_length - body_received,
-                    ) catch {
-                        try self.close_q.push(pt.conn);
-                        continue;
-                    };
-                    dispatch.submitConnRecv(self, conn);
+                    if (!conn.recv_armed) try self.submitConnRecv(conn);
                     continue;
                 }
             }
 
+            conn.inflight_request_len = header_end + content_length;
             try self.handle_q.push(.{
                 .conn = pt.conn,
                 .header_end = header_end,
@@ -674,152 +937,286 @@ pub const Pipeline = struct {
         }
     }
 
-    // ── Stage: Handle (batched + SIMD screened) ────────────────
-    // 1. SIMD screen: gather first bytes from N requests, vectorized
-    //    classify which are GET. For GET-to-root with no_args handler,
-    //    skip Request.parse() and dict building entirely.
-    // 2. GIL acquired once for the entire batch.
-    // 3. Remaining requests: full parse → route → invoke.
+    // ── Stage: Handle Prep / Python ──────────────────────────────
+    // Prep stays outside the GIL and does everything that can be decided
+    // from native state:
+    //   - SIMD first-byte screening
+    //   - route matching
+    //   - request parsing when a native handler or Python request object is needed
+    //   - native handler execution
+    //
+    // Only the actual Python call path runs under the GIL in stageHandlePython.
 
-    fn stageHandle(self: *Pipeline) !void {
+    fn stageHandlePrep(self: *Pipeline) !void {
         const req_ctx = self.req_ctx orelse return;
         const batch = self.handle_q.slice();
         if (batch.len == 0) return;
 
-        // ── SIMD screen: gather + classify ───────────────────────
         var first_bytes: [MAX_BATCH]u8 = undefined;
         for (batch, 0..) |ht, i| {
-            const data = self.conns.get_ptr(ht.conn).zc.as_slice();
-            first_bytes[i] = if (data.len > 0) data[0] else 0;
+            const conn = self.conns.get_ptr(ht.conn);
+            first_bytes[i] = if (conn.recv_queue.queuedBytes() > 0) conn.recv_queue.byteAt(0) else 0;
         }
         var is_get: [MAX_BATCH]bool = .{false} ** MAX_BATCH;
         simdScreenBytes(first_bytes[0..batch.len], 'G', is_get[0..batch.len]);
 
-        const py_ctx = req_ctx.py_ctx;
-
         for (batch, 0..) |ht, i| {
             const conn = self.conns.get_ptr(ht.conn);
-            const data = conn.zc.as_slice();
 
-            // Fast path: SIMD told us byte[0]=='G'. Check "GET / " or "GET /x".
-            if (is_get[i] and data.len >= 6 and std.mem.eql(u8, data[1..4], "ET ")) {
-                const uri_start = 4;
-                const uri_end = std.mem.indexOfScalarPos(u8, data, uri_start, ' ') orelse data.len;
-                const uri = data[uri_start..uri_end];
-
-                switch (req_ctx.router.match(.GET, uri)) {
-                    .found => |found| {
-                        if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
-                            if (py_ctx) |py| {
-                                const flags = module.getHandlerFlags(py.py.snek_module, py_id);
-                                if (flags.no_args) {
-                                    const result = try driver.invokePythonHandler(
-                                        py.py.snek_module,
-                                        py_id,
-                                        &http1.Request{},
-                                        &.{},
-                                        &conn.body_buf,
-                                        self.redisSendSlice(),
-                                        self.pgSendSlice(),
-                                        self.pgStmtCache(),
-                                        self.pgConnPrepared(),
-                                    );
-                                    try self.handleResult(ht.conn, result);
-                                    continue;
-                                }
-                                const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                                    try self.send_q.push(makeErrorSend(ht.conn, 400));
-                                    continue;
-                                };
-                                const result = driver.invokePythonHandler(
-                                    py.py.snek_module,
-                                    py_id,
-                                    &req,
-                                    found.params[0..found.param_count],
-                                    &conn.body_buf,
-                                    self.redisSendSlice(),
-                                    self.pgSendSlice(),
-                                    self.pgStmtCache(),
-                                    self.pgConnPrepared(),
-                                ) catch {
-                                    try self.send_q.push(makeErrorSend(ht.conn, 500));
-                                    continue;
-                                };
-                                try self.handleResult(ht.conn, result);
-                                continue;
-                            }
-                            try self.send_q.push(makeErrorSend(ht.conn, 503));
-                        } else if (req_ctx.handlers[found.handler_id]) |h| {
-                            const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                                try self.send_q.push(makeErrorSend(ht.conn, 400));
-                                continue;
-                            };
-                            try self.send_q.push(makeResponseSend(ht.conn, h(&req)));
-                        } else {
-                            try self.send_q.push(makeErrorSend(ht.conn, 500));
+            if (is_get[i]) {
+                if (conn.recv_queue.sliceIfContiguous(0, ht.header_end)) |data| {
+                    if (data.len >= 6 and std.mem.eql(u8, data[1..4], "ET ")) {
+                        const uri_end = std.mem.indexOfScalarPos(u8, data, 4, ' ') orelse {
+                            try self.send_q.push(makeErrorSend(ht.conn, 400));
+                            continue;
+                        };
+                        const uri = data[4..uri_end];
+                        switch (req_ctx.router.match(.GET, uri)) {
+                            .found => |found| try self.dispatchMatchedRouteNoGil(req_ctx, ht, null, found),
+                            .not_found => try self.send_q.push(makeErrorSend(ht.conn, 404)),
+                            .method_not_allowed => {
+                                var resp = response_mod.Response.init(405);
+                                resp.body = "Method Not Allowed";
+                                try self.send_q.push(makeResponseSend(ht.conn, resp));
+                            },
                         }
                         continue;
-                    },
-                    .not_found => {
-                        try self.send_q.push(makeErrorSend(ht.conn, 404));
-                        continue;
-                    },
-                    .method_not_allowed => {
-                        var r = response_mod.Response.init(405);
-                        r.body = "Method Not Allowed";
-                        try self.send_q.push(makeResponseSend(ht.conn, r));
-                        continue;
-                    },
+                    }
                 }
             }
 
-            // Slow path: non-GET or SIMD screen missed — full parse
-            const req = http1.Request.parse(data[0..ht.header_end]) catch {
+            var parsed = self.parseHandleRequestQueue(conn, ht) catch {
                 try self.send_q.push(makeErrorSend(ht.conn, 400));
                 continue;
             };
-            const method_str = if (req.method) |m| @tagName(m) else "GET";
-            const method = router_mod.Method.fromString(method_str) orelse .GET;
-
+            defer parsed.deinit(self.allocator);
+            const req = parsed.req;
+            const method = routerMethod(req.method orelse .GET);
             switch (req_ctx.router.match(method, req.uri orelse "/")) {
-                .found => |found| {
-                    if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
-                        if (py_ctx) |py| {
-                            const result = try driver.invokePythonHandler(
-                                py.py.snek_module,
-                                py_id,
-                                &req,
-                                found.params[0..found.param_count],
-                                &conn.body_buf,
-                                self.redisSendSlice(),
-                                self.pgSendSlice(),
-                                self.pgStmtCache(),
-                                self.pgConnPrepared(),
-                            );
-                            try self.handleResult(ht.conn, result);
-                        } else {
-                            try self.send_q.push(makeErrorSend(ht.conn, 503));
-                        }
-                    } else if (req_ctx.handlers[found.handler_id]) |h| {
-                        try self.send_q.push(makeResponseSend(ht.conn, h(&req)));
-                    } else {
-                        try self.send_q.push(makeErrorSend(ht.conn, 500));
-                    }
-                },
+                .found => |found| try self.dispatchMatchedRouteNoGil(req_ctx, ht, &req, found),
                 .not_found => try self.send_q.push(makeErrorSend(ht.conn, 404)),
                 .method_not_allowed => {
-                    var r = response_mod.Response.init(405);
-                    r.body = "Method Not Allowed";
-                    try self.send_q.push(makeResponseSend(ht.conn, r));
+                    var resp = response_mod.Response.init(405);
+                    resp.body = "Method Not Allowed";
+                    try self.send_q.push(makeResponseSend(ht.conn, resp));
                 },
             }
         }
     }
 
+    fn stageHandlePython(self: *Pipeline) !void {
+        const req_ctx = self.req_ctx orelse return;
+        const batch = self.py_handle_q.mutableSlice();
+        if (batch.len == 0) return;
+
+        const py_ctx = req_ctx.py_ctx orelse {
+            for (batch) |task| {
+                try self.send_q.push(makeErrorSend(task.conn, 503));
+            }
+            return;
+        };
+
+        var invoke_metrics = driver.InvokeMetrics{};
+        for (batch) |*task| {
+            const conn = self.conns.get_ptr(task.conn);
+            switch (task.kind) {
+                .no_args => self.stats.py_no_args += 1,
+                .params_only => self.stats.py_params_only += 1,
+                .request => self.stats.py_request += 1,
+            }
+            const request_obj = self.buildPythonHandleRequestObject(task) catch {
+                try self.send_q.push(makeErrorSend(task.conn, 500));
+                continue;
+            };
+            defer ffi.xdecref(request_obj);
+
+            const result = try driver.invokePythonHandlerWithKnownFlags(
+                py_ctx.py.snek_module,
+                task.py_id,
+                task.kind == .no_args,
+                task.kind == .params_only,
+                task.response_hint,
+                request_obj,
+                task.params[0..task.param_count],
+                &conn.body_buf,
+                &self.response_pool,
+                self.redisSendSlice(),
+                self.pgSendSlice(),
+                self.pgStmtCache(),
+                self.pgConnPrepared(),
+                &invoke_metrics,
+            );
+            try self.handleResult(task.conn, result);
+        }
+        self.stats.accumInvokeMetrics(&invoke_metrics);
+    }
+
+    fn buildPythonHandleRequestObject(_: *Pipeline, task: *PythonHandleTask) !?*ffi.PyObject {
+        if (task.kind != .request) return null;
+
+        var backing = task.request_backing orelse return error.MissingRequestBacking;
+        task.request_backing = null;
+        return snek_request.create(backing) catch {
+            backing.deinit();
+            return error.PythonError;
+        };
+    }
+
+    fn elapsedNs(start_at: ?std.time.Instant) u64 {
+        const t0 = start_at orelse return 0;
+        const t1 = std.time.Instant.now() catch return 0;
+        return t1.since(t0);
+    }
+
+    fn queueConvertedPythonResult(
+        self: *Pipeline,
+        conn_idx: u16,
+        py_result: *ffi.PyObject,
+        response_hint: response_hint_mod.ResponseHint,
+    ) !void {
+        const conn = self.conns.get_ptr(conn_idx);
+        var metrics = driver.InvokeMetrics{};
+        const t_convert = std.time.Instant.now() catch null;
+        var resp = driver.convertPythonResponseHinted(
+            py_result,
+            &conn.body_buf,
+            &self.response_pool,
+            response_hint,
+            &metrics,
+        );
+        metrics.ns_convert += elapsedNs(t_convert);
+        self.stats.accumInvokeMetrics(&metrics);
+        errdefer resp.deinit();
+        try self.send_q.push(makeOwnedResponseSend(conn_idx, &resp));
+    }
+
+    fn dispatchMatchedRouteNoGil(
+        self: *Pipeline,
+        req_ctx: *const handler_mod.RequestContext,
+        ht: HandleTask,
+        parsed_req: ?*const http1.Request,
+        found: anytype,
+    ) !void {
+        if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
+            if (req_ctx.py_ctx == null) {
+                try self.send_q.push(makeErrorSend(ht.conn, 503));
+                return;
+            }
+            const flags = if (req_ctx.py_handler_flags) |table| table[found.handler_id] else handler_mod.PyHandlerFlags{};
+            if (flags.no_args) {
+                try self.queuePythonHandle(ht.conn, py_id, .no_args, @enumFromInt(flags.response_hint), &.{});
+                return;
+            }
+            if (flags.needs_params) {
+                try self.queuePythonHandle(ht.conn, py_id, .params_only, @enumFromInt(flags.response_hint), found.params[0..found.param_count]);
+                return;
+            }
+            try self.queuePythonHandle(ht.conn, py_id, .request, @enumFromInt(flags.response_hint), found.params[0..found.param_count]);
+            return;
+        }
+
+        if (req_ctx.handlers[found.handler_id]) |native| {
+            var parsed_storage: ?ParsedHandleRequest = null;
+            defer if (parsed_storage) |*parsed| parsed.deinit(self.allocator);
+            const req = if (parsed_req) |req|
+                req
+            else blk: {
+                parsed_storage = self.parseHandleRequestQueue(self.conns.get_ptr(ht.conn), ht) catch {
+                    try self.send_q.push(makeErrorSend(ht.conn, 400));
+                    return;
+                };
+                break :blk &parsed_storage.?.req;
+            };
+            try self.send_q.push(makeResponseSend(ht.conn, native(req)));
+            return;
+        }
+
+        try self.send_q.push(makeErrorSend(ht.conn, 500));
+    }
+
+    fn queuePythonHandle(
+        self: *Pipeline,
+        conn_idx: u16,
+        py_id: u32,
+        kind: PythonHandleKind,
+        response_hint: response_hint_mod.ResponseHint,
+        params: []const router_mod.PathParam,
+    ) !void {
+        var task = PythonHandleTask{
+            .conn = conn_idx,
+            .py_id = py_id,
+            .kind = kind,
+            .response_hint = response_hint,
+        };
+        errdefer if (task.request_backing) |*backing| backing.deinit();
+        var stable_params = params;
+        if (kind == .request) {
+            const conn = self.conns.get_ptr(conn_idx);
+            var lease = try result_lease.ResultLease.initOwned(&self.request_pool);
+            errdefer lease.release();
+            const request_len = conn.inflight_request_len;
+            if (request_len > lease.bytes().len) return error.BufferTooSmall;
+            conn.recv_queue.copyInto(0, lease.bytes()[0..request_len]);
+            const parsed_req = try http1.Request.parse(lease.constBytes()[0..request_len]);
+            if (params.len > 0) {
+                if (self.req_ctx) |req_ctx| {
+                    const method = routerMethod(parsed_req.method orelse .GET);
+                    switch (req_ctx.router.match(method, parsed_req.uri orelse "/")) {
+                        .found => |found| stable_params = found.params[0..found.param_count],
+                        else => {},
+                    }
+                }
+            }
+            task.request_backing = try snek_request.Backing.fromParsed(lease, request_len, &parsed_req, stable_params);
+        }
+        task.param_count = copyPathParams(&task.params, stable_params);
+        try self.py_handle_q.push(task);
+    }
+
+    fn parseHandleRequestQueue(self: *Pipeline, conn: *const Conn, ht: HandleTask) !ParsedHandleRequest {
+        const request_end = std.math.add(usize, ht.header_end, ht.content_length) catch return error.MalformedRequest;
+        if (request_end > conn.recv_queue.queuedBytes()) return error.MalformedRequest;
+        if (conn.recv_queue.sliceIfContiguous(0, request_end)) |data| {
+            return .{ .req = try http1.Request.parse(data) };
+        }
+
+        const bytes = try self.allocator.alloc(u8, request_end);
+        errdefer self.allocator.free(bytes);
+        conn.recv_queue.copyInto(0, bytes);
+        return .{
+            .req = try http1.Request.parse(bytes),
+            .owned = bytes,
+        };
+    }
+
+    fn copyPathParams(dst: *[8]router_mod.PathParam, src: []const router_mod.PathParam) u8 {
+        std.debug.assert(src.len <= dst.len);
+        for (src, 0..) |param, i| dst[i] = param;
+        return @intCast(src.len);
+    }
+
+    fn routerMethod(method: http1.Method) router_mod.Method {
+        return switch (method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+            .PATCH => .PATCH,
+            .HEAD => .HEAD,
+            .OPTIONS => .OPTIONS,
+            .CONNECT => .CONNECT,
+            .TRACE => .TRACE,
+        };
+    }
+
     /// Handle an InvokeResult: response goes to send_q, yields update send buffers + push waiters.
     fn handleResult(self: *Pipeline, conn: u16, result: driver.InvokeResult) !void {
         switch (result) {
-            .response => |resp| try self.send_q.push(makeResponseSend(conn, resp)),
+            .response => |owned| {
+                var resp = owned;
+                errdefer resp.deinit();
+                try self.send_q.push(makeOwnedResponseSend(conn, &resp));
+            },
             .redis_yield => |ry| {
                 self.redis_send_len += ry.bytes_written;
                 try self.pushRedisWaiter(conn, ry.py_coro);
@@ -867,7 +1264,8 @@ pub const Pipeline = struct {
     }
 
     // ── Stage: Serialize + Send ───────────────────────────────────
-    // Formats per-response headers, builds iovecs, submits sendv.
+    // Formats per-response headers, builds connection-owned send state,
+    // then submits either sendv or sendmsg_zc.
     //
     // Each response is scattered across up to 4 iovecs:
     //   [0] status line       — static string ("HTTP/1.1 200 OK\r\n")
@@ -878,29 +1276,121 @@ pub const Pipeline = struct {
     fn stageSerializeAndSend(self: *Pipeline) !void {
         const common = commonHeaders();
 
-        for (self.send_q.mutableSlice(), 0..) |*st, i| {
+        for (self.send_q.mutableSlice()) |*st| {
             const conn = self.conns.get_ptr(st.conn);
-
-            var iov_count: usize = 0;
-            // [0] status line
-            self.iovecs_buf[i][iov_count] = .{ .base = st.status_line.ptr, .len = st.status_line.len };
-            iov_count += 1;
-            // [1] common headers
-            self.iovecs_buf[i][iov_count] = .{ .base = common.ptr, .len = common.len };
-            iov_count += 1;
-            // [2] per-response headers
-            self.iovecs_buf[i][iov_count] = .{ .base = &st.hdr, .len = st.hdr_len };
-            iov_count += 1;
-            // [3] body
-            if (st.body) |body| {
-                self.iovecs_buf[i][iov_count] = .{ .base = body.ptr, .len = body.len };
-                iov_count += 1;
+            if (conn.send_mode != .idle) {
+                st.body_lease.release();
+                try self.close_q.push(st.conn);
+                continue;
             }
-
-            dispatch.submitConnSendv(self, conn, self.iovecs_buf[i][0..iov_count]) catch {
+            prepareConnSend(conn, st, common);
+            self.submitConnSend(conn) catch {
+                conn.send_mode = .idle;
+                conn.send_total_len = 0;
+                conn.send_sent = 0;
+                conn.send_iov_count = 0;
+                if (!conn.zc_notif_pending) conn.send_body_lease.release();
+                conn.send_body = null;
+                conn.send_body_from_conn = false;
+                conn.zc_hold = null;
+                conn.zc_notif_pending = false;
                 try self.close_q.push(st.conn);
             };
         }
+    }
+
+    fn prepareConnSend(conn: *Conn, st: *SendTask, common: []const u8) void {
+        const use_zc = shouldUseSendMsgZc(conn, st, common);
+
+        conn.send_mode = if (use_zc) .sendmsg_zc else .sendv;
+        conn.send_sent = 0;
+        conn.send_body = st.body;
+        conn.send_body_from_conn = if (st.body) |body| bodyPointsIntoConn(conn, body) else false;
+        conn.send_body_lease.release();
+        conn.send_body_lease = st.body_lease;
+        st.body_lease = .{};
+        conn.send_iov_count = 0;
+
+        var hdr_storage: []u8 = conn.send_hdr[0..];
+        if (use_zc) {
+            var hold = ZcHold{};
+            @memcpy(hold.hdr[0..st.hdr_len], st.hdr[0..st.hdr_len]);
+            hold.hdr_len = st.hdr_len;
+            conn.zc_hold = hold;
+            conn.zc_notif_pending = true;
+            hdr_storage = conn.zc_hold.?.hdr[0..];
+        } else {
+            @memcpy(conn.send_hdr[0..st.hdr_len], st.hdr[0..st.hdr_len]);
+            if (!conn.zc_notif_pending) conn.zc_hold = null;
+        }
+        conn.send_hdr_len = st.hdr_len;
+
+        conn.send_iovecs[0] = .{ .base = st.status_line.ptr, .len = st.status_line.len };
+        conn.send_iov_count += 1;
+        conn.send_iovecs[1] = .{ .base = common.ptr, .len = common.len };
+        conn.send_iov_count += 1;
+        conn.send_iovecs[2] = .{ .base = hdr_storage.ptr, .len = st.hdr_len };
+        conn.send_iov_count += 1;
+        if (st.body) |body| {
+            conn.send_iovecs[3] = .{ .base = body.ptr, .len = body.len };
+            conn.send_iov_count += 1;
+        }
+
+        conn.send_total_len = totalIovLen(conn.send_iovecs[0..conn.send_iov_count]);
+        conn.send_msg = .{
+            .name = null,
+            .namelen = 0,
+            .iov = conn.send_iovecs[0..conn.send_iov_count].ptr,
+            .iovlen = conn.send_iov_count,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+    }
+
+    fn shouldUseSendMsgZc(conn: *const Conn, st: *const SendTask, common: []const u8) bool {
+        if (conn.zc_notif_pending) return false;
+        const body = st.body orelse return false;
+        if (bodyPointsIntoConn(conn, body)) return false;
+        const total_len = st.status_line.len + common.len + st.hdr_len + body.len;
+        return total_len >= HTTP_SEND_ZC_MIN_BYTES;
+    }
+
+    fn bodyPointsIntoConn(conn: *const Conn, body: []const u8) bool {
+        const body_ptr = @intFromPtr(body.ptr);
+        const conn_ptr = @intFromPtr(&conn.body_buf);
+        const conn_end = conn_ptr + conn.body_buf.len;
+        return body_ptr >= conn_ptr and body_ptr < conn_end;
+    }
+
+    fn totalIovLen(iovecs: []const posix.iovec_const) usize {
+        var total: usize = 0;
+        for (iovecs) |iov| total += iov.len;
+        return total;
+    }
+
+    fn advanceIovecs(iovecs: *[MAX_IOVECS]posix.iovec_const, iov_count: *usize, advance: usize) void {
+        var remaining = advance;
+        var idx: usize = 0;
+        while (idx < iov_count.* and remaining > 0) {
+            const len = iovecs[idx].len;
+            if (remaining < len) {
+                iovecs[idx].base += remaining;
+                iovecs[idx].len -= remaining;
+                remaining = 0;
+                break;
+            }
+            remaining -= len;
+            idx += 1;
+        }
+        if (idx > 0) {
+            const next_len = iov_count.* - idx;
+            if (next_len > 0) {
+                std.mem.copyForwards(posix.iovec_const, iovecs[0..next_len], iovecs[idx..iov_count.*]);
+            }
+            iov_count.* = next_len;
+        }
+        std.debug.assert(remaining == 0);
     }
 
     // ── Redis IO ──────────────────────────────────────────────────
@@ -909,15 +1399,15 @@ pub const Pipeline = struct {
     // here with GIL held, pushing completed responses to send_q.
 
     /// IO state machine only — no Python work. Defers RESP parsing to stageRedis.
-    pub fn onRedisSendIO(self: *Pipeline, result: i32) !void {
-        if (result <= 0) {
+    pub fn onRedisSendIO(self: *Pipeline, completion: Completion) !void {
+        if (completion.result <= 0) {
             self.redis_recv_state = .err;
             return;
         }
-        const sent: usize = @intCast(result);
+        const sent: usize = @intCast(completion.result);
         self.redis_send_offset += sent;
         if (self.redis_send_offset < self.redis_send_len) {
-            try dispatch.submitRedisSend(self);
+            try self.submitRedisSend();
             return;
         }
         // Send complete — compact and go idle
@@ -926,12 +1416,12 @@ pub const Pipeline = struct {
         self.redis_send_state = .idle;
     }
 
-    pub fn onRedisRecvIO(self: *Pipeline, result: i32) !void {
-        if (result <= 0) {
+    pub fn onRedisRecvIO(self: *Pipeline, completion: Completion) !void {
+        if (completion.result <= 0) {
             self.redis_recv_state = .err;
             return;
         }
-        self.redis_recv_len += @intCast(result);
+        self.redis_recv_len += @intCast(completion.result);
         self.redis_recv_state = .parsing;
     }
 
@@ -953,7 +1443,7 @@ pub const Pipeline = struct {
             if (self.redis_in_flight > 0) {
                 self.compactRedisRecv();
                 self.redis_recv_state = .receiving;
-                try dispatch.submitRedisRecv(self);
+                try self.submitRedisRecv();
             } else {
                 self.redis_recv_state = .idle;
             }
@@ -964,11 +1454,11 @@ pub const Pipeline = struct {
         if (new_queries > 0 and self.redis_send_state == .idle and self.redis_send_len > 0) {
             self.redis_in_flight += new_queries;
             self.redis_send_state = .sending;
-            try dispatch.submitRedisSend(self);
+            try self.submitRedisSend();
             // Arm recv if not already receiving
             if (self.redis_recv_state == .idle) {
                 self.redis_recv_state = .receiving;
-                try dispatch.submitRedisRecv(self);
+                try self.submitRedisRecv();
             }
         }
     }
@@ -1045,7 +1535,6 @@ pub const Pipeline = struct {
     fn resumeRedisWaiter(self: *Pipeline, result: *ffi.PyObject) !void {
         defer ffi.decref(result); // iterSend increfs internally; we own the creation ref
         const waiter = self.popRedisWaiter() orelse return;
-        const conn = self.conns.get_ptr(waiter.conn_idx);
 
         const send = ffi.iterSend(waiter.py_coro, result);
         switch (send.status) {
@@ -1087,9 +1576,7 @@ pub const Pipeline = struct {
                     return;
                 };
                 defer ffi.decref(py_res);
-                const resp = driver.convertPythonResponse(py_res, &conn.body_buf) catch
-                    response_mod.Response.init(500);
-                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+                try self.queueConvertedPythonResult(waiter.conn_idx, py_res, .any);
             },
             .@"error" => {
                 ffi.decref(waiter.py_coro);
@@ -1152,12 +1639,24 @@ pub const Pipeline = struct {
     // Mirrors redis: IO state machine (GIL-free), parsing + coroutine
     // resumption in stagePostgres (under GIL).
 
-    pub fn onPgSendIO(_: *Pipeline, pg: *PgConn, result: i32) !void {
-        if (result <= 0) {
-            pg.recv_state = .err;
+    fn cqeErrno(result: i32) ?posix.E {
+        if (result >= 0) return null;
+        return @enumFromInt(@as(u16, @intCast(-result)));
+    }
+
+    fn markPgFatal(pg: *PgConn, status: u16, body: ?[]const u8) void {
+        pg.recv_state = .err;
+        pg.recv_armed = false;
+        pg.fail_status = status;
+        pg.fail_body = body;
+    }
+
+    pub fn onPgSendIO(_: *Pipeline, pg: *PgConn, completion: Completion) !void {
+        if (completion.result <= 0) {
+            markPgFatal(pg, 500, null);
             return;
         }
-        const sent: usize = @intCast(result);
+        const sent: usize = @intCast(completion.result);
         pg.send_offset += sent;
         if (pg.send_offset < pg.send_len) {
             return; // partial send — will be re-submitted by stagePostgres
@@ -1167,13 +1666,36 @@ pub const Pipeline = struct {
         pg.send_state = .idle;
     }
 
-    pub fn onPgRecvIO(self: *Pipeline, pg: *PgConn, result: i32) !void {
-        if (result <= 0) {
-            pg.recv_state = .err;
+    pub fn onPgRecvIO(self: *Pipeline, pg: *PgConn, completion: Completion) !void {
+        if (completion.result == 0) {
+            markPgFatal(pg, 500, null);
             return;
         }
-        const received: usize = @intCast(result);
-        pg.transport.noteReceived(received);
+        if (completion.result < 0) {
+            pg.recv_armed = completion.more;
+            if (cqeErrno(completion.result) == .NOBUFS) {
+                pg.recv_state = if (pg.recv_queue.queuedBytes() > 0) .parsing else .idle;
+                return;
+            }
+            markPgFatal(pg, 500, null);
+            return;
+        }
+
+        const lease = self.pg_recv_group.take(completion) catch {
+            markPgFatal(pg, 500, "Postgres recv completion missing or corrupt buffer metadata");
+            return;
+        };
+        pg.recv_queue.append(&self.pg_recv_group, lease) catch |err| {
+            switch (err) {
+                error.TransportQueueFull, error.TransportSegmentQueueFull => {
+                    markPgFatal(pg, 500, "Postgres receive queue exhausted");
+                    return;
+                },
+            }
+        };
+
+        const received: usize = @intCast(completion.result);
+        pg.recv_armed = completion.more;
         pg.recv_state = .parsing;
         self.stats.pg_recv_ops += 1;
         self.stats.pg_recv_bytes += received;
@@ -1188,7 +1710,7 @@ pub const Pipeline = struct {
         for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
             // 1. Handle deferred errors
             if (pg.recv_state == .err) {
-                try self.failPgConnWaiters(pg);
+                try self.failPgConnWaitersWithStatus(pg, pg.fail_status, pg.fail_body);
             }
 
             // 2. Parse responses
@@ -1196,24 +1718,15 @@ pub const Pipeline = struct {
                 const t0 = try std.time.Instant.now();
                 try self.parsePgConnResponses(pg);
                 self.pg_wire_ns += (try std.time.Instant.now()).since(t0);
-                _ = pg.transport.consumeParsed();
+                _ = pg.recv_queue.consumeParsed(&self.pg_recv_group);
 
-                if (pg.in_flight > 0) {
-                    pg.recv_state = .receiving;
-                    dispatch.submitPgRecv(self, pg) catch |err| switch (err) {
-                        error.TransportPoolExhausted => {
-                            try self.failPgConnForTransportPool(pg);
-                            continue;
-                        },
-                        error.TransportRingFull => {
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres transport ring full");
-                            continue;
-                        },
-                        else => return err,
-                    };
-                } else {
-                    pg.recv_state = .idle;
+                if (pg.recv_state == .err) {
+                    try self.failPgConnWaitersWithStatus(pg, pg.fail_status, pg.fail_body);
+                    continue;
                 }
+
+                pg.recv_state = .idle;
+                if (pg.in_flight > 0 and !pg.recv_armed) try self.submitPgRecv(pg);
             }
 
             // 3. Flush pending sends — append single Sync for entire batch
@@ -1225,26 +1738,13 @@ pub const Pipeline = struct {
                 pg.in_flight += new_queries;
                 try pg.pushBatch(new_queries);
                 pg.send_state = .sending;
-                try dispatch.submitPgSend(self, pg);
-                if (pg.recv_state == .idle) {
-                    pg.recv_state = .receiving;
-                    dispatch.submitPgRecv(self, pg) catch |err| switch (err) {
-                        error.TransportPoolExhausted => {
-                            try self.failPgConnForTransportPool(pg);
-                            continue;
-                        },
-                        error.TransportRingFull => {
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres transport ring full");
-                            continue;
-                        },
-                        else => return err,
-                    };
-                }
+                try self.submitPgSend(pg);
+                if (!pg.recv_armed) try self.submitPgRecv(pg);
             }
 
             // 4. Re-submit partial sends
             if (pg.send_state == .sending and pg.send_offset > 0 and pg.send_offset < pg.send_len) {
-                try dispatch.submitPgSend(self, pg);
+                try self.submitPgSend(pg);
             }
         }
     }
@@ -1279,32 +1779,32 @@ pub const Pipeline = struct {
         var py_result: ?*ffi.PyObject = null;
         var py_list: ?*ffi.PyObject = null;
         // Save position at the start of current query (not entire batch)
-        var query_save_pos = pg.transport.parseOffset();
+        var query_save_pos = pg.recv_queue.parseOffset();
 
         while (pg.peekWaiter()) |waiter| {
-            const message = pg_stream.nextMessage(&pg.transport, pg.transport.parseOffset()) catch |err| switch (err) {
+            const message = pg_stream.nextMessage(&pg.recv_queue, pg.recv_queue.parseOffset()) catch |err| switch (err) {
                 error.MessageTooLarge => {
                     if (py_result) |r| ffi.decref(r);
                     if (py_list) |l| ffi.decref(l);
-                    try self.failPgConnWaitersWithStatus(pg, 500, "Postgres message exceeds transport ring capacity");
+                    try self.failPgConnWaitersWithStatus(pg, 500, "Postgres message exceeds receive queue capacity");
                     return;
                 },
                 else => return err,
             };
             if (message == null) {
                 // Incomplete mid-query — rollback current query only
-                pg.transport.setParseOffset(query_save_pos);
+                pg.recv_queue.setParseOffset(query_save_pos);
                 if (py_result) |r| ffi.decref(r);
                 if (py_list) |l| ffi.decref(l);
                 break;
             }
 
             const msg = message.?;
-            pg.transport.setParseOffset(pg.transport.parseOffset() + msg.total_len);
+            pg.recv_queue.setParseOffset(pg.recv_queue.parseOffset() + msg.total_len);
 
             // ReadyForQuery is a batch-level message, not per-query
             if (msg.header.tag == wire.BackendTag.ready_for_query) {
-                query_save_pos = pg.transport.parseOffset();
+                query_save_pos = pg.recv_queue.parseOffset();
                 continue; // consume it, don't break — there may be more batches
             }
 
@@ -1321,7 +1821,7 @@ pub const Pipeline = struct {
                     continue;
                 },
                 wire.BackendTag.row_description => {
-                    _ = pg_stream.applyRowDescription(self.allocator, &pg.transport, msg.payload_off, msg.payload_len, stmt_entry) catch |err| switch (err) {
+                    _ = pg_stream.applyRowDescription(self.allocator, &pg.recv_queue, msg.payload_off, msg.payload_len, stmt_entry) catch |err| switch (err) {
                         error.ProtocolViolation => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
@@ -1334,7 +1834,7 @@ pub const Pipeline = struct {
                 wire.BackendTag.data_row => {
                     const raw_result = pg_stream.materializeDataRow(
                         self.allocator,
-                        &pg.transport,
+                        &pg.recv_queue,
                         msg.payload_off,
                         msg.payload_len,
                         &self.pg_stmt_cache,
@@ -1352,7 +1852,7 @@ pub const Pipeline = struct {
                         error.MessageTooLarge, error.RowTooLarge => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres row exceeds transport/result capacity");
+                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres row exceeds receive/result capacity");
                             return;
                         },
                         else => return err,
@@ -1372,7 +1872,7 @@ pub const Pipeline = struct {
                 },
                 wire.BackendTag.command_complete => {
                     if (waiter.cmd == .EXECUTE) {
-                        const count = pg_stream.parseCommandCompleteCount(&pg.transport, msg.payload_off, msg.payload_len);
+                        const count = pg_stream.parseCommandCompleteCount(&pg.recv_queue, msg.payload_off, msg.payload_len);
                         py_result = ffi.longFromLong(count) catch ffi.getNone();
                     }
 
@@ -1388,7 +1888,7 @@ pub const Pipeline = struct {
                     try pg.completeBatchQuery();
                     py_result = null;
                     py_list = null;
-                    query_save_pos = pg.transport.parseOffset(); // this query is fully parsed
+                    query_save_pos = pg.recv_queue.parseOffset(); // this query is fully parsed
                 },
                 wire.BackendTag.error_response => {
                     if (py_list) |l| ffi.decref(l);
@@ -1428,7 +1928,7 @@ pub const Pipeline = struct {
                         pg.in_flight -= 1;
                     }
 
-                    query_save_pos = pg.transport.parseOffset();
+                    query_save_pos = pg.recv_queue.parseOffset();
 
                     for (completed[0..completed_count]) |cq| {
                         try self.resumePgWaiter(cq.waiter, cq.result);
@@ -1448,7 +1948,6 @@ pub const Pipeline = struct {
     fn resumePgWaiter(self: *Pipeline, waiter: PgWaiter, result: *ffi.PyObject) !void {
         defer ffi.decref(result); // iterSend increfs internally; we own the creation ref
         defer ffi.xdecref(waiter.model_cls);
-        const conn = self.conns.get_ptr(waiter.conn_idx);
         const send = ffi.iterSend(waiter.py_coro, result);
         switch (send.status) {
             .next => {
@@ -1485,9 +1984,11 @@ pub const Pipeline = struct {
                 ffi.decref(waiter.py_coro);
                 const py_res = send.result orelse return error.PythonError;
                 defer ffi.decref(py_res);
-                const resp = driver.convertPythonResponse(py_res, &conn.body_buf) catch
-                    response_mod.Response.init(500);
-                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+                const response_hint: response_hint_mod.ResponseHint = switch (waiter.cmd) {
+                    .FETCH_ONE, .FETCH_ONE_MODEL => .row_json,
+                    else => .any,
+                };
+                try self.queueConvertedPythonResult(waiter.conn_idx, py_res, response_hint);
             },
             .@"error" => {
                 ffi.decref(waiter.py_coro);
@@ -1495,14 +1996,6 @@ pub const Pipeline = struct {
                 try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
             },
         }
-    }
-
-    fn failPgConnForTransportPool(self: *Pipeline, pg: *PgConn) !void {
-        log.warn(
-            "postgres transport pool exhausted: fd={d} waiters={d} in_use={d}/{d} free={d}",
-            .{ pg.fd, pg.waiter_count, self.pg_transport_pool.inUseCount(), self.pg_transport_pool.bufferCount(), self.pg_transport_pool.freeCount() },
-        );
-        try self.failPgConnWaitersWithStatus(pg, 503, "Postgres transport pool exhausted");
     }
 
     fn failPgConnWaiters(self: *Pipeline, pg: *PgConn) !void {
@@ -1525,24 +2018,13 @@ pub const Pipeline = struct {
             }
         }
         pg.recv_state = .idle;
+        pg.recv_armed = false;
         pg.send_state = .idle;
         pg.in_flight = 0;
-        pg.transport.clear();
+        pg.fail_status = 500;
+        pg.fail_body = null;
+        pg.recv_queue.clear(&self.pg_recv_group);
         pg.clearBatches();
-    }
-
-    pub fn matchPgSendToken(self: *Pipeline, token: *Token) ?*PgConn {
-        for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
-            if (token == &pg.send_token) return pg;
-        }
-        return null;
-    }
-
-    pub fn matchPgRecvToken(self: *Pipeline, token: *Token) ?*PgConn {
-        for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
-            if (token == &pg.recv_token) return pg;
-        }
-        return null;
     }
 
     fn anyPgNeedsGil(self: *Pipeline) bool {
@@ -1571,20 +2053,134 @@ pub const Pipeline = struct {
         log.info("postgres pool: connection {d} fd={d}", .{ idx, fd });
     }
 
+    fn handleCompletion(self: *Pipeline, token_ptr: *anyopaque, completion: Completion) !void {
+        const token: *Token = @ptrCast(@alignCast(token_ptr));
+        switch (token.tag) {
+            .accept => {
+                if (completion.result >= 0) self.onAccept(completion);
+                if (!completion.more) {
+                    self.accept_armed = false;
+                    try self.armAccept();
+                }
+            },
+            .conn_recv => try self.onConnRecvCompletion(token, completion),
+            .conn_send => try self.onConnSendCompletion(token, completion),
+            .redis_send => try self.onRedisSendIO(completion),
+            .redis_recv => try self.onRedisRecvIO(completion),
+            .pg_send => try self.onPgSendIO(@fieldParentPtr("send_token", token), completion),
+            .pg_recv => try self.onPgRecvIO(@fieldParentPtr("recv_token", token), completion),
+        }
+    }
+
+    fn armAccept(self: *Pipeline) !void {
+        if (self.accept_armed) return;
+        try self.backend.queue(&self.accept_token, .{
+            .accept_multishot = .{ .socket = self.listen_fd },
+        });
+        self.accept_armed = true;
+    }
+
+    fn submitConnRecv(self: *Pipeline, conn: *Conn) !void {
+        try self.backend.queue(&conn.recv_token, .{
+            .recv_multishot = .{
+                .socket = conn.fd,
+                .buffer_group = self.http_recv_group.groupId(),
+            },
+        });
+        conn.recv_armed = true;
+    }
+
+    fn submitConnSend(self: *Pipeline, conn: *Conn) !void {
+        switch (conn.send_mode) {
+            .idle => return,
+            .sendv => try self.backend.queue(&conn.send_token, .{
+                .sendv = .{
+                    .socket = conn.fd,
+                    .iovecs = conn.send_iovecs[0..conn.send_iov_count],
+                },
+            }),
+            .sendmsg_zc => try self.backend.queue(&conn.send_token, .{
+                .sendmsg_zc = .{
+                    .socket = conn.fd,
+                    .msg = &conn.send_msg,
+                },
+            }),
+        }
+    }
+
+    fn submitRedisSend(self: *Pipeline) !void {
+        const fd = self.redis_fd orelse return;
+        try self.backend.queue(&self.redis_send_token, .{
+            .send = .{
+                .socket = fd,
+                .buffer = self.redis_send_buf[self.redis_send_offset..self.redis_send_len],
+            },
+        });
+    }
+
+    fn submitRedisRecv(self: *Pipeline) !void {
+        const fd = self.redis_fd orelse return;
+        try self.backend.queue(&self.redis_recv_token, .{
+            .recv = .{
+                .socket = fd,
+                .buffer = self.redis_recv_buf[self.redis_recv_len..],
+            },
+        });
+    }
+
+    fn submitPgSend(self: *Pipeline, pg: *PgConn) !void {
+        try self.backend.queue(&pg.send_token, .{
+            .send = .{
+                .socket = pg.fd,
+                .buffer = pg.send_buf[pg.send_offset..pg.send_len],
+            },
+        });
+    }
+
+    fn submitPgRecv(self: *Pipeline, pg: *PgConn) !void {
+        try self.backend.queue(&pg.recv_token, .{
+            .recv_multishot = .{
+                .socket = pg.fd,
+                .buffer_group = self.pg_recv_group.groupId(),
+            },
+        });
+        pg.recv_armed = true;
+    }
+
     // ── Close ─────────────────────────────────────────────────────
 
     fn stageClose(self: *Pipeline) void {
         for (self.close_q.slice()) |index| {
             const conn = self.conns.get_ptr(index);
+            if (conn.zc_notif_pending) {
+                conn.recv_queue.clear(&self.http_recv_group);
+                conn.recv_armed = false;
+                conn.parse_queued = false;
+                conn.inflight_request_len = 0;
+                conn.head_parser = .{};
+                conn.head_fed = 0;
+                conn.send_mode = .idle;
+                conn.send_total_len = 0;
+                conn.send_sent = 0;
+                conn.send_iov_count = 0;
+                if (!conn.zc_notif_pending) conn.send_body_lease.release();
+                conn.send_body = null;
+                conn.send_body_from_conn = false;
+                if (conn.fd >= 0) posix.close(conn.fd);
+                conn.fd = -1;
+                conn.close_after_notif = true;
+                continue;
+            }
+            conn.recv_queue.clear(&self.http_recv_group);
+            conn.recv_armed = false;
+            conn.parse_queued = false;
+            conn.inflight_request_len = 0;
+            conn.head_parser = .{};
+            conn.head_fed = 0;
+            conn.send_body_lease.release();
             posix.close(conn.fd);
             self.conns.release(index);
         }
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────
-
-    pub fn pushSendTask(self: *Pipeline, task: SendTask) !void {
-        try self.send_q.push(task);
     }
 };
 
@@ -1609,23 +2205,51 @@ fn simdScreenBytes(bytes: []const u8, target: u8, out: []bool) void {
     }
 }
 
-/// Scan raw header bytes for Content-Length without a full Request.parse().
-/// Methods that never carry a body (GET, HEAD, DELETE, OPTIONS) return 0
-/// immediately — the common fast path under benchmarks.
-fn quickContentLength(data: []const u8) usize {
-    if (data.len < 4) return 0;
-    switch (data[0]) {
+fn quickContentLengthQueue(queue: *const UringRecvQueue, header_end: usize) usize {
+    if (header_end < 4) return 0;
+    switch (queue.byteAt(0)) {
         'G', 'H', 'D', 'O' => return 0,
         else => {},
     }
+
     const needle = "Content-Length: ";
-    const pos = std.mem.indexOf(u8, data, needle) orelse return 0;
-    const start = pos + needle.len;
-    var end = start;
-    while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
-    if (end == start) return 0;
-    return std.fmt.parseInt(usize, data[start..end], 10) catch 0;
+    var i: usize = 0;
+    while (i + needle.len <= header_end) : (i += 1) {
+        var matched = true;
+        for (needle, 0..) |ch, off| {
+            if (queue.byteAt(i + off) != ch) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) continue;
+
+        const start = i + needle.len;
+        var end = start;
+        while (end < header_end) : (end += 1) {
+            const ch = queue.byteAt(end);
+            if (ch < '0' or ch > '9') break;
+        }
+        if (end == start) return 0;
+
+        var tmp: [32]u8 = undefined;
+        const len = end - start;
+        if (len > tmp.len) return 0;
+        queue.copyInto(start, tmp[0..len]);
+        return std.fmt.parseInt(usize, tmp[0..len], 10) catch 0;
+    }
+    return 0;
 }
+
+const ParsedHandleRequest = struct {
+    req: http1.Request,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: *ParsedHandleRequest, allocator: std.mem.Allocator) void {
+        if (self.owned) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+};
 
 // ── Send Constructors ─────────────────────────────────────────────
 
@@ -1654,8 +2278,22 @@ fn makeResponseSend(conn_idx: u16, resp: response_mod.Response) SendTask {
         .hdr_len = 0,
         .status_line = statusLine(resp.status),
         .body = resp.body,
+        .body_lease = .{},
     };
     writePerResponseHeaders(&st, &resp);
+    return st;
+}
+
+fn makeOwnedResponseSend(conn_idx: u16, owned: *driver.OwnedResponse) SendTask {
+    var st = SendTask{
+        .conn = conn_idx,
+        .hdr = undefined,
+        .hdr_len = 0,
+        .status_line = statusLine(owned.response.status),
+        .body = owned.response.body,
+        .body_lease = owned.takeBodyLease(),
+    };
+    writePerResponseHeaders(&st, &owned.response);
     return st;
 }
 
@@ -1666,6 +2304,7 @@ fn makeErrorSend(conn_idx: u16, status: u16) SendTask {
         .hdr_len = 0,
         .status_line = statusLine(status),
         .body = null,
+        .body_lease = .{},
     };
     const suffix = "Connection: close\r\nContent-Length: 0\r\n\r\n";
     @memcpy(st.hdr[0..suffix.len], suffix);
@@ -1790,22 +2429,6 @@ test "simdScreenBytes classifies GET" {
     try std.testing.expect(out[5]); // G
     try std.testing.expect(!out[6]); // O
     try std.testing.expect(!out[7]); // H
-}
-
-test "quickContentLength GET" {
-    try std.testing.expectEqual(@as(usize, 0), quickContentLength("GET / HTTP/1.1\r\nHost: h\r\n\r\n"));
-}
-
-test "quickContentLength HEAD" {
-    try std.testing.expectEqual(@as(usize, 0), quickContentLength("HEAD / HTTP/1.1\r\n\r\n"));
-}
-
-test "quickContentLength POST with body" {
-    try std.testing.expectEqual(@as(usize, 13), quickContentLength("POST /x HTTP/1.1\r\nContent-Length: 13\r\n\r\n"));
-}
-
-test "quickContentLength POST no body" {
-    try std.testing.expectEqual(@as(usize, 0), quickContentLength("POST /x HTTP/1.1\r\nHost: h\r\n\r\n"));
 }
 
 test "Queue typed" {

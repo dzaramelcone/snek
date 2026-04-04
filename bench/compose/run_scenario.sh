@@ -16,6 +16,10 @@ COMPOSE_FILE="${COMPOSE_FILE:-bench/compose/docker-compose.yml}"
 THREADS="${THREADS:-1}"
 CONCURRENCY="${CONCURRENCY:-256}"
 DURATION="${DURATION:-10s}"
+PRIMER_CONCURRENCY="${PRIMER_CONCURRENCY:-8}"
+PRIMER_DURATION="${PRIMER_DURATION:-4s}"
+WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-${CONCURRENCY}}"
+WARMUP_DURATION="${WARMUP_DURATION:-3s}"
 PORT="${PORT:-8080}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-30}"
 TARGET_SERVICE="${TARGET_SERVICE:-bench}"
@@ -57,8 +61,10 @@ until compose exec -T bench python3 -c "import urllib.request; print(urllib.requ
     sleep 0.2
 done
 
-echo "==> running oha from a separate loadgen container on ${PROJECT}_default"
-docker run --rm --network "${PROJECT}_default" "${PROJECT}-bench" \
-    oha --no-tui -z "${DURATION}" -c "${CONCURRENCY}" "http://${TARGET_SERVICE}:${PORT}${PATH_SUFFIX}"
+echo "==> running primer/warmup/bench from one loadgen container on ${PROJECT}_default"
+docker run --rm --network "${PROJECT}_default" "${PROJECT}-bench" sh -lc "\
+    oha --no-tui -c '${PRIMER_CONCURRENCY}' -z '${PRIMER_DURATION}' 'http://${TARGET_SERVICE}:${PORT}${PATH_SUFFIX}' >/tmp/primer.txt && \
+    oha --no-tui -c '${WARMUP_CONCURRENCY}' -z '${WARMUP_DURATION}' 'http://${TARGET_SERVICE}:${PORT}${PATH_SUFFIX}' >/tmp/warmup.txt && \
+    oha --no-tui -c '${CONCURRENCY}' -z '${DURATION}' 'http://${TARGET_SERVICE}:${PORT}${PATH_SUFFIX}'"
 
 echo "==> app log: ${APP_LOG}"

@@ -26,6 +26,24 @@ async def extract_idea(joined: Any) -> Any:
     return await _identity(joined.idea)
 
 
+async def inspect_request(req: Any) -> dict[str, Any]:
+    await _identity(None)
+    return _request_summary(req)
+
+
+def _request_summary(req: Any) -> dict[str, Any]:
+    headers = dict(req.headers)
+    params = dict(req.params)
+    return {
+        "method": req.method,
+        "path": req.path,
+        "body": None if req.body is None else req.body.decode("utf-8"),
+        "headers": headers,
+        "params": params,
+        "keepalive": bool(req.keepalive),
+    }
+
+
 def reset() -> None:
     global _cached_value, _cached_view, _thread_value, _thread_mutated_value, _thread_view
     _cached_value = None

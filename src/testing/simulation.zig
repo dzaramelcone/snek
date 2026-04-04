@@ -22,7 +22,6 @@ pub const IoOp = union(enum) {
     accept_multishot: struct { socket: i32 },
     connect: struct { socket: i32 },
     recv: struct { socket: i32, buffer: []u8 },
-    recv_fixed: struct { socket: i32, buffer_id: u16, len: u32, offset: u32 = 0 },
     recv_multishot: struct { socket: i32, buffer_group: u16, flags: u32 = 0 },
     send: struct { socket: i32, buffer: []const u8 },
     send_zc: struct { socket: i32, buffer: []const u8, send_flags: u32 = 0, zc_flags: u16 = 0 },
