@@ -1,8 +1,34 @@
 const std = @import("std");
 const ffi = @import("ffi.zig");
+const c = ffi.c;
 const PyObject = ffi.PyObject;
 const json_serialize = @import("../json/serialize.zig");
 const snek_row = @import("snek_row.zig");
+
+const ModelKeys = struct {
+    row: *PyObject,
+    root: *PyObject,
+    attached_row: *PyObject,
+};
+
+threadlocal var model_keys: ?ModelKeys = null;
+
+fn ensureModelKeys() ffi.PythonError!*const ModelKeys {
+    if (model_keys == null) {
+        model_keys = .{
+            .row = c.PyUnicode_InternFromString("_snek_row") orelse return error.PythonError,
+            .root = c.PyUnicode_InternFromString("_snek_root") orelse return error.PythonError,
+            .attached_row = c.PyUnicode_InternFromString("_snek_attached_row") orelse return error.PythonError,
+        };
+    }
+    return &model_keys.?;
+}
+
+fn instanceDictItem(obj: *PyObject, key: *PyObject) ?*PyObject {
+    const dict_ptr = c._PyObject_GetDictPtr(obj) orelse return null;
+    const dict = dict_ptr.* orelse return null;
+    return ffi.dictGetItem(dict, key);
+}
 
 const NestedLayout = struct {
     field_order: *PyObject,
@@ -16,34 +42,16 @@ const NestedLayout = struct {
     }
 };
 
-fn modelIsClean(obj: *PyObject) ffi.PythonError!bool {
-    const clean = try ffi.callOptionalNoArgs(obj, "_snek_is_clean");
-    if (clean == null) return true;
-    defer ffi.decref(clean.?);
-    return try ffi.objectIsTrue(clean.?);
-}
-
 fn getBackingRow(obj: *PyObject) ffi.PythonError!?*PyObject {
     if (snek_row.isSnekRow(obj)) return ffi.increfBorrowed(obj);
 
-    const backing = try ffi.getAttrOptional(obj, "_snek_row");
-    if (backing == null) return null;
-    if (!try modelIsClean(obj)) {
-        ffi.decref(backing.?);
-        return null;
-    }
-    if (!snek_row.isSnekRow(backing.?)) {
-        ffi.decref(backing.?);
-        return null;
-    }
-    return backing.?;
-}
-
-fn hasNestedShape(obj: *PyObject) ffi.PythonError!bool {
-    const nested = try ffi.getAttrOptional(obj, "__snek_nested__");
-    if (nested == null) return false;
-    defer ffi.decref(nested.?);
-    return ffi.isDict(nested.?) and ffi.dictSize(nested.?) > 0;
+    const keys = try ensureModelKeys();
+    const root = instanceDictItem(obj, keys.root) orelse obj;
+    const root_backing = instanceDictItem(root, keys.attached_row) orelse return null;
+    if (!snek_row.isSnekRow(root_backing)) return null;
+    const backing = instanceDictItem(obj, keys.row) orelse return null;
+    if (!snek_row.isSnekRow(backing)) return null;
+    return ffi.increfBorrowed(backing);
 }
 
 fn getNestedLayout(obj: *PyObject) ffi.PythonError!?NestedLayout {
@@ -163,9 +171,8 @@ pub fn tryWrite(obj: *PyObject, buf: []u8, pos: *usize) WriteError!bool {
     if (backing == null) return false;
     defer ffi.decref(backing.?);
 
-    if (try hasNestedShape(obj)) {
-        const layout = try getNestedLayout(obj);
-        if (layout == null) return false;
+    const layout = try getNestedLayout(obj);
+    if (layout != null) {
         defer layout.?.deinit();
 
         const written = serializeNestedModel(backing.?, layout.?, buf[pos.*..]) catch |err| switch (err) {

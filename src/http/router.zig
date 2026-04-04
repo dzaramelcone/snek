@@ -14,35 +14,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-pub const Method = enum(u4) {
-    GET = 0,
-    POST = 1,
-    PUT = 2,
-    DELETE = 3,
-    PATCH = 4,
-    HEAD = 5,
-    OPTIONS = 6,
-    CONNECT = 7,
-    TRACE = 8,
-
-    pub fn fromString(s: []const u8) ?Method {
-        const map = .{
-            .{ "GET", Method.GET },
-            .{ "POST", Method.POST },
-            .{ "PUT", Method.PUT },
-            .{ "DELETE", Method.DELETE },
-            .{ "PATCH", Method.PATCH },
-            .{ "HEAD", Method.HEAD },
-            .{ "OPTIONS", Method.OPTIONS },
-            .{ "CONNECT", Method.CONNECT },
-            .{ "TRACE", Method.TRACE },
-        };
-        inline for (map) |entry| {
-            if (std.mem.eql(u8, s, entry[0])) return entry[1];
-        }
-        return null;
-    }
-};
+pub const Method = std.http.Method;
 
 pub const PathParam = struct {
     name: []const u8,

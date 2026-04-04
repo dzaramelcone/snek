@@ -487,13 +487,13 @@ class TestEmitQueries:
             returns_table="users",
         )]
         code = emit_queries(queries, tables, "models")
-        assert "def get_user(self, *, id: str) -> User | None:" in code
+        assert "def get_user(self, *, id: str) -> Awaitable[User | None]:" in code
 
     def test_many_method(self):
         tables = {"t": Table("t", [Column("id", "text", "str")])}
         queries = [Query("ListT", "list_t", "many", "", "", returns_table="t")]
         code = emit_queries(queries, tables, "models")
-        assert "-> list[T]:" in code
+        assert "-> Awaitable[list[T]]:" in code
 
     def test_model_methods_emit_typed_pg_sentinels(self):
         tables = {
@@ -510,7 +510,7 @@ class TestEmitQueries:
             returns_table="users",
         )]
         code = emit_queries(queries, tables, "models")
-        assert "return (yield _snek.pg_fetch_one_model(GET_USER, (id,), User))" in code
+        assert "return _snek.pg_fetch_one_model(GET_USER, (id,), User)" in code
 
     def test_row_models_are_imported_for_typed_queries(self):
         query = Query(
@@ -523,7 +523,7 @@ class TestEmitQueries:
         )
         code = emit_queries([query], {}, "models")
         assert "from models import GetStatsRow" in code
-        assert "return (yield _snek.pg_fetch_one_model(GET_STATS, (), GetStatsRow))" in code
+        assert "return _snek.pg_fetch_one_model(GET_STATS, (), GetStatsRow)" in code
 
     def test_exec_method(self):
         tables = {"t": Table("t", [Column("id", "text", "str")])}
@@ -532,7 +532,7 @@ class TestEmitQueries:
             params=[QueryParam("id", 1)],
         )]
         code = emit_queries(queries, tables, "models")
-        assert "-> None:" in code
+        assert "-> Awaitable[None]:" in code
 
     def test_execrows_method(self):
         tables = {"t": Table("t", [Column("id", "text", "str")])}
@@ -541,7 +541,7 @@ class TestEmitQueries:
             params=[QueryParam("id", 1)],
         )]
         code = emit_queries(queries, tables, "models")
-        assert "-> int:" in code
+        assert "-> Awaitable[int]:" in code
 
     def test_sql_constants(self):
         queries = [Query(
@@ -555,6 +555,7 @@ class TestEmitQueries:
         queries = [Query("GetT", "get_t", "one", "", "")]
         code = emit_queries(queries, {}, "models")
         assert "__future__" not in code
+        assert "import types" not in code
 
 
 # ---------------------------------------------------------------------------
@@ -608,12 +609,12 @@ class TestEndToEnd:
         assert "Optional" not in models
 
         # Db methods
-        assert "def get_idea(self, *, id: str) -> Idea | None:" in db
-        assert "def list_ideas(self) -> list[Idea]:" in db
-        assert "def create_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in db
-        assert "def delete_idea(self, *, id: str) -> None:" in db
-        assert "def upsert_idea(self, *, id: str, description: str, tags: list[str]) -> Idea | None:" in db
-        assert "@types.coroutine" in db
+        assert "def get_idea(self, *, id: str) -> Awaitable[Idea | None]:" in db
+        assert "def list_ideas(self) -> Awaitable[list[Idea]]:" in db
+        assert "def create_idea(self, *, id: str, description: str, tags: list[str]) -> Awaitable[Idea | None]:" in db
+        assert "def delete_idea(self, *, id: str) -> Awaitable[None]:" in db
+        assert "def upsert_idea(self, *, id: str, description: str, tags: list[str]) -> Awaitable[Idea | None]:" in db
+        assert "@types.coroutine" not in db
 
         # SQL constants
         assert "$1" in db
@@ -652,7 +653,7 @@ class TestEndToEnd:
         assert "    id: str" in models
         assert "    description: str" in models
         assert "    created_at: datetime" in models
-        assert "def get_idea_lite(self, *, id: str) -> GetIdeaLiteRow | None:" in db
+        assert "def get_idea_lite(self, *, id: str) -> Awaitable[GetIdeaLiteRow | None]:" in db
 
     def test_mixed_alias_and_bare_scalars_track_field_order(self):
         schema_sql = (
@@ -680,4 +681,4 @@ class TestEndToEnd:
         assert "    summary: str" in models
         assert "    __snek_field_order__ = ('idea', 'summary')" in models
         assert "    __snek_scalar_indexes__ = {'summary': 2}" in models
-        assert "def get_idea_with_bare_summary(self, *, id: str) -> GetIdeaWithBareSummaryRow | None:" in db
+        assert "def get_idea_with_bare_summary(self, *, id: str) -> Awaitable[GetIdeaWithBareSummaryRow | None]:" in db

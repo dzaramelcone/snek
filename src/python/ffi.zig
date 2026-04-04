@@ -20,6 +20,11 @@ pub const c = @cImport({
 /// Opaque PyObject pointer from CPython.
 pub const PyObject = c.PyObject;
 
+// PyEval_SaveThread/RestoreThread use PyThreadState*, but the imported type
+// is not useful to us here. We only need the opaque saved thread-state token.
+pub extern fn PyEval_SaveThread() ?*anyopaque;
+pub extern fn PyEval_RestoreThread(?*anyopaque) void;
+
 // ── Layer 2: Zig-idiomatic wrappers ─────────────────────────────────
 
 pub const PythonError = error{
@@ -29,6 +34,7 @@ pub const PythonError = error{
     TypeError,
     CallError,
     ConversionError,
+    ModuleStateError,
 };
 
 /// Initialize the CPython interpreter.
@@ -151,13 +157,6 @@ pub fn callMethodNoArgs(obj: *PyObject, method: [*:0]const u8) PythonError!*PyOb
     const callable = try getAttrRaw(obj, method);
     defer decref(callable);
     return callNoArgs(callable);
-}
-
-pub fn callOptionalNoArgs(obj: *PyObject, method: [*:0]const u8) PythonError!?*PyObject {
-    const callable = try getAttrOptional(obj, method);
-    if (callable == null) return null;
-    defer decref(callable.?);
-    return callNoArgs(callable.?);
 }
 
 pub fn callMethodOneArg(obj: *PyObject, method: [*:0]const u8, arg: *PyObject) PythonError!*PyObject {
@@ -426,22 +425,73 @@ pub fn wrapVarArgs(comptime name: [*:0]const u8, comptime func: *const fn (?*PyO
     };
 }
 
-/// Wrap a Zig function as a METH_NOARGS method that receives the module object.
-/// The Zig function must accept *PyObject (the module) and return PythonError!*PyObject.
-/// Used with multi-phase init where self is the module with per-interpreter state.
-pub fn wrapNoArgsModule(comptime name: [*:0]const u8, comptime func: fn (*PyObject) PythonError!*PyObject) c.PyMethodDef {
-    return .{
-        .ml_name = name,
-        .ml_meth = &struct {
-            fn wrapper(self: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
-                return func(self.?) catch |err| {
-                    c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
-                    return null;
-                };
-            }
-        }.wrapper,
-        .ml_flags = c.METH_NOARGS,
-        .ml_doc = null,
+pub fn moduleStateRequired(comptime T: type, mod: *PyObject) PythonError!*T {
+    const raw = moduleGetState(mod) orelse return error.ModuleStateError;
+    return @ptrCast(@alignCast(raw));
+}
+
+fn raiseBoundaryError(err: anyerror) ?*PyObject {
+    if (err == error.PythonError) return null;
+    if (err == error.ModuleStateError) {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
+        return null;
+    }
+
+    if (!errOccurred()) {
+        c.PyErr_SetString(c.PyExc_RuntimeError, @errorName(err));
+    }
+    return null;
+}
+
+pub const StateMethodKind = enum {
+    noargs,
+    onearg,
+    fastcall,
+};
+
+pub fn wrapStateMethod(
+    comptime name: [*:0]const u8,
+    comptime State: type,
+    comptime kind: StateMethodKind,
+    comptime func: anytype,
+) c.PyMethodDef {
+    return switch (kind) {
+        .noargs => .{
+            .ml_name = name,
+            .ml_meth = @ptrCast(&struct {
+                fn wrapper(self: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
+                    const mod = self.?;
+                    const state = moduleStateRequired(State, mod) catch |err| return raiseBoundaryError(err);
+                    return func(state) catch |err| return raiseBoundaryError(err);
+                }
+            }.wrapper),
+            .ml_flags = c.METH_NOARGS,
+            .ml_doc = null,
+        },
+        .onearg => .{
+            .ml_name = name,
+            .ml_meth = @ptrCast(&struct {
+                fn wrapper(self: ?*PyObject, arg: ?*PyObject) callconv(.c) ?*PyObject {
+                    const mod = self.?;
+                    const state = moduleStateRequired(State, mod) catch |err| return raiseBoundaryError(err);
+                    return func(state, arg.?) catch |err| return raiseBoundaryError(err);
+                }
+            }.wrapper),
+            .ml_flags = c.METH_O,
+            .ml_doc = null,
+        },
+        .fastcall => .{
+            .ml_name = name,
+            .ml_meth = @ptrCast(&struct {
+                fn wrapper(self: ?*PyObject, args: [*]const *PyObject, nargs: c.Py_ssize_t) callconv(.c) ?*PyObject {
+                    const mod = self.?;
+                    const state = moduleStateRequired(State, mod) catch |err| return raiseBoundaryError(err);
+                    return func(state, args, nargs) catch |err| return raiseBoundaryError(err);
+                }
+            }.wrapper),
+            .ml_flags = c.METH_FASTCALL,
+            .ml_doc = null,
+        },
     };
 }
 
@@ -480,13 +530,6 @@ pub fn dictSize(dict: *PyObject) isize {
     return c.PyDict_Size(dict);
 }
 
-/// Iterate over dict items. Returns 0 when iteration is done.
-/// pos must be initialized to 0 before first call.
-/// key and value are borrowed references.
-pub fn dictNext(dict: *PyObject, pos: *isize, key: *?*PyObject, value: *?*PyObject) bool {
-    return c.PyDict_Next(dict, pos, key, value) != 0;
-}
-
 /// Get Python object's string representation. Caller must decref.
 pub fn objectStr(obj: *PyObject) PythonError!*PyObject {
     return c.PyObject_Str(obj) orelse error.ConversionError;
@@ -506,9 +549,9 @@ pub fn objectIsTrue(obj: *PyObject) PythonError!bool {
 ///   and GC callbacks (traverse/clear/free) for any PyObject* in the state.
 pub fn moduleDef(
     name: [*:0]const u8,
-    methods: [*]c.PyMethodDef,
+    methods: [*]const c.PyMethodDef,
     m_size: isize,
-    slots: ?[*]c.PyModuleDef_Slot,
+    slots: ?[*]const c.PyModuleDef_Slot,
     traverse: c.traverseproc,
     clear: c.inquiry,
     free: c.freefunc,
@@ -518,8 +561,8 @@ pub fn moduleDef(
         .m_name = name,
         .m_doc = null,
         .m_size = m_size,
-        .m_methods = methods,
-        .m_slots = slots,
+        .m_methods = @constCast(methods),
+        .m_slots = if (slots) |s| @constCast(s) else null,
         .m_traverse = traverse,
         .m_clear = clear,
         .m_free = free,
@@ -536,6 +579,10 @@ pub fn moduleDefInit(def: *c.PyModuleDef) ?*PyObject {
 /// Returns null if the module has no state (m_size <= 0).
 pub fn moduleGetState(mod: *PyObject) ?*anyopaque {
     return c.PyModule_GetState(mod);
+}
+
+pub fn typeGetModuleState(tp: *c.PyTypeObject) PythonError!*anyopaque {
+    return c.PyType_GetModuleState(tp) orelse error.ModuleStateError;
 }
 
 /// Create a module from a PyModuleDef (single-phase init).

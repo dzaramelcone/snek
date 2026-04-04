@@ -12,9 +12,7 @@ const ffi = @import("ffi.zig");
 const c = ffi.c;
 const PyObject = ffi.PyObject;
 const driver = @import("driver.zig");
-const server_mod = @import("../server.zig");
-const response_hint_mod = @import("../response_hint.zig");
-const ResponseHint = response_hint_mod.ResponseHint;
+const future_mod = @import("futures/mod.zig");
 
 // ── Module state ────────────────────────────────────────────────────
 
@@ -33,8 +31,6 @@ pub const HandlerFlags = extern struct {
     no_args: bool = false,
     /// Handler is async def (pre-computed, saves per-call check)
     is_async: bool = false,
-    /// Cached response conversion hint.
-    response_hint: u8 = @intFromEnum(ResponseHint.any),
 };
 
 /// Route metadata stored alongside handlers for server setup.
@@ -53,22 +49,12 @@ pub const SnekModuleState = extern struct {
     py_handler_count: u32,
     handler_flags: [MAX_HANDLERS]HandlerFlags,
     route_entries: [MAX_HANDLERS]RouteEntry,
+    future_types: future_mod.TypeState,
     /// "module:attr" ref for sub-interpreters to re-import the user app.
     /// Stored as a null-terminated fixed buffer (e.g. "app:app\x00...").
     module_ref: [256]u8,
     module_ref_len: u16,
 };
-
-/// Temporary global module reference. Set during pyRun so driver.startServer
-/// can access the module state. Will be replaced by per-worker interpreter
-/// state in the next refactor step.
-var g_current_module: ?*PyObject = null;
-
-/// Get the current module object. Used by driver.zig to access state
-/// during server operation (temporary — next step makes this per-worker).
-pub fn getCurrentModule() ?*PyObject {
-    return g_current_module;
-}
 
 /// Get module state from a module object.
 pub fn getState(mod: *PyObject) ?*SnekModuleState {
@@ -81,19 +67,6 @@ pub fn getHandler(mod: *PyObject, handler_id: u32) ?*PyObject {
     const state = getState(mod) orelse return null;
     if (handler_id >= MAX_HANDLERS) return null;
     return state.py_handlers[handler_id];
-}
-
-/// Get the current handler count.
-pub fn getHandlerCount(mod: *PyObject) u32 {
-    const state = getState(mod) orelse return 0;
-    return state.py_handler_count;
-}
-
-/// Get route entry by handler_id.
-pub fn getRouteEntry(mod: *PyObject, handler_id: u32) ?RouteEntry {
-    const state = getState(mod) orelse return null;
-    if (handler_id >= state.py_handler_count) return null;
-    return state.route_entries[handler_id];
 }
 
 /// Get handler flags by handler_id.
@@ -122,7 +95,6 @@ pub fn getModuleRef(mod: *PyObject) ?[]const u8 {
 ///   - fallback → needs_request
 fn inspectHandlerFlags(handler_obj: *PyObject) HandlerFlags {
     var flags = HandlerFlags{};
-    flags.response_hint = @intFromEnum(inspectResponseHint(handler_obj));
 
     // Detect async: check if the handler is a coroutine function
     flags.is_async = c.PyCoro_CheckExact(handler_obj) != 0 or isCoroutineFunction(handler_obj);
@@ -190,104 +162,6 @@ fn inspectHandlerFlags(handler_obj: *PyObject) HandlerFlags {
     return flags;
 }
 
-fn inspectResponseHint(handler_obj: *PyObject) ResponseHint {
-    const return_obj = resolvedReturnAnnotation(handler_obj) orelse return .any;
-    defer ffi.decref(return_obj);
-    return classifyResponseHint(return_obj);
-}
-
-fn resolvedReturnAnnotation(handler_obj: *PyObject) ?*PyObject {
-    if (resolvedReturnAnnotationViaTyping(handler_obj)) |resolved| return resolved;
-    if (resolvedReturnAnnotationFromDict(handler_obj)) |raw| return raw;
-    return null;
-}
-
-fn resolvedReturnAnnotationViaTyping(handler_obj: *PyObject) ?*PyObject {
-    const typing_mod = ffi.importModuleRaw("typing") catch return null;
-    defer ffi.decref(typing_mod);
-    const get_type_hints = ffi.getAttrRaw(typing_mod, "get_type_hints") catch return null;
-    defer ffi.decref(get_type_hints);
-    const hints = ffi.callOneArg(get_type_hints, handler_obj) catch {
-        ffi.errClear();
-        return null;
-    };
-    defer ffi.decref(hints);
-    if (!ffi.isDict(hints)) return null;
-    const return_obj = ffi.dictGetItemString(hints, "return") orelse return null;
-    return ffi.increfBorrowed(return_obj);
-}
-
-fn resolvedReturnAnnotationFromDict(handler_obj: *PyObject) ?*PyObject {
-    const annotations = ffi.getAttrOptional(handler_obj, "__annotations__") catch return null;
-    if (annotations == null) return null;
-    defer ffi.decref(annotations.?);
-    if (!ffi.isDict(annotations.?)) return null;
-    const return_obj = ffi.dictGetItemString(annotations.?, "return") orelse return null;
-    return ffi.increfBorrowed(return_obj);
-}
-
-fn classifyResponseHint(return_obj: *PyObject) ResponseHint {
-    if (isStrAnnotation(return_obj)) return .str;
-    if (isBytesAnnotation(return_obj)) return .bytes;
-    if (isRowBackedAnnotation(return_obj)) return .row_json;
-    return .any;
-}
-
-fn normalizedAnnotationString(obj: *PyObject) ?[]const u8 {
-    if (!ffi.isString(obj)) return null;
-    const value = ffi.unicodeAsUTF8(obj) catch return null;
-    var span: []const u8 = std.mem.span(value);
-    if (span.len >= 2) {
-        const first = span[0];
-        const last = span[span.len - 1];
-        if ((first == '\'' and last == '\'') or (first == '"' and last == '"')) {
-            span = span[1 .. span.len - 1];
-        }
-    }
-    return span;
-}
-
-fn isStrAnnotation(return_obj: *PyObject) bool {
-    if (normalizedAnnotationString(return_obj)) |span| {
-        return std.mem.eql(u8, span, "str");
-    }
-
-    const builtins = ffi.importModuleRaw("builtins") catch return false;
-    defer ffi.decref(builtins);
-    const str_type = ffi.getAttrRaw(builtins, "str") catch return false;
-    defer ffi.decref(str_type);
-    return return_obj == str_type;
-}
-
-fn isBytesAnnotation(return_obj: *PyObject) bool {
-    if (normalizedAnnotationString(return_obj)) |span| {
-        return std.mem.eql(u8, span, "bytes") or std.mem.eql(u8, span, "memoryview");
-    }
-
-    const builtins = ffi.importModuleRaw("builtins") catch return false;
-    defer ffi.decref(builtins);
-    const bytes_type = ffi.getAttrRaw(builtins, "bytes") catch return false;
-    defer ffi.decref(bytes_type);
-    if (return_obj == bytes_type) return true;
-
-    const memoryview_type = ffi.getAttrRaw(builtins, "memoryview") catch return false;
-    defer ffi.decref(memoryview_type);
-    return return_obj == memoryview_type;
-}
-
-fn isRowBackedAnnotation(return_obj: *PyObject) bool {
-    if (normalizedAnnotationString(return_obj)) |span| {
-        return std.mem.eql(u8, span, "snek.Row");
-    }
-
-    const row_factory = ffi.getAttrOptional(return_obj, "_snek_from_row") catch return false;
-    if (row_factory) |value| {
-        ffi.decref(value);
-        return true;
-    }
-    return false;
-}
-
 /// Check if a callable is an async def (coroutine function).
 fn isCoroutineFunction(obj: *PyObject) bool {
     const inspect_mod = ffi.importModuleRaw("inspect") catch return false;
@@ -307,80 +181,40 @@ fn isCoroutineFunction(obj: *PyObject) bool {
 
 // ── Module methods ──────────────────────────────────────────────────
 
-/// _snek.add_route(method: str, path: str, handler: callable)
-///
-/// Registers a Python handler for the given HTTP method + path.
-/// In multi-phase init, self is the module object with per-interpreter state.
-fn pyAddRoute(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
-    const mod = self_mod orelse {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
-        return null;
-    };
-    const state: *SnekModuleState = getState(mod) orelse {
+fn pyAddRoute(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const mod = self.?;
+    const state = ffi.moduleStateRequired(SnekModuleState, mod) catch {
         c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
         return null;
     };
-
-    const tuple = args orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "add_route requires 3 arguments");
-        return null;
-    };
-
-    if (!ffi.isTuple(tuple) or ffi.tupleSize(tuple) != 3) {
+    const tuple = args.?;
+    if (ffi.tupleSize(tuple) != 3) {
         c.PyErr_SetString(c.PyExc_TypeError, "add_route(method, path, handler) requires exactly 3 arguments");
         return null;
     }
 
-    // Extract method string
-    const method_obj = ffi.tupleGetItem(tuple, 0) orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "method must be a string");
-        return null;
-    };
+    const method_obj = ffi.tupleGetItem(tuple, 0).?;
+    const path_obj = ffi.tupleGetItem(tuple, 1).?;
+    const handler_obj = ffi.tupleGetItem(tuple, 2).?;
     if (!ffi.isString(method_obj)) {
-        c.PyErr_SetString(c.PyExc_TypeError, "method must be a string");
+        c.PyErr_SetString(c.PyExc_TypeError, "add_route(method, path, handler): method must be a string");
         return null;
     }
-    const method_str = ffi.unicodeAsUTF8(method_obj) catch {
-        c.PyErr_SetString(c.PyExc_TypeError, "method must be a valid UTF-8 string");
-        return null;
-    };
-
-    // Extract path string
-    const path_obj = ffi.tupleGetItem(tuple, 1) orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "path must be a string");
-        return null;
-    };
     if (!ffi.isString(path_obj)) {
-        c.PyErr_SetString(c.PyExc_TypeError, "path must be a string");
+        c.PyErr_SetString(c.PyExc_TypeError, "add_route(method, path, handler): path must be a string");
         return null;
     }
-    const path_str = ffi.unicodeAsUTF8(path_obj) catch {
-        c.PyErr_SetString(c.PyExc_TypeError, "path must be a valid UTF-8 string");
-        return null;
-    };
-
-    // Extract handler callable
-    const handler_obj = ffi.tupleGetItem(tuple, 2) orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "handler must be a callable");
-        return null;
-    };
     if (!ffi.isCallable(handler_obj)) {
-        c.PyErr_SetString(c.PyExc_TypeError, "handler must be a callable");
+        c.PyErr_SetString(c.PyExc_TypeError, "add_route(method, path, handler): handler must be callable");
         return null;
     }
-
-    // Store handler
     if (state.py_handler_count >= MAX_HANDLERS) {
         c.PyErr_SetString(c.PyExc_RuntimeError, "too many handlers registered (max 64)");
         return null;
     }
 
-    const id = state.py_handler_count;
-
-    // Store route metadata
-    const method_span = std.mem.span(method_str);
-    const path_span = std.mem.span(path_str);
-
+    const method_span = std.mem.span(ffi.unicodeAsUTF8(method_obj) catch return null);
+    const path_span = std.mem.span(ffi.unicodeAsUTF8(path_obj) catch return null);
     if (method_span.len > 8) {
         c.PyErr_SetString(c.PyExc_ValueError, "method string too long (max 8 chars)");
         return null;
@@ -390,169 +224,186 @@ fn pyAddRoute(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
         return null;
     }
 
-    var entry: RouteEntry = undefined;
+    const id = state.py_handler_count;
+    var entry = RouteEntry{
+        .method = std.mem.zeroes([8]u8),
+        .method_len = @intCast(method_span.len),
+        .path = std.mem.zeroes([256]u8),
+        .path_len = @intCast(path_span.len),
+    };
     @memcpy(entry.method[0..method_span.len], method_span);
-    entry.method_len = @intCast(method_span.len);
     @memcpy(entry.path[0..path_span.len], path_span);
-    entry.path_len = @intCast(path_span.len);
     state.route_entries[id] = entry;
 
-    // Incref the handler — we own a reference now
     ffi.incref(handler_obj);
     state.py_handlers[id] = handler_obj;
-
-    // Inspect handler signature to determine calling convention flags.
     state.handler_flags[id] = inspectHandlerFlags(handler_obj);
-
     state.py_handler_count = id + 1;
-
     return ffi.getNone();
 }
 
-/// _snek.run(host: str, port: int, module_ref: str = "")
-///
-/// Starts the Zig HTTP server. Blocks until the server shuts down.
-/// Routes must be registered via add_route() before calling run().
-/// module_ref is "module:attr" (e.g. "app:app") so sub-interpreters
-/// can re-import the user's app independently.
-fn pyRun(self_mod: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
-    const mod = self_mod orelse {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "module object is null");
+fn pyRun(self: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+    const mod = self.?;
+    const state = ffi.moduleStateRequired(SnekModuleState, mod) catch {
+        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
         return null;
     };
-
-    const tuple = args orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "run requires 2-3 arguments");
-        return null;
-    };
-
-    const tuple_size = if (ffi.isTuple(tuple)) ffi.tupleSize(tuple) else 0;
-    if (tuple_size < 3 or tuple_size > 5) {
-        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads[, module_ref[, backlog]]) requires 3-5 arguments");
+    const tuple = args.?;
+    const argc = ffi.tupleSize(tuple);
+    if (argc < 3 or argc > 5) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads, module_ref?, backlog?) requires 3-5 arguments");
         return null;
     }
 
-    // Extract host string
-    const host_obj = ffi.tupleGetItem(tuple, 0) orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "host must be a string");
-        return null;
-    };
+    const host_obj = ffi.tupleGetItem(tuple, 0).?;
+    const port_obj = ffi.tupleGetItem(tuple, 1).?;
+    const threads_obj = ffi.tupleGetItem(tuple, 2).?;
     if (!ffi.isString(host_obj)) {
-        c.PyErr_SetString(c.PyExc_TypeError, "host must be a string");
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads, module_ref?, backlog?): host must be a string");
         return null;
     }
-    const host_str = ffi.unicodeAsUTF8(host_obj) catch {
-        c.PyErr_SetString(c.PyExc_TypeError, "host must be a valid UTF-8 string");
+    if (c.PyLong_Check(port_obj) == 0) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads, module_ref?, backlog?): port must be an integer");
         return null;
-    };
+    }
+    if (c.PyLong_Check(threads_obj) == 0) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads, module_ref?, backlog?): threads must be an integer");
+        return null;
+    }
+    if (argc >= 4 and !ffi.isString(ffi.tupleGetItem(tuple, 3).?)) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads, module_ref?, backlog?): module_ref must be a string");
+        return null;
+    }
+    if (argc >= 5 and c.PyLong_Check(ffi.tupleGetItem(tuple, 4).?) == 0) {
+        c.PyErr_SetString(c.PyExc_TypeError, "run(host, port, threads, module_ref?, backlog?): backlog must be an integer");
+        return null;
+    }
 
-    // Extract port int
-    const port_obj = ffi.tupleGetItem(tuple, 1) orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "port must be an integer");
-        return null;
-    };
-    const port_long = ffi.longAsLong(port_obj) catch {
-        c.PyErr_SetString(c.PyExc_TypeError, "port must be an integer");
-        return null;
-    };
+    const host_span = std.mem.span(ffi.unicodeAsUTF8(host_obj) catch return null);
+    const port_long = ffi.longAsLong(port_obj) catch return null;
+    const threads_long = ffi.longAsLong(threads_obj) catch return null;
     if (port_long < 0 or port_long > 65535) {
         c.PyErr_SetString(c.PyExc_ValueError, "port must be 0-65535");
         return null;
     }
-
-    // Extract threads int
-    const threads_obj = ffi.tupleGetItem(tuple, 2) orelse {
-        c.PyErr_SetString(c.PyExc_TypeError, "threads must be an integer");
-        return null;
-    };
-    const threads_long = ffi.longAsLong(threads_obj) catch {
-        c.PyErr_SetString(c.PyExc_TypeError, "threads must be an integer");
-        return null;
-    };
     if (threads_long < 1 or threads_long > 256) {
         c.PyErr_SetString(c.PyExc_ValueError, "threads must be 1-256");
         return null;
     }
 
-    // Extract optional module_ref string (e.g. "app:app")
-    const state: *SnekModuleState = getState(mod) orelse {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "module state not initialized");
-        return null;
-    };
-    if (tuple_size >= 4) {
-        const ref_obj = ffi.tupleGetItem(tuple, 3) orelse {
-            c.PyErr_SetString(c.PyExc_TypeError, "module_ref must be a string");
+    state.module_ref_len = 0;
+    if (argc >= 4) {
+        const ref_span = std.mem.span(ffi.unicodeAsUTF8(ffi.tupleGetItem(tuple, 3).?) catch return null);
+        if (ref_span.len >= state.module_ref.len) {
+            c.PyErr_SetString(c.PyExc_ValueError, "module_ref string too long (max 255 chars)");
             return null;
-        };
-        if (ffi.isString(ref_obj)) {
-            const ref_str = ffi.unicodeAsUTF8(ref_obj) catch {
-                c.PyErr_SetString(c.PyExc_TypeError, "module_ref must be valid UTF-8");
-                return null;
-            };
-            const ref_span = std.mem.span(ref_str);
-            if (ref_span.len > 0 and ref_span.len < state.module_ref.len) {
-                @memcpy(state.module_ref[0..ref_span.len], ref_span);
-                state.module_ref_len = @intCast(ref_span.len);
-            }
+        }
+        if (ref_span.len > 0) {
+            @memcpy(state.module_ref[0..ref_span.len], ref_span);
+            state.module_ref_len = @intCast(ref_span.len);
         }
     }
 
-    const host_span = std.mem.span(host_str);
-    const port: u16 = @intCast(port_long);
-    const threads: usize = @intCast(threads_long);
-
-    // Extract optional backlog (tuple index 4, default 2048)
     var backlog: u16 = 2048;
-    if (tuple_size >= 5) {
-        if (ffi.tupleGetItem(tuple, 4)) |obj| {
-            const bl = ffi.longAsLong(obj) catch {
-                c.PyErr_SetString(c.PyExc_TypeError, "backlog must be an integer");
-                return null;
-            };
-            if (bl < 1 or bl > 65535) {
-                c.PyErr_SetString(c.PyExc_ValueError, "backlog must be 1-65535");
-                return null;
-            }
-            backlog = @intCast(bl);
+    if (argc >= 5) {
+        const backlog_long = ffi.longAsLong(ffi.tupleGetItem(tuple, 4).?) catch return null;
+        if (backlog_long < 1 or backlog_long > 65535) {
+            c.PyErr_SetString(c.PyExc_ValueError, "backlog must be 1-65535");
+            return null;
         }
+        backlog = @intCast(backlog_long);
     }
 
-    // Set global module ref so driver can access state (temporary)
-    g_current_module = mod;
-    defer g_current_module = null;
-
-    // Start the server with Python handlers wired in.
-    driver.startServer(host_span, port, threads, backlog) catch {
-        c.PyErr_SetString(c.PyExc_RuntimeError, "failed to start server");
+    driver.startServer(mod, host_span, @intCast(port_long), @intCast(threads_long), backlog) catch {
         return null;
     };
-
     return ffi.getNone();
 }
 
-// ── Redis bridge ────────────────────────────────────────────────────
+fn redisGet(state: *SnekModuleState, key: *PyObject) ffi.PythonError!*PyObject {
+    const args = [_]*PyObject{key};
+    return future_mod.createRedisFuture("GET", &state.future_types, &args);
+}
 
-/// _snek.redis_command("GET", "key") or _snek.redis_command("SET", "key", "val")
-/// Uses the thread-local redis connection and tardy runtime for async I/O.
-/// Bulk string responses are received directly into PyBytes (zero-copy).
-fn pyRedisCommand(_: ?*PyObject, _: ?*PyObject) callconv(.c) ?*PyObject {
-    // TODO: async redis support for Python handlers
-    c.PyErr_SetString(c.PyExc_RuntimeError, "redis_command: async path not yet implemented");
-    return null;
+fn redisSet(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createRedisFuture("SET", &state.future_types, args[0..count]);
+}
+
+fn redisSetex(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createRedisFuture("SETEX", &state.future_types, args[0..count]);
+}
+
+fn redisDel(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createRedisFuture("DEL", &state.future_types, args[0..count]);
+}
+
+fn redisIncr(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createRedisFuture("INCR", &state.future_types, args[0..count]);
+}
+
+fn redisExpire(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createRedisFuture("EXPIRE", &state.future_types, args[0..count]);
+}
+
+fn redisTtl(state: *SnekModuleState, key: *PyObject) ffi.PythonError!*PyObject {
+    const args = [_]*PyObject{key};
+    return future_mod.createRedisFuture("TTL", &state.future_types, &args);
+}
+
+fn redisExists(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createRedisFuture("EXISTS", &state.future_types, args[0..count]);
+}
+
+fn redisPing(state: *SnekModuleState) ffi.PythonError!*PyObject {
+    const args = [_]*PyObject{};
+    return future_mod.createRedisFuture("PING", &state.future_types, &args);
+}
+
+fn pgExecute(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createPgFuture(.execute, &state.future_types, args[0..count]);
+}
+
+fn pgFetchOne(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createPgFuture(.fetch_one, &state.future_types, args[0..count]);
+}
+
+fn pgFetchAll(state: *SnekModuleState, args: [*]const *PyObject, nargs: c.Py_ssize_t) ffi.PythonError!*PyObject {
+    const count: usize = @intCast(nargs);
+    return future_mod.createPgFuture(.fetch_all, &state.future_types, args[0..count]);
+}
+
+fn getRouteCount(state: *SnekModuleState) ffi.PythonError!*PyObject {
+    return ffi.longFromLong(@intCast(state.py_handler_count));
 }
 
 // ── Module definition (multi-phase init, PEP 489) ───────────────────
 
-fn pyGetRouteCountImpl(mod: *PyObject) ffi.PythonError!*PyObject {
-    const state = getState(mod) orelse return error.PythonError;
-    return ffi.longFromLong(@intCast(state.py_handler_count));
-}
-
-var methods = [_]c.PyMethodDef{
-    ffi.wrapVarArgs("add_route", &pyAddRoute),
-    ffi.wrapVarArgs("run", &pyRun),
-    ffi.wrapNoArgsModule("get_route_count", pyGetRouteCountImpl),
-    ffi.wrapVarArgs("redis_command", &pyRedisCommand),
+const methods = [_]c.PyMethodDef{
+    .{ .ml_name = "add_route", .ml_meth = @ptrCast(&pyAddRoute), .ml_flags = c.METH_VARARGS, .ml_doc = null },
+    .{ .ml_name = "run", .ml_meth = @ptrCast(&pyRun), .ml_flags = c.METH_VARARGS, .ml_doc = null },
+    ffi.wrapStateMethod("get_route_count", SnekModuleState, .noargs, getRouteCount),
+    ffi.wrapStateMethod("redis_get", SnekModuleState, .onearg, redisGet),
+    ffi.wrapStateMethod("redis_set", SnekModuleState, .fastcall, redisSet),
+    ffi.wrapStateMethod("redis_setex", SnekModuleState, .fastcall, redisSetex),
+    ffi.wrapStateMethod("redis_del", SnekModuleState, .fastcall, redisDel),
+    ffi.wrapStateMethod("redis_incr", SnekModuleState, .fastcall, redisIncr),
+    ffi.wrapStateMethod("redis_expire", SnekModuleState, .fastcall, redisExpire),
+    ffi.wrapStateMethod("redis_ttl", SnekModuleState, .onearg, redisTtl),
+    ffi.wrapStateMethod("redis_exists", SnekModuleState, .fastcall, redisExists),
+    ffi.wrapStateMethod("redis_ping", SnekModuleState, .noargs, redisPing),
+    ffi.wrapStateMethod("pg_execute", SnekModuleState, .fastcall, pgExecute),
+    ffi.wrapStateMethod("pg_fetch_one", SnekModuleState, .fastcall, pgFetchOne),
+    ffi.wrapStateMethod("pg_fetch_all", SnekModuleState, .fastcall, pgFetchAll),
+    ffi.wrapStateMethod("pg_fetch_one_model", SnekModuleState, .fastcall, pgFetchOne),
+    ffi.wrapStateMethod("pg_fetch_all_model", SnekModuleState, .fastcall, pgFetchAll),
     std.mem.zeroes(c.PyMethodDef), // sentinel
 };
 
@@ -564,9 +415,14 @@ fn snekModuleExec(mod: ?*PyObject) callconv(.c) c_int {
     state.py_handlers = .{null} ** MAX_HANDLERS;
     state.py_handler_count = 0;
     state.handler_flags = .{HandlerFlags{}} ** MAX_HANDLERS;
+    state.future_types = .{};
     // route_entries don't need zeroing — only valid up to py_handler_count
     state.module_ref = .{0} ** 256;
     state.module_ref_len = 0;
+    future_mod.initTypes(m, &state.future_types) catch {
+        if (!ffi.errOccurred()) c.PyErr_SetString(c.PyExc_RuntimeError, "failed to initialize _snek future types");
+        return -1;
+    };
     return 0;
 }
 
@@ -575,6 +431,7 @@ fn snekModuleExec(mod: ?*PyObject) callconv(.c) c_int {
 fn snekModuleTraverse(mod: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const m = mod orelse return 0;
     const state: *SnekModuleState = getState(m) orelse return 0;
+    if (future_mod.traverseTypes(&state.future_types, visit, arg) != 0) return -1;
     var i: u32 = 0;
     while (i < state.py_handler_count) : (i += 1) {
         if (state.py_handlers[i]) |handler| {
@@ -588,6 +445,7 @@ fn snekModuleTraverse(mod: ?*PyObject, visit: c.visitproc, arg: ?*anyopaque) cal
 fn snekModuleClear(mod: ?*PyObject) callconv(.c) c_int {
     const m = mod orelse return 0;
     const state: *SnekModuleState = getState(m) orelse return 0;
+    future_mod.clearTypes(&state.future_types);
     var i: u32 = 0;
     while (i < MAX_HANDLERS) : (i += 1) {
         if (state.py_handlers[i]) |handler| {
@@ -608,7 +466,7 @@ fn snekModuleFree(mod_ptr: ?*anyopaque) callconv(.c) void {
 
 // ── Module slots (multi-phase init) ─────────────────────────────────
 
-var module_slots = [_]c.PyModuleDef_Slot{
+const module_slots = [_]c.PyModuleDef_Slot{
     .{ .slot = c.Py_mod_exec, .value = @ptrCast(@constCast(&snekModuleExec)) },
     .{ .slot = c.Py_mod_multiple_interpreters, .value = c.Py_MOD_PER_INTERPRETER_GIL_SUPPORTED },
     .{ .slot = 0, .value = null }, // sentinel
@@ -704,95 +562,6 @@ test "add_route stores handler" {
     const entry = state.route_entries[0];
     try std.testing.expect(std.mem.eql(u8, entry.method[0..entry.method_len], "GET"));
     try std.testing.expect(std.mem.eql(u8, entry.path[0..entry.path_len], "/test"));
-}
-
-test "add_route stores str response hint from annotation" {
-    registerBuiltin();
-    ffi.init();
-    defer ffi.deinit();
-
-    const mod = try ffi.importModule("_snek");
-    defer ffi.decref(mod);
-    defer releaseHandlers(mod);
-
-    try ffi.runString(
-        \\import _snek
-        \\def hello() -> str:
-        \\    return "ok"
-        \\_snek.add_route("GET", "/text", hello)
-    );
-
-    const state = getState(mod).?;
-    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
-    try std.testing.expectEqual(@intFromEnum(ResponseHint.str), state.handler_flags[0].response_hint);
-}
-
-test "add_route stores stringified str response hint from annotation" {
-    registerBuiltin();
-    ffi.init();
-    defer ffi.deinit();
-
-    const mod = try ffi.importModule("_snek");
-    defer ffi.decref(mod);
-    defer releaseHandlers(mod);
-
-    try ffi.runString(
-        \\from __future__ import annotations
-        \\import _snek
-        \\def hello() -> "str":
-        \\    return "ok"
-        \\_snek.add_route("GET", "/text", hello)
-    );
-
-    const state = getState(mod).?;
-    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
-    try std.testing.expectEqual(@intFromEnum(ResponseHint.str), state.handler_flags[0].response_hint);
-}
-
-test "add_route stores bytes response hint from annotation" {
-    registerBuiltin();
-    ffi.init();
-    defer ffi.deinit();
-
-    const mod = try ffi.importModule("_snek");
-    defer ffi.decref(mod);
-    defer releaseHandlers(mod);
-
-    try ffi.runString(
-        \\import _snek
-        \\def hello() -> bytes:
-        \\    return b"ok"
-        \\_snek.add_route("GET", "/bytes", hello)
-    );
-
-    const state = getState(mod).?;
-    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
-    try std.testing.expectEqual(@intFromEnum(ResponseHint.bytes), state.handler_flags[0].response_hint);
-}
-
-test "add_route stores row_json response hint from model annotation" {
-    registerBuiltin();
-    ffi.init();
-    defer ffi.deinit();
-
-    const mod = try ffi.importModule("_snek");
-    defer ffi.decref(mod);
-    defer releaseHandlers(mod);
-
-    try ffi.runString(
-        \\import _snek
-        \\class MyModel:
-        \\    @classmethod
-        \\    def _snek_from_row(cls, row):
-        \\        return cls()
-        \\def hello() -> MyModel:
-        \\    return MyModel()
-        \\_snek.add_route("GET", "/model", hello)
-    );
-
-    const state = getState(mod).?;
-    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
-    try std.testing.expectEqual(@intFromEnum(ResponseHint.row_json), state.handler_flags[0].response_hint);
 }
 
 test "add_route rejects non-callable" {

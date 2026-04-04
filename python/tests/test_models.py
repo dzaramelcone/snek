@@ -100,7 +100,6 @@ def test_pg_backed_model_decodes_lazily() -> None:
     assert user.tags == ["alpha", "beta"]
     assert user.created_at == datetime(2024, 1, 2, 3, 4, 5)
     assert user.raw("id").tobytes() == b"42"
-    assert user._snek_is_clean() is True
     assert user.model_dump() == {
         "id": 42,
         "active": True,
@@ -123,7 +122,7 @@ def test_pg_backed_nested_models_decode_lazily() -> None:
     assert joined.thesis.id == 2
     assert joined.thesis.title == "thesis"
     assert joined.thesis_count == 7
-    assert joined._snek_is_clean() is True
+    assert joined.raw("thesis_count").tobytes() == b"7"
     assert joined.model_dump() == {
         "idea": {"id": 1, "name": "idea"},
         "thesis": {"id": 2, "title": "thesis"},
@@ -153,11 +152,10 @@ def test_pg_backed_model_assignment_marks_it_dirty() -> None:
     )
 
     user = User._snek_from_row(row)
-    assert user._snek_is_clean() is True
+    assert user.raw("id").tobytes() == b"42"
 
     user.id = 99
 
-    assert user._snek_is_clean() is False
     assert user.model_dump()["id"] == 99
 
 
@@ -197,12 +195,17 @@ def test_pg_backed_list_mutation_marks_it_dirty() -> None:
     user = User._snek_from_row(row)
     tags = user.tags
 
-    assert user._snek_is_clean() is True
+    assert user.raw("id").tobytes() == b"42"
 
     tags.append("gamma")
 
-    assert user._snek_is_clean() is False
     assert user.model_dump()["tags"] == ["alpha", "beta", "gamma"]
+    try:
+        user.raw("id")
+    except RuntimeError as exc:
+        assert "mutated" in str(exc)
+    else:
+        raise AssertionError("expected raw() to reject mutated list-backed models")
 
 
 def test_nested_child_mutation_marks_parent_dirty() -> None:
@@ -214,9 +217,14 @@ def test_nested_child_mutation_marks_parent_dirty() -> None:
     joined = JoinedRow._snek_from_row(row)
     idea = joined.idea
 
-    assert joined._snek_is_clean() is True
+    assert joined.raw("thesis_count").tobytes() == b"7"
 
     idea.name = "changed"
 
-    assert joined._snek_is_clean() is False
     assert joined.model_dump()["idea"] == {"id": 1, "name": "changed"}
+    try:
+        joined.raw("thesis_count")
+    except RuntimeError as exc:
+        assert "mutated" in str(exc)
+    else:
+        raise AssertionError("expected raw() to reject mutated nested models")

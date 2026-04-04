@@ -1,32 +1,18 @@
-//! HTTP/1.1 request parser and response serializer.
+//! HTTP/1.1 request parser.
 //!
-//! Parser takes a complete header block as []const u8, tokenizes in one pass.
+//! Takes a complete header block as []const u8, tokenizes in one pass.
 //! All parsed fields are slices into the input — zero copy, zero allocation.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const http = std.http;
-
 pub const MAX_HEADERS: usize = 64;
-pub const MAX_RESP_HEADERS: usize = 64;
 
-pub const Method = enum {
-    GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE,
+const COMMON_RESPONSE_HDR_CAP = 64;
 
-    pub fn fromBytes(bytes: []const u8) ?Method {
-        if (bytes.len < 3 or bytes.len > 7) return null;
-        if (std.mem.eql(u8, bytes, "GET")) return .GET;
-        if (std.mem.eql(u8, bytes, "POST")) return .POST;
-        if (std.mem.eql(u8, bytes, "PUT")) return .PUT;
-        if (std.mem.eql(u8, bytes, "DELETE")) return .DELETE;
-        if (std.mem.eql(u8, bytes, "PATCH")) return .PATCH;
-        if (std.mem.eql(u8, bytes, "HEAD")) return .HEAD;
-        if (std.mem.eql(u8, bytes, "OPTIONS")) return .OPTIONS;
-        if (std.mem.eql(u8, bytes, "CONNECT")) return .CONNECT;
-        if (std.mem.eql(u8, bytes, "TRACE")) return .TRACE;
-        return null;
-    }
-};
+threadlocal var cached_common_response_hdr: [COMMON_RESPONSE_HDR_CAP]u8 = undefined;
+threadlocal var cached_common_response_len: usize = 0;
+threadlocal var cached_common_response_epoch: i64 = 0;
+
+pub const Method = std.http.Method;
 
 pub const Header = struct {
     name: []const u8,
@@ -65,7 +51,7 @@ pub const Request = struct {
         var chunks = std.mem.tokenizeScalar(u8, request_line, ' ');
 
         const method_str = chunks.next() orelse return error.MalformedRequest;
-        req.method = Method.fromBytes(method_str) orelse return error.BadMethod;
+        req.method = std.meta.stringToEnum(Method, method_str) orelse return error.BadMethod;
         req.method_bytes = method_str;
 
         const uri = chunks.next() orelse return error.MalformedRequest;
@@ -115,6 +101,47 @@ pub const Request = struct {
     }
 };
 
+fn refreshCommonResponseHeaders() void {
+    const now = std.time.timestamp();
+    if (now == cached_common_response_epoch and cached_common_response_len > 0) return;
+    cached_common_response_epoch = now;
+
+    const epoch_secs: u64 = @intCast(now);
+    const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+    const day_secs = es.getDaySeconds();
+    const year_day = es.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const days_since_epoch = es.getEpochDay().day;
+    const dow = @mod(days_since_epoch + 3, 7);
+
+    const hour = day_secs.getHoursIntoDay();
+    const minute = day_secs.getMinutesIntoHour();
+    const second = day_secs.getSecondsIntoMinute();
+
+    cached_common_response_len = (std.fmt.bufPrint(
+        &cached_common_response_hdr,
+        "Server: snek\r\nDate: {s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT\r\n",
+        .{
+            day_names[dow],
+            month_day.day_index + 1,
+            month_names[month_day.month.numeric() - 1],
+            year_day.year,
+            hour,
+            minute,
+            second,
+        },
+    ) catch &.{}).len;
+}
+
+pub fn commonResponseHeaders() []const u8 {
+    refreshCommonResponseHeaders();
+    return cached_common_response_hdr[0..cached_common_response_len];
+}
+
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |ca, cb| {
@@ -123,127 +150,6 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (la != lb) return false;
     }
     return true;
-}
-
-
-// --- Response ---
-
-pub const Response = struct {
-    status: http.Status,
-    headers: [MAX_RESP_HEADERS]Header,
-    header_count: usize,
-    body: ?[]const u8,
-
-    pub fn init(status: http.Status) Response {
-        return .{ .status = status, .headers = undefined, .header_count = 0, .body = null };
-    }
-
-    pub fn json(body_str: []const u8) Response {
-        var r = init(.ok);
-        r.setContentType("application/json");
-        r.body = body_str;
-        return r;
-    }
-
-    pub fn text(body_str: []const u8) Response {
-        var r = init(.ok);
-        r.setContentType("text/plain");
-        r.body = body_str;
-        return r;
-    }
-
-    pub fn notFound() Response {
-        return init(.not_found);
-    }
-
-    pub fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
-        if (self.header_count >= MAX_RESP_HEADERS) return;
-        self.headers[self.header_count] = .{ .name = name, .value = value };
-        self.header_count += 1;
-    }
-
-    pub fn setContentType(self: *Response, ct: []const u8) void {
-        self.setHeader("Content-Type", ct);
-    }
-
-    pub fn setBody(self: *Response, b: []const u8) void {
-        self.body = b;
-    }
-
-    pub fn serialize(self: *const Response, out: []u8) error{ BufferTooSmall, UnsupportedStatus }!usize {
-        var pos: usize = 0;
-
-        const sl = try statusLine(self.status);
-        if (pos + sl.len > out.len) return error.BufferTooSmall;
-        @memcpy(out[pos..][0..sl.len], sl);
-        pos += sl.len;
-
-        // Content-Length header (auto)
-        if (self.body) |b| {
-            const cl_header = "Content-Length: ";
-            if (pos + cl_header.len > out.len) return error.BufferTooSmall;
-            @memcpy(out[pos..][0..cl_header.len], cl_header);
-            pos += cl_header.len;
-            const cl_str = std.fmt.bufPrint(out[pos..], "{d}", .{b.len}) catch return error.BufferTooSmall;
-            pos += cl_str.len;
-            if (pos + 2 > out.len) return error.BufferTooSmall;
-            out[pos] = '\r';
-            out[pos + 1] = '\n';
-            pos += 2;
-        }
-
-        for (self.headers[0..self.header_count]) |h| {
-            const needed = h.name.len + 2 + h.value.len + 2;
-            if (pos + needed > out.len) return error.BufferTooSmall;
-            @memcpy(out[pos..][0..h.name.len], h.name);
-            pos += h.name.len;
-            out[pos] = ':';
-            out[pos + 1] = ' ';
-            pos += 2;
-            @memcpy(out[pos..][0..h.value.len], h.value);
-            pos += h.value.len;
-            out[pos] = '\r';
-            out[pos + 1] = '\n';
-            pos += 2;
-        }
-
-        if (pos + 2 > out.len) return error.BufferTooSmall;
-        out[pos] = '\r';
-        out[pos + 1] = '\n';
-        pos += 2;
-
-        if (self.body) |b| {
-            if (pos + b.len > out.len) return error.BufferTooSmall;
-            @memcpy(out[pos..][0..b.len], b);
-            pos += b.len;
-        }
-
-        return pos;
-    }
-};
-
-pub fn statusLine(status: http.Status) error{UnsupportedStatus}![]const u8 {
-    return switch (status) {
-        .ok => "HTTP/1.1 200 OK\r\n",
-        .created => "HTTP/1.1 201 Created\r\n",
-        .no_content => "HTTP/1.1 204 No Content\r\n",
-        .moved_permanently => "HTTP/1.1 301 Moved Permanently\r\n",
-        .found => "HTTP/1.1 302 Found\r\n",
-        .not_modified => "HTTP/1.1 304 Not Modified\r\n",
-        .bad_request => "HTTP/1.1 400 Bad Request\r\n",
-        .unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
-        .forbidden => "HTTP/1.1 403 Forbidden\r\n",
-        .not_found => "HTTP/1.1 404 Not Found\r\n",
-        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
-        .payload_too_large => "HTTP/1.1 413 Content Too Large\r\n",
-        .teapot => "HTTP/1.1 418 I'm a Teapot\r\n",
-        .too_many_requests => "HTTP/1.1 429 Too Many Requests\r\n",
-        .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
-        .bad_gateway => "HTTP/1.1 502 Bad Gateway\r\n",
-        .service_unavailable => "HTTP/1.1 503 Service Unavailable\r\n",
-        .gateway_timeout => "HTTP/1.1 504 Gateway Timeout\r\n",
-        else => return error.UnsupportedStatus,
-    };
 }
 
 // --- Tests ---
@@ -300,13 +206,16 @@ test "keepalive detection" {
     }
 }
 
-test "serialize response" {
-    var resp = Response.init(.ok);
-    resp.setContentType("text/plain");
-    resp.body = "hello";
+test "cached common response headers" {
+    const hdr = commonResponseHeaders();
+    try std.testing.expect(hdr.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, hdr, "Server: snek\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, hdr, "Date:") != null);
+    try std.testing.expect(std.mem.endsWith(u8, hdr, "GMT\r\n"));
+}
 
-    var out: [4096]u8 = undefined;
-    const n = try resp.serialize(&out);
-    const expected = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello";
-    try std.testing.expectEqualStrings(expected, out[0..n]);
+test "cached response headers stable within same second" {
+    const a = commonResponseHeaders();
+    const b = commonResponseHeaders();
+    try std.testing.expectEqualStrings(a, b);
 }

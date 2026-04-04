@@ -285,24 +285,6 @@ pub fn encodeStartupMessage(buf: []u8, user: []const u8, database: []const u8) [
     return buf[0..pos];
 }
 
-/// Encode a simple Query message ('Q').
-/// Format: tag('Q') + length(u32) + sql + '\0'
-pub fn encodeQuery(buf: []u8, sql: []const u8) []const u8 {
-    const length: u32 = @intCast(4 + sql.len + 1); // length includes itself + sql + null
-    var pos: usize = 0;
-
-    buf[pos] = Tag.query;
-    pos += 1;
-    @memcpy(buf[pos..][0..4], &mem.toBytes(mem.nativeTo(u32, length, .big)));
-    pos += 4;
-    @memcpy(buf[pos..][0..sql.len], sql);
-    pos += sql.len;
-    buf[pos] = 0;
-    pos += 1;
-
-    return buf[0..pos];
-}
-
 /// Encode a PasswordMessage ('p').
 /// Format: tag('p') + length(u32) + password + '\0'
 pub fn encodePasswordMessage(buf: []u8, password: []const u8) []const u8 {
@@ -319,14 +301,6 @@ pub fn encodePasswordMessage(buf: []u8, password: []const u8) []const u8 {
     pos += 1;
 
     return buf[0..pos];
-}
-
-/// Encode a Terminate message ('X').
-/// Format: tag('X') + length(4) = 5 bytes total
-pub fn encodeTerminate(buf: []u8) []const u8 {
-    buf[0] = Tag.terminate;
-    @memcpy(buf[1..5], &mem.toBytes(mem.nativeTo(u32, @as(u32, 4), .big)));
-    return buf[0..5];
 }
 
 // ─── Extended query protocol ─────────────────────────────────────────
@@ -374,12 +348,6 @@ pub fn encodeDescribe(buf: []u8, kind: u8, name: []const u8) []const u8 {
     pos += 1;
 
     return buf[0..pos];
-}
-
-/// Encode a Bind message ('B'): bind a prepared statement to a portal (no params).
-/// Format: tag('B') + length + portal\0 + stmt\0 + 0(u16 format codes) + 0(u16 params) + 0(u16 result formats)
-pub fn encodeBind(buf: []u8, stmt_name: []const u8) []const u8 {
-    return encodeBindWithParams(buf, stmt_name, &.{});
 }
 
 /// Encode a Bind message with text-format parameters.
@@ -561,57 +529,6 @@ pub fn parseCommandComplete(payload: []const u8) []const u8 {
     return payload[0..end];
 }
 
-/// Parse an ErrorResponse or NoticeResponse payload.
-/// Format: repeated (field_code(u8) + value(null-terminated)), terminated by '\0'.
-pub fn parseErrorFields(payload: []const u8) ErrorNotice {
-    var result = ErrorNotice{
-        .severity = "",
-        .code = "",
-        .message = "",
-        .detail = null,
-        .hint = null,
-        .position = null,
-    };
-
-    var pos: usize = 0;
-    while (pos < payload.len) {
-        const field_byte = payload[pos];
-        if (field_byte == 0) break;
-        pos += 1;
-
-        const val_start = pos;
-        while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
-        const val = payload[val_start..pos];
-        if (pos < payload.len) pos += 1; // skip null
-
-        switch (field_byte) {
-            'S' => result.severity = val,
-            'C' => result.code = val,
-            'M' => result.message = val,
-            'D' => result.detail = val,
-            'H' => result.hint = val,
-            'P' => result.position = val,
-            else => {}, // ignore unknown fields
-        }
-    }
-    return result;
-}
-
-/// Parse a ParameterStatus payload: name(null-terminated) + value(null-terminated).
-pub fn parseParameterStatus(payload: []const u8) struct { name: []const u8, value: []const u8 } {
-    var pos: usize = 0;
-    // Find name
-    const name_start = pos;
-    while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
-    const name = payload[name_start..pos];
-    if (pos < payload.len) pos += 1;
-    // Find value
-    const val_start = pos;
-    while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
-    const value = payload[val_start..pos];
-    return .{ .name = name, .value = value };
-}
-
 /// Parse the auth type from an Authentication message payload (first 4 bytes after header).
 pub fn parseAuthType(payload: []const u8) WireError!AuthType {
     if (payload.len < 4) return WireError.ProtocolViolation;
@@ -623,115 +540,6 @@ pub fn parseAuthType(payload: []const u8) WireError!AuthType {
 pub fn parseMd5Salt(payload: []const u8) WireError![4]u8 {
     if (payload.len < 8) return WireError.ProtocolViolation;
     return payload[4..8].*;
-}
-
-// ─── Generic-over-IO wire connection (stub retained for future phases) ─
-// Full implementation deferred to when the IO abstraction layer is ready.
-// Phase 10 MVP uses std.posix directly in query.zig instead.
-
-pub fn WireConnectionType(comptime IO: type) type {
-    return struct {
-        const Self = @This();
-
-        io: *IO,
-        fd: i32,
-        server_params: ServerParams,
-        process_id: u32,
-        secret_key: u32,
-        tx_status: TransactionStatus,
-
-        pub fn sslNegotiate(self: *Self) !bool {
-            _ = self;
-            @panic("WireConnectionType.sslNegotiate: not yet implemented — use query.Client for MVP");
-        }
-
-        pub fn startup(self: *Self, user: []const u8, database: []const u8) !void {
-            _ = .{ self, user, database };
-            @panic("WireConnectionType.startup: not yet implemented — use query.Client for MVP");
-        }
-
-        pub fn authenticate(self: *Self, password: []const u8) !void {
-            _ = .{ self, password };
-            @panic("WireConnectionType.authenticate: not yet implemented — use query.Client for MVP");
-        }
-
-        pub fn sendQuery(self: *Self, sql: []const u8) !void {
-            _ = .{ self, sql };
-            @panic("WireConnectionType.sendQuery: not yet implemented — use query.Client for MVP");
-        }
-
-        pub fn sendParse(self: *Self, name: []const u8, sql: []const u8, param_oids: []const u32) !void {
-            _ = .{ self, name, sql, param_oids };
-            @panic("WireConnectionType.sendParse: not yet implemented");
-        }
-
-        pub fn sendBind(self: *Self, portal: []const u8, statement: []const u8, params: []const ?[]const u8, format_codes: []const u16) !void {
-            _ = .{ self, portal, statement, params, format_codes };
-            @panic("WireConnectionType.sendBind: not yet implemented");
-        }
-
-        pub fn sendExecute(self: *Self, portal: []const u8, max_rows: u32) !void {
-            _ = .{ self, portal, max_rows };
-            @panic("WireConnectionType.sendExecute: not yet implemented");
-        }
-
-        pub fn sendDescribe(self: *Self, kind: u8, name: []const u8) !void {
-            _ = .{ self, kind, name };
-            @panic("WireConnectionType.sendDescribe: not yet implemented");
-        }
-
-        pub fn sendSync(self: *Self) !void {
-            _ = self;
-            @panic("WireConnectionType.sendSync: not yet implemented");
-        }
-
-        pub fn sendFlush(self: *Self) !void {
-            _ = self;
-            @panic("WireConnectionType.sendFlush: not yet implemented");
-        }
-
-        pub fn sendTerminate(self: *Self) !void {
-            _ = self;
-            @panic("WireConnectionType.sendTerminate: not yet implemented");
-        }
-
-        pub fn readMessage(self: *Self) !MessageHeader {
-            _ = self;
-            @panic("WireConnectionType.readMessage: not yet implemented");
-        }
-
-        pub fn parseErrorResponse(self: *Self, payload: []const u8) ErrorNotice {
-            _ = self;
-            return parseErrorFields(payload);
-        }
-
-        pub fn parseNoticeResponse(self: *Self, payload: []const u8) ErrorNotice {
-            _ = self;
-            return parseErrorFields(payload);
-        }
-
-        pub fn parseNotification(self: *Self, payload: []const u8) Notification {
-            _ = self;
-            if (payload.len < 4) @panic("parseNotification: payload too short");
-            const pid = mem.bigToNative(u32, mem.bytesToValue(u32, payload[0..4]));
-            var pos: usize = 4;
-            const ch_start = pos;
-            while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
-            const channel = payload[ch_start..pos];
-            if (pos < payload.len) pos += 1;
-            const pl_start = pos;
-            while (pos < payload.len and payload[pos] != 0) : (pos += 1) {}
-            return .{ .pid = pid, .channel = channel, .payload = payload[pl_start..pos] };
-        }
-
-        pub fn handleParameterStatus(self: *Self, payload: []const u8) void {
-            _ = .{ self, payload };
-        }
-
-        pub fn close(self: *Self) void {
-            _ = self;
-        }
-    };
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -775,18 +583,6 @@ test "startup message encoding" {
     try std.testing.expectEqual(msg[36], 0);
 }
 
-test "query message encoding" {
-    var buf: [256]u8 = undefined;
-    const msg = encodeQuery(&buf, "SELECT 1");
-
-    try std.testing.expectEqual(msg[0], Tag.query);
-    const length = mem.bigToNative(u32, mem.bytesToValue(u32, msg[1..5]));
-    // length = 4 (self) + 8 (sql) + 1 (null) = 13
-    try std.testing.expectEqual(length, 13);
-    try std.testing.expectEqualStrings("SELECT 1", msg[5..13]);
-    try std.testing.expectEqual(msg[13], 0);
-}
-
 test "password message encoding" {
     var buf: [256]u8 = undefined;
     const msg = encodePasswordMessage(&buf, "secret");
@@ -796,16 +592,6 @@ test "password message encoding" {
     try std.testing.expectEqual(length, 11); // 4 + 6 + 1
     try std.testing.expectEqualStrings("secret", msg[5..11]);
     try std.testing.expectEqual(msg[11], 0);
-}
-
-test "terminate message encoding" {
-    var buf: [8]u8 = undefined;
-    const msg = encodeTerminate(&buf);
-
-    try std.testing.expectEqual(msg.len, 5);
-    try std.testing.expectEqual(msg[0], Tag.terminate);
-    const length = mem.bigToNative(u32, mem.bytesToValue(u32, msg[1..5]));
-    try std.testing.expectEqual(length, 4);
 }
 
 test "message header parsing" {
@@ -946,38 +732,6 @@ test "command complete parsing" {
     const payload = "SELECT 42\x00";
     const tag = parseCommandComplete(payload);
     try std.testing.expectEqualStrings("SELECT 42", tag);
-}
-
-test "error response field parsing" {
-    // Build an ErrorResponse payload
-    const payload = "SERROR\x00" ++ "C42601\x00" ++ "Msyntax error\x00" ++ "Dsome detail\x00" ++ "Htry this\x00" ++ "\x00";
-    const err = parseErrorFields(payload);
-
-    try std.testing.expectEqualStrings("ERROR", err.severity);
-    try std.testing.expectEqualStrings("42601", err.code);
-    try std.testing.expectEqualStrings("syntax error", err.message);
-    try std.testing.expectEqualStrings("some detail", err.detail.?);
-    try std.testing.expectEqualStrings("try this", err.hint.?);
-    try std.testing.expect(err.position == null);
-}
-
-test "error response minimal fields" {
-    // Only severity, code, message — no optional fields
-    const payload = "SERROR\x00" ++ "C42000\x00" ++ "Mfailed\x00" ++ "\x00";
-    const err = parseErrorFields(payload);
-
-    try std.testing.expectEqualStrings("ERROR", err.severity);
-    try std.testing.expectEqualStrings("42000", err.code);
-    try std.testing.expectEqualStrings("failed", err.message);
-    try std.testing.expect(err.detail == null);
-    try std.testing.expect(err.hint == null);
-}
-
-test "parameter status parsing" {
-    const payload = "server_version\x00" ++ "16.2\x00";
-    const ps = parseParameterStatus(payload);
-    try std.testing.expectEqualStrings("server_version", ps.name);
-    try std.testing.expectEqualStrings("16.2", ps.value);
 }
 
 test "auth type parsing" {

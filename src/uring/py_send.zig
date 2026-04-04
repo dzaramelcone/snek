@@ -5,7 +5,7 @@ const response_mod = @import("../http/response.zig");
 const result_lease = @import("../db/result_lease.zig");
 const ResultLease = result_lease.ResultLease;
 const SlabPool = result_lease.SlabPool;
-const row_json = @import("../python/row_json.zig");
+const py_json = @import("../python/py_json.zig");
 
 pub const PyBodyHold = struct {
     owner: ?*PyObject = null,
@@ -79,15 +79,15 @@ fn prepareText(py_result: *PyObject) PrepareError!Prepared {
     };
 }
 
-fn tryPrepareRowJson(py_result: *PyObject, body_buf: []u8, pool: *SlabPool) PrepareError!?Prepared {
+fn prepareJson(py_result: *PyObject, body_buf: []u8, pool: *SlabPool) PrepareError!Prepared {
     var pos: usize = 0;
-    const wrote = row_json.tryWrite(py_result, body_buf, &pos) catch |err| switch (err) {
+    const wrote = py_json.tryWrite(py_result, body_buf, &pos) catch |err| switch (err) {
         error.BufferTooSmall => {
             var lease = try ResultLease.initOwned(pool);
             errdefer lease.release();
             var lease_pos: usize = 0;
-            const lease_wrote = try row_json.tryWrite(py_result, lease.bytes(), &lease_pos);
-            if (!lease_wrote) return null;
+            const lease_wrote = try py_json.tryWrite(py_result, lease.bytes(), &lease_pos);
+            if (!lease_wrote) return error.UnsupportedReturnType;
             return .{
                 .response = response_mod.Response.json(lease.constBytes()[0..lease_pos]),
                 .body_lease = lease,
@@ -95,7 +95,7 @@ fn tryPrepareRowJson(py_result: *PyObject, body_buf: []u8, pool: *SlabPool) Prep
         },
         else => return err,
     };
-    if (!wrote) return null;
+    if (!wrote) return error.UnsupportedReturnType;
     return Prepared.fromResponse(response_mod.Response.json(body_buf[0..pos]));
 }
 
@@ -122,8 +122,11 @@ pub fn prepare(
         else => return err,
     }
 
-    if (try tryPrepareRowJson(py_result, body_buf, pool)) |prepared| {
+    if (prepareJson(py_result, body_buf, pool)) |prepared| {
         return prepared;
+    } else |err| switch (err) {
+        error.UnsupportedReturnType => {},
+        else => return err,
     }
 
     return error.UnsupportedReturnType;

@@ -7,7 +7,6 @@ const std = @import("std");
 const ffi = @import("ffi.zig");
 const c = ffi.c;
 const module = @import("module.zig");
-const gil = @import("gil.zig");
 
 const log = std.log.scoped(.@"snek/subinterp");
 
@@ -67,7 +66,7 @@ pub const WorkerPyContext = struct {
         // Release sub-interpreter GIL. Each request will reacquire via
         // PyEval_RestoreThread which uses this interpreter's OWN GIL,
         // avoiding the global GIL state machine entirely.
-        const saved = gil.PyEval_SaveThread();
+        const saved = ffi.PyEval_SaveThread();
         log.debug("sub-interpreter created, GIL released", .{});
 
         return .{ .tstate = saved, .snek_module = snek_mod };
@@ -77,12 +76,12 @@ pub const WorkerPyContext = struct {
     /// Uses PyEval_RestoreThread (per-interpreter GIL), not PyGILState_Ensure (global).
     pub fn acquireGil(self: *WorkerPyContext) void {
         log.debug("acquiring sub-interp GIL", .{});
-        gil.PyEval_RestoreThread(self.tstate);
+        ffi.PyEval_RestoreThread(self.tstate);
     }
 
     /// Release this sub-interpreter's GIL, saving thread state for reacquisition.
     pub fn releaseGil(self: *WorkerPyContext) void {
-        self.tstate = gil.PyEval_SaveThread();
+        self.tstate = ffi.PyEval_SaveThread();
         log.debug("released sub-interp GIL", .{});
     }
 

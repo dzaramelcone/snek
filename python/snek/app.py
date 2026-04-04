@@ -1,7 +1,5 @@
 """snek application class with FastAPI-style decorators."""
 
-import types
-
 from snek import _snek
 
 
@@ -44,52 +42,40 @@ class App:
 
 
 class Redis:
-    @types.coroutine
     def get(self, key: str):
-        return (yield _snek.redis_get(key))
+        return _snek.redis_get(key)
 
-    @types.coroutine
     def set(self, key: str, value: str):
-        return (yield _snek.redis_set(key, value))
+        return _snek.redis_set(key, value)
 
-    @types.coroutine
     def setex(self, key: str, seconds: int, value: str):
-        return (yield _snek.redis_setex(key, str(seconds), value))
+        return _snek.redis_setex(key, str(seconds), value)
 
-    @types.coroutine
     def delete(self, *keys: str):
-        return (yield _snek.redis_del(*keys))
+        return _snek.redis_del(*keys)
 
-    @types.coroutine
     def incr(self, key: str):
-        return (yield _snek.redis_incr(key))
+        return _snek.redis_incr(key)
 
-    @types.coroutine
     def expire(self, key: str, seconds: int):
-        return (yield _snek.redis_expire(key, str(seconds)))
+        return _snek.redis_expire(key, str(seconds))
 
-    @types.coroutine
     def ttl(self, key: str):
-        return (yield _snek.redis_ttl(key))
+        return _snek.redis_ttl(key)
 
-    @types.coroutine
     def exists(self, *keys: str):
-        return (yield _snek.redis_exists(*keys))
+        return _snek.redis_exists(*keys)
 
-    @types.coroutine
     def ping(self):
-        return (yield _snek.redis_ping())
+        return _snek.redis_ping()
 
 
 class Db:
-    @types.coroutine
     def fetch_one(self, sql: str, *params):
-        return (yield _snek.pg_fetch_one(sql, params))
+        return _snek.pg_fetch_one(sql, params)
 
-    @types.coroutine
     def fetch_all(self, sql: str, *params):
-        return (yield _snek.pg_fetch_all(sql, params))
+        return _snek.pg_fetch_all(sql, params)
 
-    @types.coroutine
     def execute(self, sql: str, *params):
-        return (yield _snek.pg_execute(sql, params))
+        return _snek.pg_execute(sql, params)

@@ -155,7 +155,7 @@ pub fn writeJsonEscaped(output: []u8, input: []const u8) SerializeError!usize {
 pub fn writeJsonString(output: []u8, input: []const u8) SerializeError!usize {
     if (output.len < 2) return error.BufferOverflow;
     output[0] = '"';
-    const content_len = try writeJsonEscaped(output[1..], input);
+    const content_len = try writeJsonEscapedSpeculative(output[1..], input);
     if (1 + content_len >= output.len) return error.BufferOverflow;
     output[1 + content_len] = '"';
     return 2 + content_len;
@@ -308,6 +308,14 @@ pub const Serializer = struct {
         self.markNotFirst();
     }
 
+    pub fn unsigned(self: *Serializer, n: u64) SerializeError!void {
+        try self.writeCommaIfNeeded();
+        const result = std.fmt.bufPrint(self.buf[self.pos..], "{d}", .{n}) catch
+            return SerializeError.BufferOverflow;
+        self.pos += result.len;
+        self.markNotFirst();
+    }
+
     pub fn float(self: *Serializer, f: f64) SerializeError!void {
         try self.writeCommaIfNeeded();
         const result = std.fmt.bufPrint(self.buf[self.pos..], "{d}", .{f}) catch
@@ -332,6 +340,19 @@ pub const Serializer = struct {
     /// Get the written JSON output.
     pub fn output(self: *const Serializer) []const u8 {
         return self.buf[0..self.pos];
+    }
+
+    pub fn beginValue(self: *Serializer) SerializeError!usize {
+        try self.writeCommaIfNeeded();
+        return self.pos;
+    }
+
+    pub fn finishValue(self: *Serializer) void {
+        self.markNotFirst();
+    }
+
+    pub fn rewind(self: *Serializer, pos: usize) void {
+        self.pos = pos;
     }
 
     // -- internal helpers --

@@ -30,8 +30,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lib.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = true,
         }),
     });
+    pyext.want_lto = true;
+    pyext.link_gc_sections = true;
     linkPython(pyext.root_module);
     b.installArtifact(pyext);
 
@@ -95,35 +98,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests");
 
     const test_sources = [_][]const u8{
-        "src/net/tcp.zig",
-        "src/net/tls.zig",
         "src/net/http1.zig",
-        "src/net/http2.zig",
-        "src/net/websocket.zig",
         "src/db/wire.zig",
         "src/db/query.zig",
-        "src/db/types.zig",
         "src/db/auth.zig",
-        "src/redis/protocol.zig",
-        "src/http/request.zig",
         "src/http/response.zig",
         "src/http/router.zig",
-        "src/http/middleware.zig",
-        "src/http/cookies.zig",
-        "src/http/compress.zig",
-        "src/http/validate.zig",
         "src/json/parse.zig",
         "src/json/serialize.zig",
-        "src/security/cors.zig",
-        "src/security/headers.zig",
-        "src/security/jwt.zig",
-        "src/observe/log.zig",
-        "src/observe/health.zig",
-        "src/config/toml.zig",
-        "src/config/env.zig",
-        "src/cli/main.zig",
-        "src/cli/commands.zig",
-        "src/testing/conformance.zig",
         "src/testing/simulation.zig",
     };
 

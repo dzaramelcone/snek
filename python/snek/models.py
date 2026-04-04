@@ -16,81 +16,74 @@ from typing import Any, ClassVar, get_type_hints
 _model_registry: dict[str, type[Model]] = {}
 
 
-class _RowState:
-    __slots__ = ("dirty",)
-
-    def __init__(self) -> None:
-        self.dirty = False
-
-
 class _TrackedList(list[Any]):
-    __slots__ = ("_snek_state",)
+    __slots__ = ("_snek_root",)
 
-    def __init__(self, values: list[Any], state: _RowState) -> None:
+    def __init__(self, values: list[Any], root: "Model") -> None:
         super().__init__(values)
-        self._snek_state = state
+        self._snek_root = root
 
-    def _mark_dirty(self) -> None:
-        self._snek_state.dirty = True
+    def _detach_root(self) -> None:
+        object.__setattr__(self._snek_root, "_snek_attached_row", None)
 
     def __setitem__(self, index: Any, value: Any) -> None:
         if isinstance(index, slice):
-            value = [_track_mutable_value(item, self._snek_state) for item in value]
+            value = [_track_mutable_value(item, self._snek_root) for item in value]
         else:
-            value = _track_mutable_value(value, self._snek_state)
+            value = _track_mutable_value(value, self._snek_root)
         super().__setitem__(index, value)
-        self._mark_dirty()
+        self._detach_root()
 
     def __delitem__(self, index: Any) -> None:
         super().__delitem__(index)
-        self._mark_dirty()
+        self._detach_root()
 
     def __iadd__(self, values: Any) -> "_TrackedList":
-        values = [_track_mutable_value(item, self._snek_state) for item in values]
+        values = [_track_mutable_value(item, self._snek_root) for item in values]
         result = super().__iadd__(values)
-        self._mark_dirty()
+        self._detach_root()
         return result
 
     def __imul__(self, count: int) -> "_TrackedList":
         result = super().__imul__(count)
-        self._mark_dirty()
+        self._detach_root()
         return result
 
     def append(self, value: Any) -> None:
-        value = _track_mutable_value(value, self._snek_state)
+        value = _track_mutable_value(value, self._snek_root)
         super().append(value)
-        self._mark_dirty()
+        self._detach_root()
 
     def clear(self) -> None:
         super().clear()
-        self._mark_dirty()
+        self._detach_root()
 
     def extend(self, values: Any) -> None:
-        values = [_track_mutable_value(item, self._snek_state) for item in values]
+        values = [_track_mutable_value(item, self._snek_root) for item in values]
         super().extend(values)
-        self._mark_dirty()
+        self._detach_root()
 
     def insert(self, index: int, value: Any) -> None:
-        value = _track_mutable_value(value, self._snek_state)
+        value = _track_mutable_value(value, self._snek_root)
         super().insert(index, value)
-        self._mark_dirty()
+        self._detach_root()
 
     def pop(self, index: int = -1) -> Any:
         value = super().pop(index)
-        self._mark_dirty()
+        self._detach_root()
         return value
 
     def remove(self, value: Any) -> None:
         super().remove(value)
-        self._mark_dirty()
+        self._detach_root()
 
     def reverse(self) -> None:
         super().reverse()
-        self._mark_dirty()
+        self._detach_root()
 
     def sort(self, /, *args: Any, **kwargs: Any) -> None:
         super().sort(*args, **kwargs)
-        self._mark_dirty()
+        self._detach_root()
 
 
 class Model:
@@ -143,28 +136,25 @@ class Model:
             object.__setattr__(self, name, value)
 
     @classmethod
-    def _snek_from_row(cls, row: Any, state: _RowState | None = None) -> "Model":
+    def _snek_from_row(cls, row: Any, root: "Model | None" = None) -> "Model":
         obj = cls.__new__(cls)
         object.__setattr__(obj, "_snek_row", row)
-        object.__setattr__(obj, "_snek_state", state or _RowState())
+        if root is None:
+            object.__setattr__(obj, "_snek_attached_row", row)
+        else:
+            object.__setattr__(obj, "_snek_root", root)
         return obj
-
-    def _snek_is_clean(self) -> bool:
-        state = self.__dict__.get("_snek_state")
-        return state is None or not state.dirty
 
     def __setattr__(self, name: str, value: Any) -> None:
         if not name.startswith("_"):
-            state = self.__dict__.get("_snek_state")
-            if state is not None:
-                state.dirty = True
+            root = self.__dict__.get("_snek_root", self)
+            object.__setattr__(root, "_snek_attached_row", None)
         object.__setattr__(self, name, value)
 
     def __delattr__(self, name: str) -> None:
         if not name.startswith("_"):
-            state = self.__dict__.get("_snek_state")
-            if state is not None:
-                state.dirty = True
+            root = self.__dict__.get("_snek_root", self)
+            object.__setattr__(root, "_snek_attached_row", None)
         object.__delattr__(self, name)
 
     def __getattr__(self, name: str) -> Any:
@@ -179,7 +169,7 @@ class Model:
             if subrow is None:
                 object.__setattr__(self, name, None)
                 return None
-            value = model_cls._snek_from_row(subrow, self.__dict__.get("_snek_state"))
+            value = model_cls._snek_from_row(subrow, self.__dict__.get("_snek_root", self))
             object.__setattr__(self, name, value)
             return value
 
@@ -188,7 +178,7 @@ class Model:
             raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!r}")
 
         value = getattr(row, name)
-        coerced = _coerce_model_value(hint, value, self.__dict__.get("_snek_state"))
+        coerced = _coerce_model_value(hint, value, self.__dict__.get("_snek_root", self))
         object.__setattr__(self, name, coerced)
         return coerced
 
@@ -196,8 +186,8 @@ class Model:
         row = self.__dict__.get("_snek_row")
         if row is None:
             raise AttributeError("raw() is only available for PG-backed model instances")
-        state = self.__dict__.get("_snek_state")
-        if state is not None and state.dirty:
+        root = self.__dict__.get("_snek_root", self)
+        if root.__dict__.get("_snek_attached_row") is None:
             raise RuntimeError("raw() is unavailable after the model has been mutated")
         return row.raw(name)
 
@@ -292,13 +282,13 @@ def _is_classvar(hint: Any) -> bool:
     return typing.get_origin(hint) is ClassVar
 
 
-def _coerce_model_value(hint: Any, value: Any, state: _RowState | None = None) -> Any:
+def _coerce_model_value(hint: Any, value: Any, root: Model | None = None) -> Any:
     if value is None or hint is Any:
         return value
 
     origin = typing.get_origin(hint)
     if origin is typing.Annotated:
-        return _coerce_model_value(typing.get_args(hint)[0], value, state)
+        return _coerce_model_value(typing.get_args(hint)[0], value, root)
 
     if origin in (typing.Union, types.UnionType):
         args = typing.get_args(hint)
@@ -307,7 +297,7 @@ def _coerce_model_value(hint: Any, value: Any, state: _RowState | None = None) -
             return None
         for arg in non_none:
             try:
-                return _coerce_model_value(arg, value, state)
+                return _coerce_model_value(arg, value, root)
             except (TypeError, ValueError):
                 continue
         return value
@@ -316,13 +306,13 @@ def _coerce_model_value(hint: Any, value: Any, state: _RowState | None = None) -
         (item_hint,) = typing.get_args(hint) or (Any,)
         if isinstance(value, list):
             return _track_mutable_value(
-                [_coerce_model_value(item_hint, item, state) for item in value],
-                state,
+                [_coerce_model_value(item_hint, item, root) for item in value],
+                root,
             )
         items = _parse_pg_array_text(_to_text_value(value))
         return _track_mutable_value(
-            [_coerce_model_value(item_hint, item, state) for item in items],
-            state,
+            [_coerce_model_value(item_hint, item, root) for item in items],
+            root,
         )
 
     if isinstance(hint, type) and issubclass(hint, Model):
@@ -353,13 +343,13 @@ def _coerce_model_value(hint: Any, value: Any, state: _RowState | None = None) -
     return value
 
 
-def _track_mutable_value(value: Any, state: _RowState | None) -> Any:
-    if state is None:
+def _track_mutable_value(value: Any, root: Model | None) -> Any:
+    if root is None:
         return value
     if isinstance(value, _TrackedList):
         return value
     if isinstance(value, list):
-        return _TrackedList([_track_mutable_value(item, state) for item in value], state)
+        return _TrackedList([_track_mutable_value(item, root) for item in value], root)
     return value
 
 

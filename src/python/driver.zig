@@ -7,8 +7,7 @@ const std = @import("std");
 const ffi = @import("ffi.zig");
 const c = ffi.c;
 const PyObject = ffi.PyObject;
-const gil = @import("gil.zig");
-const future_mod = @import("future.zig");
+const future_mod = @import("futures/mod.zig");
 const module = @import("module.zig");
 const response_mod = @import("../http/response.zig");
 const router_mod = @import("../http/router.zig");
@@ -31,21 +30,8 @@ pub fn buildParamsKwargs(params: []const router_mod.PathParam) ffi.PythonError!*
 pub const InvokeResult = union(enum) {
     native_response: response_mod.Response,
     py_result: *PyObject,
-    redis_yield: RedisYield,
-    pg_yield: PgYield,
-
-    pub const RedisYield = struct {
-        py_coro: *PyObject,
-        bytes_written: usize,
-    };
-
-    pub const PgYield = struct {
-        py_coro: *PyObject,
-        bytes_written: usize,
-        cmd: PgCmd,
-        stmt_idx: u16,
-        model_cls: ?*PyObject,
-    };
+    redis_yield: future_mod.RedisYield,
+    pg_yield: future_mod.PgYield,
 };
 
 pub const InvokeMetrics = struct {
@@ -59,7 +45,7 @@ pub const InvokeMetrics = struct {
     ns_arg_build: u64 = 0,
     ns_call: u64 = 0,
     ns_resume: u64 = 0,
-    ns_sentinel: u64 = 0,
+    ns_yield_consume: u64 = 0,
 };
 
 fn nowInstant() ?std.time.Instant {
@@ -143,13 +129,18 @@ pub fn invokePythonHandlerWithKnownFlags(
 
         switch (send.status) {
             .next => {
-                const sentinel = send.result.?;
-                defer ffi.decref(sentinel);
+                const yielded = send.result.?;
+                defer ffi.decref(yielded);
 
-                const t_sentinel = nowInstant();
-                const yield = consumeAsyncYield(
-                    mod,
-                    sentinel,
+                const t_yield_consume = nowInstant();
+                const state = module.getState(mod) orelse {
+                    ffi.coroutineClose(call_result);
+                    ffi.decref(call_result);
+                    return .{ .native_response = response_mod.Response.init(.internal_server_error) };
+                };
+                const yield = future_mod.consumeYield(
+                    &state.future_types,
+                    yielded,
                     call_result,
                     redis_send_buf,
                     pg_send_buf,
@@ -161,7 +152,7 @@ pub fn invokePythonHandlerWithKnownFlags(
                     return .{ .native_response = response_mod.Response.init(.service_unavailable) };
                 };
                 if (metrics) |m| {
-                    accumElapsed(&m.ns_sentinel, t_sentinel);
+                    accumElapsed(&m.ns_yield_consume, t_yield_consume);
                     switch (yield) {
                         .redis => m.redis_yields += 1,
                         .pg => m.pg_yields += 1,
@@ -192,169 +183,6 @@ pub fn invokePythonHandlerWithKnownFlags(
     return .{ .py_result = call_result };
 }
 
-pub const PgCmd = enum(u8) {
-    EXECUTE = 100,
-    FETCH_ONE = 101,
-    FETCH_ALL = 102,
-    FETCH_ONE_MODEL = 103,
-    FETCH_ALL_MODEL = 104,
-
-    pub fn normalize(self: PgCmd) PgCmd {
-        return switch (self) {
-            .FETCH_ONE_MODEL => .FETCH_ONE,
-            .FETCH_ALL_MODEL => .FETCH_ALL,
-            else => self,
-        };
-    }
-};
-
-pub const SentinelYield = union(enum) {
-    redis: InvokeResult.RedisYield,
-    pg: InvokeResult.PgYield,
-};
-
-fn writeRedisOp(buf: []u8, cmd: []const u8, args_tuple: *PyObject) !usize {
-    if (!ffi.isTuple(args_tuple)) return error.TypeError;
-    const size = ffi.tupleSize(args_tuple);
-    if (size < 0) return error.PythonError;
-    if (size + 1 > 8) return error.TypeError;
-
-    var args: [8][]const u8 = undefined;
-    args[0] = cmd;
-    var arg_count: usize = 1;
-    var i: isize = 0;
-    while (i < size) : (i += 1) {
-        const arg_obj = ffi.tupleGetItem(args_tuple, i) orelse return error.PythonError;
-        if (!ffi.isString(arg_obj)) return error.TypeError;
-        const s = try ffi.unicodeAsUTF8(arg_obj);
-        args[arg_count] = std.mem.span(s);
-        arg_count += 1;
-    }
-
-    const n = writeResp(buf, args[0..arg_count]);
-    if (n == 0) return error.RespBufferOverflow;
-    return n;
-}
-
-fn encodePgYield(
-    py_coro: *PyObject,
-    buf: []u8,
-    cache: *StmtCache,
-    prepared: *[MAX_PG_STMTS]bool,
-    cmd: PgCmd,
-    data: future_mod.PgOp,
-) !SentinelYield {
-    const sql_str = try ffi.unicodeAsUTF8(data.sql);
-    const sql = std.mem.span(sql_str);
-    const size = ffi.tupleSize(data.params);
-    const num_params: usize = @intCast(size);
-
-    var param_bufs: [StmtCache.MAX_PARAMS]?[]const u8 = .{null} ** StmtCache.MAX_PARAMS;
-    var str_bufs: [StmtCache.MAX_PARAMS][64]u8 = undefined;
-
-    for (0..num_params) |pi| {
-        const param_obj = ffi.tupleGetItem(data.params, @intCast(pi)) orelse continue;
-        if (ffi.isNone(param_obj)) {
-            param_bufs[pi] = null;
-            continue;
-        }
-        if (ffi.isString(param_obj)) {
-            const s = try ffi.unicodeAsUTF8(param_obj);
-            param_bufs[pi] = std.mem.span(s);
-            continue;
-        }
-
-        const str_obj = try ffi.objectStr(param_obj);
-        defer ffi.decref(str_obj);
-        const s = try ffi.unicodeAsUTF8(str_obj);
-        const span = std.mem.span(s);
-        if (span.len > str_bufs[pi].len) return error.ParamTooLong;
-        @memcpy(str_bufs[pi][0..span.len], span);
-        param_bufs[pi] = str_bufs[pi][0..span.len];
-    }
-
-    const result = try cache.encodeExtendedWithParams(buf, sql, prepared, param_bufs[0..num_params]);
-    return .{ .pg = .{
-        .py_coro = py_coro,
-        .bytes_written = result.bytes_written,
-        .cmd = cmd,
-        .stmt_idx = result.stmt_idx,
-        .model_cls = if (data.model_cls) |cls| ffi.increfBorrowed(cls) else null,
-    } };
-}
-
-pub fn consumeAsyncYield(
-    mod: *PyObject,
-    yielded: *PyObject,
-    py_coro: *PyObject,
-    redis_buf: ?[]u8,
-    pg_buf: ?[]u8,
-    pg_stmt_cache: ?*StmtCache,
-    pg_conn_prepared: ?*[MAX_PG_STMTS]bool,
-) !SentinelYield {
-    const state = module.getState(mod) orelse return error.UnknownSentinelType;
-    var op = future_mod.takePending(&state.async_state, yielded) orelse return error.UnknownSentinelType;
-    defer op.deinit();
-
-    return switch (op) {
-        .redis => |redis| blk: {
-            const buf = redis_buf orelse return error.NoRedisBuffer;
-            const cmd = switch (redis.kind) {
-                .get => "GET",
-                .set => "SET",
-                .del => "DEL",
-                .incr => "INCR",
-                .expire => "EXPIRE",
-                .ttl => "TTL",
-                .exists => "EXISTS",
-                .ping => "PING",
-                .setex => "SETEX",
-            };
-            const n = try writeRedisOp(buf, cmd, redis.args);
-            break :blk .{ .redis = .{ .py_coro = py_coro, .bytes_written = n } };
-        },
-        .pg => |pg| blk: {
-            const buf = pg_buf orelse return error.NoPgSendBuffer;
-            const cache = pg_stmt_cache orelse return error.NoPgStmtCache;
-            const prepared = pg_conn_prepared orelse return error.NoPgConnPrepared;
-            const cmd = switch (pg.kind) {
-                .execute => PgCmd.EXECUTE,
-                .fetch_one, .fetch_one_model => PgCmd.FETCH_ONE,
-                .fetch_all, .fetch_all_model => PgCmd.FETCH_ALL,
-            };
-            break :blk try encodePgYield(py_coro, buf, cache, prepared, cmd, pg);
-        },
-    };
-}
-
-pub fn writeResp(buf: []u8, args: []const []const u8) usize {
-    var pos: usize = 0;
-    if (pos >= buf.len) return 0;
-    buf[pos] = '*';
-    pos += 1;
-
-    const n_str = std.fmt.bufPrint(buf[pos..], "{d}\r\n", .{args.len}) catch return 0;
-    pos += n_str.len;
-
-    for (args) |arg| {
-        if (pos >= buf.len) return 0;
-        buf[pos] = '$';
-        pos += 1;
-
-        const l_str = std.fmt.bufPrint(buf[pos..], "{d}\r\n", .{arg.len}) catch return 0;
-        pos += l_str.len;
-
-        if (pos + arg.len + 2 > buf.len) return 0;
-        @memcpy(buf[pos..][0..arg.len], arg);
-        pos += arg.len;
-        buf[pos] = '\r';
-        buf[pos + 1] = '\n';
-        pos += 2;
-    }
-
-    return pos;
-}
-
 const server_mod = @import("../server.zig");
 const posix = std.posix;
 
@@ -374,9 +202,8 @@ fn installShutdownSignals() void {
 
 const drv_log = std.log.scoped(.@"snek/driver");
 
-pub fn startServer(host: []const u8, port: u16, threads: usize, backlog: u16) !void {
+pub fn startServer(mod: *PyObject, host: []const u8, port: u16, threads: usize, backlog: u16) !void {
     drv_log.info("startServer called host={s} port={d} threads={d} backlog={d}", .{ host, port, threads, backlog });
-    const mod = module.getCurrentModule() orelse return error.ModuleNotSet;
     const state = module.getState(mod) orelse return error.ModuleNotSet;
 
     installShutdownSignals();
@@ -391,7 +218,7 @@ pub fn startServer(host: []const u8, port: u16, threads: usize, backlog: u16) !v
     var i: u32 = 0;
     while (i < state.py_handler_count) : (i += 1) {
         const entry = state.route_entries[i];
-        const method = router_mod.Method.fromString(entry.method[0..entry.method_len]) orelse continue;
+        const method = std.meta.stringToEnum(std.http.Method, entry.method[0..entry.method_len]) orelse continue;
         const route_id = server.handler_count;
         server.addPythonRoute(method, entry.path[0..entry.path_len], i) catch continue;
         server.py_handler_flags[route_id] = .{
@@ -402,6 +229,6 @@ pub fn startServer(host: []const u8, port: u16, threads: usize, backlog: u16) !v
         };
     }
 
-    _ = gil.PyEval_SaveThread();
+    _ = ffi.PyEval_SaveThread();
     try server_mod.run(std.heap.smp_allocator, &server);
 }

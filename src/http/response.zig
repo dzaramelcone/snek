@@ -95,64 +95,7 @@ pub const Response = struct {
         return r;
     }
 
-    /// Serialize to HTTP/1.1 response bytes.
-    /// Mirrors zzz's response writer: status line, Connection: keep-alive,
-    /// user headers, Content-Length, blank line, body.
-    pub fn serialize(self: *const Response, buf: []u8) error{ BufferTooSmall, UnsupportedStatus }!usize {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-
-        // Status line
-        w.writeAll(try statusLine(self.status)) catch return error.BufferTooSmall;
-
-        // Connection: keep-alive (matches zzz behavior)
-        w.writeAll("Connection: keep-alive\r\n") catch return error.BufferTooSmall;
-
-        // User headers
-        for (self.headers[0..self.header_count]) |h| {
-            w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.BufferTooSmall;
-        }
-
-        // Content-Length
-        if (self.body) |b| {
-            w.print("Content-Length: {d}\r\n", .{b.len}) catch return error.BufferTooSmall;
-        }
-
-        // End of headers
-        w.writeAll("\r\n") catch return error.BufferTooSmall;
-
-        // Body
-        if (self.body) |b| {
-            w.writeAll(b) catch return error.BufferTooSmall;
-        }
-
-        return fbs.pos;
-    }
 };
-
-fn statusLine(status: http.Status) error{UnsupportedStatus}![]const u8 {
-    return switch (status) {
-        .ok => "HTTP/1.1 200 OK\r\n",
-        .created => "HTTP/1.1 201 Created\r\n",
-        .no_content => "HTTP/1.1 204 No Content\r\n",
-        .moved_permanently => "HTTP/1.1 301 Moved Permanently\r\n",
-        .found => "HTTP/1.1 302 Found\r\n",
-        .not_modified => "HTTP/1.1 304 Not Modified\r\n",
-        .bad_request => "HTTP/1.1 400 Bad Request\r\n",
-        .unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
-        .forbidden => "HTTP/1.1 403 Forbidden\r\n",
-        .not_found => "HTTP/1.1 404 Not Found\r\n",
-        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
-        .payload_too_large => "HTTP/1.1 413 Content Too Large\r\n",
-        .teapot => "HTTP/1.1 418 I'm a Teapot\r\n",
-        .too_many_requests => "HTTP/1.1 429 Too Many Requests\r\n",
-        .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
-        .bad_gateway => "HTTP/1.1 502 Bad Gateway\r\n",
-        .service_unavailable => "HTTP/1.1 503 Service Unavailable\r\n",
-        .gateway_timeout => "HTTP/1.1 504 Gateway Timeout\r\n",
-        else => return error.UnsupportedStatus,
-    };
-}
 
 // ============================================================
 // Tests
@@ -196,12 +139,3 @@ test "fluent API chaining" {
     try std.testing.expectEqualStrings("val", r.headers[1].value);
 }
 
-test "serialize to bytes" {
-    const r = Response.text("hi");
-    var buf: [4096]u8 = undefined;
-    const n = try r.serialize(&buf);
-    const out = buf[0..n];
-    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Type: text/plain\r\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, out, "hi"));
-}

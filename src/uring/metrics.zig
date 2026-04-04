@@ -17,7 +17,7 @@ pub const Stats = struct {
     ns_py_lookup: u64 = 0,
     ns_py_arg_build: u64 = 0,
     ns_py_resume: u64 = 0,
-    ns_py_sentinel: u64 = 0,
+    ns_py_yield_consume: u64 = 0,
     ns_py_request_obj: u64 = 0,
     ns_py_invoke_total: u64 = 0,
     ns_py_result: u64 = 0,
@@ -39,6 +39,8 @@ pub const Stats = struct {
     ns_send: u64 = 0,
     pg_recv_ops: u64 = 0,
     pg_recv_bytes: u64 = 0,
+    /// CQE batch size histogram: <32, 32-63, 64-127, 128-255, 256-511, 512+
+    cqe_batch_hist: [6]u64 = .{0} ** 6,
     pmu: if (has_pmu) PmuState else void = if (has_pmu) .{} else {},
 
     pub const has_pmu = perf.Backend != void;
@@ -87,6 +89,11 @@ pub const Stats = struct {
         self.pmu.tlb_misses += d.tlb_misses;
     }
 
+    pub fn recordBatchSize(self: *Stats, n: usize) void {
+        const bucket: usize = if (n < 32) 0 else if (n < 64) 1 else if (n < 128) 2 else if (n < 256) 3 else if (n < 512) 4 else 5;
+        self.cqe_batch_hist[bucket] += 1;
+    }
+
     pub fn accumInvokeMetrics(self: *Stats, metrics: *const driver.InvokeMetrics) void {
         self.py_invocations += metrics.invocations;
         self.py_coroutines += metrics.coroutines;
@@ -98,7 +105,7 @@ pub const Stats = struct {
         self.ns_py_arg_build += metrics.ns_arg_build;
         self.ns_py_call += metrics.ns_call;
         self.ns_py_resume += metrics.ns_resume;
-        self.ns_py_sentinel += metrics.ns_sentinel;
+        self.ns_py_yield_consume += metrics.ns_yield_consume;
     }
 
     pub fn resetWindow(self: *Stats) void {
@@ -113,7 +120,7 @@ pub const Stats = struct {
         self.ns_py_lookup = 0;
         self.ns_py_arg_build = 0;
         self.ns_py_resume = 0;
-        self.ns_py_sentinel = 0;
+        self.ns_py_yield_consume = 0;
         self.ns_py_request_obj = 0;
         self.ns_py_invoke_total = 0;
         self.ns_py_result = 0;
@@ -135,6 +142,7 @@ pub const Stats = struct {
         self.ns_send = 0;
         self.pg_recv_ops = 0;
         self.pg_recv_bytes = 0;
+        self.cqe_batch_hist = .{0} ** 6;
     }
 
     pub fn dump(self: *Stats) void {
@@ -168,8 +176,19 @@ pub const Stats = struct {
                 self.pg_recv_bytes,
             },
         );
+        log.info(
+            "BATCH_HIST  <32={d}  32-63={d}  64-127={d}  128-255={d}  256-511={d}  512+={d}",
+            .{
+                self.cqe_batch_hist[0],
+                self.cqe_batch_hist[1],
+                self.cqe_batch_hist[2],
+                self.cqe_batch_hist[3],
+                self.cqe_batch_hist[4],
+                self.cqe_batch_hist[5],
+            },
+        );
         if (self.py_invocations > 0) {
-            const invoke_known = self.ns_py_lookup + self.ns_py_arg_build + self.ns_py_call + self.ns_py_resume + self.ns_py_sentinel;
+            const invoke_known = self.ns_py_lookup + self.ns_py_arg_build + self.ns_py_call + self.ns_py_resume + self.ns_py_yield_consume;
             const invoke_other = self.ns_py_invoke_total -| invoke_known;
             self.dumpPyProfile(invoke_other, us);
         }
@@ -210,7 +229,7 @@ pub const Stats = struct {
             },
         );
         log.info(
-            "PYPROFILE  reqobj={d}us  invoke={d}us(other={d}us)  result={d}us(resp={d}us yield={d}us)  lookup={d}us  args={d}us  call={d}us  resume={d}us  sentinel={d}us",
+            "PYPROFILE  reqobj={d}us  invoke={d}us(other={d}us)  result={d}us(resp={d}us yield={d}us)  lookup={d}us  args={d}us  call={d}us  resume={d}us  yield_consume={d}us",
             .{
                 us(self.ns_py_request_obj),
                 us(self.ns_py_invoke_total),
@@ -222,7 +241,7 @@ pub const Stats = struct {
                 us(self.ns_py_arg_build),
                 us(self.ns_py_call),
                 us(self.ns_py_resume),
-                us(self.ns_py_sentinel),
+                us(self.ns_py_yield_consume),
             },
         );
     }

@@ -10,7 +10,6 @@ pub const std_options: std.Options = .{
 
 pub const python = struct {
     pub const ffi = @import("python/ffi.zig");
-    pub const gil = @import("python/gil.zig");
     pub const module = @import("python/module.zig");
     pub const driver = @import("python/driver.zig");
 };

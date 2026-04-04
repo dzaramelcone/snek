@@ -7,8 +7,7 @@
 //!   [kernel recv] → ParseTask → HandleTask ─┬→ SendTask → [kernel sendv] → recv
 //!                                            └→ RedisTask ··· → SendTask
 //!
-//! Response headers use a cached per-second prefix (Server + Date) shared
-//! across all responses. sendv scatter-gathers prefix + per-response headers + body.
+//! sendv scatter-gathers the shared HTTP response prefix + per-response headers + body.
 
 const std = @import("std");
 const posix = std.posix;
@@ -45,61 +44,6 @@ const MAX_IOVECS = 4; // status | common | per-response | body
 const TRANSPORT_BUFFER_COUNT = transport_pool.DEFAULT_BUFFER_COUNT;
 const RESULT_SLAB_CACHE = 128;
 const RESULT_SLAB_MAX_LIVE = 1024;
-
-// ── Cached response prefix ────────────────────────────────────────
-// Recomputed once per second. Shared by all responses in the window.
-//
-//   Server: snek\r\n
-//   Date: Thu, 28 Mar 2026 12:34:56 GMT\r\n
-//
-// ~50 bytes. Every response points to the same buffer.
-
-const COMMON_HDR_CAP = 64;
-
-threadlocal var cached_common_hdr: [COMMON_HDR_CAP]u8 = undefined;
-threadlocal var cached_common_len: usize = 0;
-threadlocal var cached_epoch: i64 = 0;
-
-fn refreshCommonHeaders() void {
-    const now = std.time.timestamp();
-    if (now == cached_epoch and cached_common_len > 0) return;
-    cached_epoch = now;
-
-    const epoch_secs: u64 = @intCast(now);
-    const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
-    const day_secs = es.getDaySeconds();
-    const year_day = es.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
-    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-
-    // Day of week: Jan 1 1970 was Thursday (index 0)
-    const days_since_epoch = es.getEpochDay().day;
-    const dow = @mod(days_since_epoch + 3, 7); // +3 because Jan 1 1970 = Thursday
-
-    const hour = day_secs.getHoursIntoDay();
-    const minute = day_secs.getMinutesIntoHour();
-    const second = day_secs.getSecondsIntoMinute();
-
-    cached_common_len = (std.fmt.bufPrint(
-        &cached_common_hdr,
-        "Server: snek\r\nDate: {s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT\r\n",
-        .{
-            day_names[dow],
-            month_day.day_index + 1,
-            month_names[month_day.month.numeric() - 1],
-            year_day.year,
-            hour,
-            minute,
-            second,
-        },
-    ) catch &.{}).len;
-}
-
-fn commonHeaders() []const u8 {
-    return cached_common_hdr[0..cached_common_len];
-}
 
 // ── Connection — pure data ────────────────────────────────────────
 
@@ -380,7 +324,7 @@ pub const Pipeline = struct {
     // ── Main loop ─────────────────────────────────────────────────
 
     pub fn run(self: *Pipeline) !void {
-        refreshCommonHeaders();
+        _ = http1.commonResponseHeaders();
         self.stats.initPmu();
         defer self.stats.deinitPmu();
         while (self.running) {
@@ -400,8 +344,8 @@ pub const Pipeline = struct {
             (if (self.stats.pmu.backend != null and self.stats.cycles % 10000 >= 9990) self.stats.pmuRead() else null)
         else {};
 
-        // Refresh cached date header (once per second)
-        refreshCommonHeaders();
+        // Refresh cached response prefix (once per second)
+        _ = http1.commonResponseHeaders();
 
         // Reset queues
         self.parse_q.len = 0;
@@ -792,10 +736,7 @@ pub const Pipeline = struct {
                 try self.send_q.push(try makeErrorSend(ht.conn, .bad_request));
                 continue;
             };
-            const method_str = if (req.method) |m| @tagName(m) else "GET";
-            const method = router_mod.Method.fromString(method_str) orelse .GET;
-
-            switch (req_ctx.router.match(method, req.uri orelse "/")) {
+            switch (req_ctx.router.match(req.method orelse .GET, req.uri orelse "/")) {
                 .found => |found| {
                     if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
                         if (py_ctx) |py| {
@@ -896,7 +837,7 @@ pub const Pipeline = struct {
     //   [3] body              — from conn.body_buf or static string
 
     fn stageSerializeAndSend(self: *Pipeline) !void {
-        const common = commonHeaders();
+        const common = http1.commonResponseHeaders();
 
         for (self.send_q.mutableSlice(), 0..) |*st, i| {
             const conn = self.conns.get_ptr(st.conn);
@@ -1746,25 +1687,8 @@ fn writePerResponseHeaders(st: *SendTask, resp: *const response_mod.Response) vo
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-test "cached common headers" {
-    refreshCommonHeaders();
-    const hdr = commonHeaders();
-    try std.testing.expect(hdr.len > 0);
-    try std.testing.expect(std.mem.startsWith(u8, hdr, "Server: snek\r\n"));
-    try std.testing.expect(std.mem.indexOf(u8, hdr, "Date:") != null);
-    try std.testing.expect(std.mem.endsWith(u8, hdr, "GMT\r\n"));
-}
-
-test "cached headers stable within same second" {
-    refreshCommonHeaders();
-    const a = commonHeaders();
-    refreshCommonHeaders();
-    const b = commonHeaders();
-    try std.testing.expectEqualStrings(a, b);
-}
-
 test "makeResponseSend 200 text" {
-    refreshCommonHeaders();
+    _ = http1.commonResponseHeaders();
     const resp = response_mod.Response.text("hello");
     const st = try makeResponseSend(5, resp);
     try std.testing.expectEqual(@as(u16, 5), st.conn);

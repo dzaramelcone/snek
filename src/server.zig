@@ -60,7 +60,7 @@ pub const Server = struct {
         }
     }
 
-    pub fn addRoute(self: *Server, method: router_mod.Method, path: []const u8, h: HandlerFn) !void {
+    pub fn addRoute(self: *Server, method: std.http.Method, path: []const u8, h: HandlerFn) !void {
         const id = self.handler_count;
         if (id >= 64) return error.TooManyHandlers;
         self.handlers[id] = h;
@@ -70,7 +70,7 @@ pub const Server = struct {
         try self.router.addRoute(method, path, id);
     }
 
-    pub fn addPythonRoute(self: *Server, method: router_mod.Method, path: []const u8, py_handler_id: u32) !void {
+    pub fn addPythonRoute(self: *Server, method: std.http.Method, path: []const u8, py_handler_id: u32) !void {
         const id = self.handler_count;
         if (id >= 64) return error.TooManyHandlers;
         self.handlers[id] = null;
