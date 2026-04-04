@@ -1,7 +1,6 @@
 """snek application class with FastAPI-style decorators."""
 
 import types
-from enum import IntEnum
 
 from snek import _snek
 
@@ -44,67 +43,53 @@ class App:
         _snek.run(host, port, threads, module_ref, backlog)
 
 
-class _Cmd(IntEnum):
-    """Command IDs — must match REDIS_CMD_NAMES in driver.zig."""
-    GET = 0; SET = 1; DEL = 2; INCR = 3; EXPIRE = 4; TTL = 5; EXISTS = 6; PING = 7; SETEX = 8
-
-
 class Redis:
-    """Yield (cmd_id, *args). Zig looks up the command name and builds RESP."""
-
     @types.coroutine
     def get(self, key: str):
-        return (yield (_Cmd.GET, key))
+        return (yield _snek.redis_get(key))
 
     @types.coroutine
     def set(self, key: str, value: str):
-        return (yield (_Cmd.SET, key, value))
+        return (yield _snek.redis_set(key, value))
 
     @types.coroutine
     def setex(self, key: str, seconds: int, value: str):
-        return (yield (_Cmd.SETEX, key, str(seconds), value))
+        return (yield _snek.redis_setex(key, str(seconds), value))
 
     @types.coroutine
     def delete(self, *keys: str):
-        return (yield (_Cmd.DEL, *keys))
+        return (yield _snek.redis_del(*keys))
 
     @types.coroutine
     def incr(self, key: str):
-        return (yield (_Cmd.INCR, key))
+        return (yield _snek.redis_incr(key))
 
     @types.coroutine
     def expire(self, key: str, seconds: int):
-        return (yield (_Cmd.EXPIRE, key, str(seconds)))
+        return (yield _snek.redis_expire(key, str(seconds)))
 
     @types.coroutine
     def ttl(self, key: str):
-        return (yield (_Cmd.TTL, key))
+        return (yield _snek.redis_ttl(key))
 
     @types.coroutine
     def exists(self, *keys: str):
-        return (yield (_Cmd.EXISTS, *keys))
+        return (yield _snek.redis_exists(*keys))
 
     @types.coroutine
     def ping(self):
-        return (yield (_Cmd.PING,))
-
-
-class _DbCmd(IntEnum):
-    """Command IDs — must match PgCmd in driver.zig."""
-    EXECUTE = 100; FETCH_ONE = 101; FETCH_ALL = 102; FETCH_ONE_MODEL = 103; FETCH_ALL_MODEL = 104
+        return (yield _snek.redis_ping())
 
 
 class Db:
-    """Yield (cmd_id, sql, *params). Zig builds postgres wire messages and pipelines them."""
-
     @types.coroutine
     def fetch_one(self, sql: str, *params):
-        return (yield (_DbCmd.FETCH_ONE, sql, *params))
+        return (yield _snek.pg_fetch_one(sql, params))
 
     @types.coroutine
     def fetch_all(self, sql: str, *params):
-        return (yield (_DbCmd.FETCH_ALL, sql, *params))
+        return (yield _snek.pg_fetch_all(sql, params))
 
     @types.coroutine
     def execute(self, sql: str, *params):
-        return (yield (_DbCmd.EXECUTE, sql, *params))
+        return (yield _snek.pg_execute(sql, params))

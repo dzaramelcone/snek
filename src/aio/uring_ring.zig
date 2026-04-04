@@ -338,8 +338,8 @@ pub fn setupBufRing(
     return br;
 }
 
-pub fn freeBufRing(fd: posix.fd_t, br: *align(page_size_min) linux.io_uring_buf_ring, entries: u32, group_id: u16) void {
-    unregisterBufRing(fd, group_id) catch {};
+pub fn freeBufRing(fd: posix.fd_t, br: *align(page_size_min) linux.io_uring_buf_ring, entries: u32, group_id: u16) !void {
+    try unregisterBufRing(fd, group_id);
     var mmap: []align(page_size_min) u8 = undefined;
     mmap.ptr = @ptrCast(br);
     mmap.len = entries * @sizeOf(linux.io_uring_buf);

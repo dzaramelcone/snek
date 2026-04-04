@@ -221,7 +221,7 @@ test "empty pipeline calls handler directly" {
     var p = Pipeline.init();
     var req = makeRequest();
     const resp = p.execute(&req, echoHandler);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(std.http.Status.ok, resp.status);
     try std.testing.expectEqualStrings("ok", resp.body.?);
 }
 
@@ -234,7 +234,7 @@ fn beforeIncrement(_: *Request) ?Response {
 
 fn handlerChecksCounter(_: *Request) Response {
     // Counter should already be 1 (before hook ran first).
-    return if (test_counter == 1) Response.text("good") else Response.init(500);
+    return if (test_counter == 1) Response.text("good") else Response.init(.internal_server_error);
 }
 
 test "before hook runs before handler" {
@@ -243,7 +243,7 @@ test "before hook runs before handler" {
     p.addBefore(beforeIncrement);
     var req = makeRequest();
     const resp = p.execute(&req, handlerChecksCounter);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(std.http.Status.ok, resp.status);
     try std.testing.expectEqualStrings("good", resp.body.?);
 }
 
@@ -268,12 +268,12 @@ test "after hook modifies response" {
 // -- 4. Before hook short-circuits -----------------------------------------
 
 fn authHookDeny(_: *Request) ?Response {
-    return Response.init(401);
+    return Response.init(.unauthorized);
 }
 
 fn unreachableHandler(_: *Request) Response {
     // Should never be called.
-    return Response.init(500);
+    return Response.init(.internal_server_error);
 }
 
 test "before hook short-circuits" {
@@ -281,7 +281,7 @@ test "before hook short-circuits" {
     p.addBefore(authHookDeny);
     var req = makeRequest();
     const resp = p.execute(&req, unreachableHandler);
-    try std.testing.expectEqual(@as(u16, 401), resp.status);
+    try std.testing.expectEqual(std.http.Status.unauthorized, resp.status);
 }
 
 // -- 5. Multiple hooks execute in order ------------------------------------
@@ -385,7 +385,7 @@ test "background task drain" {
 
 fn shortCircuitEarly(_: *Request) ?Response {
     test_counter += 1;
-    return Response.init(403);
+    return Response.init(.forbidden);
 }
 
 fn neverReachedHook(_: *Request) ?Response {
@@ -400,6 +400,6 @@ test "short-circuit stops remaining before hooks" {
     p.addBefore(neverReachedHook);
     var req = makeRequest();
     const resp = p.execute(&req, unreachableHandler);
-    try std.testing.expectEqual(@as(u16, 403), resp.status);
+    try std.testing.expectEqual(std.http.Status.forbidden, resp.status);
     try std.testing.expectEqual(@as(u32, 1), test_counter);
 }

@@ -5,6 +5,7 @@
 //! Self-contained: inlines serialization so it can be tested standalone.
 
 const std = @import("std");
+const http = std.http;
 
 pub const Header = struct {
     name: []const u8,
@@ -14,12 +15,12 @@ pub const Header = struct {
 const MAX_HEADERS: usize = 32;
 
 pub const Response = struct {
-    status: u16,
+    status: http.Status,
     headers: [MAX_HEADERS]Header,
     header_count: usize,
     body: ?[]const u8,
 
-    pub fn init(status: u16) Response {
+    pub fn init(status: http.Status) Response {
         return .{
             .status = status,
             .headers = undefined,
@@ -50,7 +51,7 @@ pub const Response = struct {
 
     /// 200 + application/json
     pub fn json(b: []const u8) Response {
-        var r = init(200);
+        var r = init(.ok);
         _ = r.setContentType("application/json");
         r.body = b;
         return r;
@@ -58,7 +59,7 @@ pub const Response = struct {
 
     /// 200 + text/plain
     pub fn text(b: []const u8) Response {
-        var r = init(200);
+        var r = init(.ok);
         _ = r.setContentType("text/plain");
         r.body = b;
         return r;
@@ -66,7 +67,7 @@ pub const Response = struct {
 
     /// 200 + text/html
     pub fn html(b: []const u8) Response {
-        var r = init(200);
+        var r = init(.ok);
         _ = r.setContentType("text/html");
         r.body = b;
         return r;
@@ -74,21 +75,21 @@ pub const Response = struct {
 
     /// 302 + Location header
     pub fn redirect(location: []const u8) Response {
-        var r = init(302);
+        var r = init(.found);
         _ = r.setHeader("Location", location);
         return r;
     }
 
     /// 404 Not Found
     pub fn notFound() Response {
-        var r = init(404);
+        var r = init(.not_found);
         r.body = "Not Found";
         return r;
     }
 
     /// 405 + Allow header
     pub fn methodNotAllowed(allowed: []const u8) Response {
-        var r = init(405);
+        var r = init(.method_not_allowed);
         _ = r.setHeader("Allow", allowed);
         r.body = "Method Not Allowed";
         return r;
@@ -97,12 +98,12 @@ pub const Response = struct {
     /// Serialize to HTTP/1.1 response bytes.
     /// Mirrors zzz's response writer: status line, Connection: keep-alive,
     /// user headers, Content-Length, blank line, body.
-    pub fn serialize(self: *const Response, buf: []u8) error{BufferTooSmall}!usize {
+    pub fn serialize(self: *const Response, buf: []u8) error{ BufferTooSmall, UnsupportedStatus }!usize {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
 
         // Status line
-        w.writeAll(statusLine(self.status)) catch return error.BufferTooSmall;
+        w.writeAll(try statusLine(self.status)) catch return error.BufferTooSmall;
 
         // Connection: keep-alive (matches zzz behavior)
         w.writeAll("Connection: keep-alive\r\n") catch return error.BufferTooSmall;
@@ -129,20 +130,27 @@ pub const Response = struct {
     }
 };
 
-fn statusLine(code: u16) []const u8 {
-    return switch (code) {
-        200 => "HTTP/1.1 200 OK\r\n",
-        201 => "HTTP/1.1 201 Created\r\n",
-        204 => "HTTP/1.1 204 No Content\r\n",
-        301 => "HTTP/1.1 301 Moved Permanently\r\n",
-        302 => "HTTP/1.1 302 Found\r\n",
-        304 => "HTTP/1.1 304 Not Modified\r\n",
-        400 => "HTTP/1.1 400 Bad Request\r\n",
-        404 => "HTTP/1.1 404 Not Found\r\n",
-        405 => "HTTP/1.1 405 Method Not Allowed\r\n",
-        500 => "HTTP/1.1 500 Internal Server Error\r\n",
-        503 => "HTTP/1.1 503 Service Unavailable\r\n",
-        else => "HTTP/1.1 200 OK\r\n",
+fn statusLine(status: http.Status) error{UnsupportedStatus}![]const u8 {
+    return switch (status) {
+        .ok => "HTTP/1.1 200 OK\r\n",
+        .created => "HTTP/1.1 201 Created\r\n",
+        .no_content => "HTTP/1.1 204 No Content\r\n",
+        .moved_permanently => "HTTP/1.1 301 Moved Permanently\r\n",
+        .found => "HTTP/1.1 302 Found\r\n",
+        .not_modified => "HTTP/1.1 304 Not Modified\r\n",
+        .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+        .unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
+        .forbidden => "HTTP/1.1 403 Forbidden\r\n",
+        .not_found => "HTTP/1.1 404 Not Found\r\n",
+        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
+        .payload_too_large => "HTTP/1.1 413 Content Too Large\r\n",
+        .teapot => "HTTP/1.1 418 I'm a Teapot\r\n",
+        .too_many_requests => "HTTP/1.1 429 Too Many Requests\r\n",
+        .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
+        .bad_gateway => "HTTP/1.1 502 Bad Gateway\r\n",
+        .service_unavailable => "HTTP/1.1 503 Service Unavailable\r\n",
+        .gateway_timeout => "HTTP/1.1 504 Gateway Timeout\r\n",
+        else => return error.UnsupportedStatus,
     };
 }
 
@@ -152,21 +160,21 @@ fn statusLine(code: u16) []const u8 {
 
 test "json response" {
     const r = Response.json("{\"ok\":true}");
-    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqual(http.Status.ok, r.status);
     try std.testing.expectEqualStrings("application/json", r.headers[0].value);
     try std.testing.expectEqualStrings("{\"ok\":true}", r.body.?);
 }
 
 test "text response" {
     const r = Response.text("hello");
-    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqual(http.Status.ok, r.status);
     try std.testing.expectEqualStrings("text/plain", r.headers[0].value);
     try std.testing.expectEqualStrings("hello", r.body.?);
 }
 
 test "redirect response" {
     const r = Response.redirect("/login");
-    try std.testing.expectEqual(@as(u16, 302), r.status);
+    try std.testing.expectEqual(http.Status.found, r.status);
     try std.testing.expectEqualStrings("Location", r.headers[0].name);
     try std.testing.expectEqualStrings("/login", r.headers[0].value);
     try std.testing.expect(r.body == null);
@@ -174,14 +182,14 @@ test "redirect response" {
 
 test "not found response" {
     const r = Response.notFound();
-    try std.testing.expectEqual(@as(u16, 404), r.status);
+    try std.testing.expectEqual(http.Status.not_found, r.status);
     try std.testing.expectEqualStrings("Not Found", r.body.?);
 }
 
 test "fluent API chaining" {
-    var r = Response.init(201);
+    var r = Response.init(.created);
     _ = r.setContentType("text/plain").setHeader("X-Custom", "val").setBody("created");
-    try std.testing.expectEqual(@as(u16, 201), r.status);
+    try std.testing.expectEqual(http.Status.created, r.status);
     try std.testing.expectEqualStrings("created", r.body.?);
     try std.testing.expectEqual(@as(usize, 2), r.header_count);
     try std.testing.expectEqualStrings("text/plain", r.headers[0].value);

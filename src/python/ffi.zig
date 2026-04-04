@@ -211,11 +211,6 @@ pub fn errPrint() void {
     c.PyErr_Print();
 }
 
-/// Check if an object is a coroutine (from async def).
-pub fn isCoroutine(obj: *PyObject) bool {
-    return c.PyCoro_CheckExact(obj) != 0;
-}
-
 /// Properly close a suspended coroutine/generator by calling its .close() method.
 /// This throws GeneratorExit into the coroutine, allowing finally blocks to run
 /// and preventing GC corruption from half-unwound frames.
@@ -321,6 +316,36 @@ pub fn bytesData(obj: *PyObject) []const u8 {
     const ptr: [*]const u8 = @ptrCast(c.PyBytes_AS_STRING(obj));
     const len: usize = @intCast(c.PyBytes_GET_SIZE(obj));
     return ptr[0..len];
+}
+
+pub const BufferView = struct {
+    raw: c.Py_buffer,
+};
+
+pub fn isMemoryView(obj: *PyObject) bool {
+    return c.PyMemoryView_Check(obj) != 0;
+}
+
+pub fn getReadOnlyBuffer(obj: *PyObject) PythonError!BufferView {
+    var view: c.Py_buffer = undefined;
+    if (c.PyObject_GetBuffer(obj, &view, c.PyBUF_CONTIG_RO) != 0) return error.ConversionError;
+    return .{ .raw = view };
+}
+
+pub fn bufferIsReadOnly(view: *const BufferView) bool {
+    return view.raw.readonly != 0;
+}
+
+pub fn bufferData(view: *const BufferView) []const u8 {
+    const buf_ptr = view.raw.buf orelse @panic("null Py_buffer.buf");
+    const ptr: [*]const u8 = @ptrCast(@alignCast(buf_ptr));
+    const len: usize = @intCast(view.raw.len);
+    return ptr[0..len];
+}
+
+pub fn releaseBuffer(view: *BufferView) void {
+    c.PyBuffer_Release(&view.raw);
+    view.* = undefined;
 }
 
 // ── Tuple operations ────────────────────────────────────────────────

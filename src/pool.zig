@@ -20,18 +20,9 @@ pub fn Pool(comptime T: type) type {
                 .direction = .forward,
             }),
 
-            pub fn next(self: *Iterator) ?T {
-                const index = self.iter.next() orelse return null;
-                return self.items[index];
-            }
-
             pub fn next_ptr(self: *Iterator) ?*T {
                 const index = self.iter.next() orelse return null;
                 return &self.items[index];
-            }
-
-            pub fn next_index(self: *Iterator) ?usize {
-                return self.iter.next();
             }
         };
 
@@ -57,44 +48,11 @@ pub fn Pool(comptime T: type) type {
             self.dirty.deinit(self.allocator);
         }
 
-        /// Deinitalizes our items buffer with a passed in hook.
-        pub fn deinit_with_hook(
-            self: *Self,
-            args: anytype,
-            deinit_hook: ?*const fn (buffer: []T, args: @TypeOf(args)) void,
-        ) void {
-            if (deinit_hook) |hook| {
-                @call(.auto, hook, .{ self.items, args });
-            }
-
-            self.allocator.free(self.items);
-            self.dirty.deinit(self.allocator);
-        }
-
-        pub fn get(self: *const Self, index: usize) T {
-            assert(index < self.items.len);
-            return self.items[index];
-        }
-
         pub fn get_ptr(self: *const Self, index: usize) *T {
             assert(index < self.items.len);
             return &self.items[index];
         }
 
-        /// Is this empty?
-        pub fn empty(self: *const Self) bool {
-            return self.dirty.count() == 0;
-        }
-
-        /// Is this full?
-        pub fn full(self: *const Self) bool {
-            return self.dirty.count() == self.list.len;
-        }
-
-        /// Returns the number of clean (or available) slots.
-        pub fn clean(self: *const Self) usize {
-            return self.items.len - self.dirty.count();
-        }
 
         fn grow(self: *Self) !void {
             assert(self.kind == .grow);
@@ -138,34 +96,10 @@ pub fn Pool(comptime T: type) type {
             return index;
         }
 
-        /// Linearly probes for an available slot in the pool.
-        /// Uses a provided hint value as the starting index.
-        ///
-        /// Returns the index into the Pool.
-        pub fn borrow_hint(self: *Self, hint: usize) !usize {
-            const length = self.items.len;
-            for (0..length) |i| {
-                const index = @mod(hint + i, length);
-                if (!self.dirty.isSet(index)) {
-                    self.dirty.set(index);
-                    return index;
-                }
-            }
-
-            switch (self.kind) {
-                .static => return error.Full,
-                .grow => {
-                    const last_index = self.items.len;
-                    try self.grow();
-                    return self.borrow_assume_unset(last_index);
-                },
-            }
-        }
-
         /// Attempts to borrow at the given index.
         /// Asserts that it is an available slot.
         /// This will never grow the Pool.
-        pub fn borrow_assume_unset(self: *Self, index: usize) usize {
+        fn borrow_assume_unset(self: *Self, index: usize) usize {
             assert(!self.dirty.isSet(index));
             self.dirty.set(index);
             return index;
@@ -190,8 +124,8 @@ test "Pool: Initalization (integer)" {
     var byte_pool: Pool(u8) = try .init(testing.allocator, 1024, .static);
     defer byte_pool.deinit();
 
-    for (0..1024) |i| {
-        const index = try byte_pool.borrow_hint(i);
+    for (0..1024) |_| {
+        const index = try byte_pool.borrow();
         const byte_ptr = byte_pool.get_ptr(index);
         byte_ptr.* = 2;
     }
@@ -207,8 +141,8 @@ test "Pool: Dynamic Growth (integer)" {
 
     const count = 1024;
 
-    for (0..count) |i| {
-        const index = try byte_pool.borrow_hint(i);
+    for (0..count) |_| {
+        const index = try byte_pool.borrow();
         const byte_ptr = byte_pool.get_ptr(index);
         byte_ptr.* = 2;
     }
@@ -267,47 +201,24 @@ test "Pool: Borrowing" {
     }
 }
 
-test "Pool: Borrowing Hint" {
-    var byte_pool: Pool(u8) = try .init(testing.allocator, 1024, .static);
-    defer byte_pool.deinit();
-
-    for (0..byte_pool.items.len) |i| {
-        _ = try byte_pool.borrow_hint(i);
-    }
-
-    for (0..byte_pool.items.len) |i| {
-        byte_pool.release(i);
-    }
-}
-
-test "Pool: Borrowing Unset" {
-    var byte_pool: Pool(u8) = try .init(testing.allocator, 1024, .static);
-    defer byte_pool.deinit();
-
-    for (0..byte_pool.items.len) |i| {
-        _ = byte_pool.borrow_assume_unset(i);
-    }
-
-    for (0..byte_pool.items.len) |i| {
-        byte_pool.release(i);
-    }
-}
-
 test "Pool Iterator" {
     var int_pool: Pool(usize) = try .init(testing.allocator, 1024, .static);
     defer int_pool.deinit();
 
+    var count: usize = 0;
     for (0..(1024 / 2)) |_| {
         const borrowed = try int_pool.borrow();
         const item_ptr = int_pool.get_ptr(borrowed);
         item_ptr.* = borrowed;
+        count += 1;
     }
 
+    var released: usize = 0;
     var iter = int_pool.iterator();
-    while (iter.next()) |item| {
-        try testing.expect(int_pool.dirty.isSet(item));
-        int_pool.release(item);
+    while (iter.next_ptr()) |item| {
+        int_pool.release(item.*);
+        released += 1;
     }
 
-    try testing.expect(int_pool.empty());
+    try testing.expectEqual(count, released);
 }

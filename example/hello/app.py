@@ -35,7 +35,7 @@ async def redis_set(key: str, value: str):
 @app.get("/redis-get/{key}")
 async def redis_get(key: str):
     val = await app.redis.get(key)
-    return {"key": key, "value": val.decode() if isinstance(val, bytes) else val}
+    return {"key": key, "value": val}
 
 
 if __name__ == "__main__":

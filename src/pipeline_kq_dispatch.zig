@@ -15,7 +15,7 @@ pub fn classifyCompletion(pipeline: anytype, token_ptr: *anyopaque, completion: 
     const token: *Token = @ptrCast(@alignCast(token_ptr));
     switch (token.tag) {
         .accept => {
-            queueAccept(pipeline) catch {};
+            try queueAccept(pipeline);
             pipeline.onAccept(completion.result);
         },
         .redis_send => try pipeline.onRedisSendIO(completion.result),
@@ -26,9 +26,9 @@ pub fn classifyCompletion(pipeline: anytype, token_ptr: *anyopaque, completion: 
     }
 }
 
-pub fn submitConnRecv(pipeline: anytype, conn: anytype) void {
+pub fn submitConnRecv(pipeline: anytype, conn: anytype) !void {
     const op = Op{ .recv = .{ .socket = conn.fd, .buffer = conn.recv_slice } };
-    pipeline.backend.queue(&conn.token, op) catch {};
+    try pipeline.backend.queue(&conn.token, op);
 }
 
 pub fn submitConnSendv(pipeline: anytype, conn: anytype, iovecs: []const posix.iovec_const) !void {

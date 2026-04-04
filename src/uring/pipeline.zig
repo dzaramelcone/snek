@@ -13,30 +13,31 @@
 
 const std = @import("std");
 const posix = std.posix;
-const io_uring = @import("aio/io_uring.zig");
+const io_uring = @import("../aio/io_uring.zig");
 const Completion = io_uring.Completion;
-const Pool = @import("pool.zig").Pool;
-const http1 = @import("net/http1.zig");
-const handler_mod = @import("handler.zig");
-const driver = @import("python/driver.zig");
-const ffi = @import("python/ffi.zig");
-const snek_request = @import("python/snek_request.zig");
-const response_hint_mod = @import("response_hint.zig");
+const Pool = @import("../pool.zig").Pool;
+const http1 = @import("../net/http1.zig");
+const handler_mod = @import("../handler.zig");
+const driver = @import("../python/driver.zig");
+const ffi = @import("../python/ffi.zig");
+const snek_request = @import("../python/snek_request.zig");
+const py_send = @import("py_send.zig");
 const c = ffi.c;
-const router_mod = @import("http/router.zig");
-const response_mod = @import("http/response.zig");
-const stmt_cache_mod = @import("db/stmt_cache.zig");
+const router_mod = @import("../http/router.zig");
+const response_mod = @import("../http/response.zig");
+const Stats = @import("metrics.zig").Stats;
+const stmt_cache_mod = @import("../db/stmt_cache.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
-const pg_stream = @import("db/pg_stream_uring.zig");
-const result_lease = @import("db/result_lease.zig");
+const pg_stream = @import("../db/pg_stream_uring.zig");
+const result_lease = @import("../db/result_lease.zig");
 const ResultSlabPool = result_lease.SlabPool;
-const uring_recv_group = @import("aio/uring_recv_group.zig");
+const uring_recv_group = @import("../aio/uring_recv_group.zig");
 const UringRecvGroup = uring_recv_group.Group;
-const uring_recv_queue = @import("aio/uring_recv_queue.zig");
+const uring_recv_queue = @import("../aio/uring_recv_queue.zig");
 const UringRecvQueue = uring_recv_queue.Queue;
-const snek_row = @import("python/snek_row.zig");
-const perf = @import("observe/perf.zig");
+const snek_row = @import("../python/snek_row.zig");
+const PyBodyHold = py_send.PyBodyHold;
 
 const log = std.log.scoped(.@"snek/pipeline");
 
@@ -145,18 +146,19 @@ pub const Conn = struct {
     head_parser: std.http.HeadParser = .{},
     head_fed: usize = 0,
 
-    // Body buffer — Python response body is copied here.
-    // Lives until send completes. Eliminates resp_buf[8192].
+    // Small response scratch for buffered fallback bodies.
+    // First-class str/bytes/memoryview responses can bypass this entirely by
+    // borrowing Python-owned memory until send completion.
     body_buf: [4096]u8 = undefined,
 
     send_hdr: [SEND_HDR_CAP]u8 = undefined,
-    send_hdr_len: usize = 0,
     send_iovecs: [MAX_IOVECS]posix.iovec_const = undefined,
     send_iov_count: usize = 0,
     send_msg: posix.msghdr_const = std.mem.zeroes(posix.msghdr_const),
     send_body: ?[]const u8 = null,
     send_body_from_conn: bool = false,
     send_body_lease: result_lease.ResultLease = .{},
+    send_body_py: PyBodyHold = .{},
     send_total_len: usize = 0,
     send_sent: usize = 0,
     send_mode: enum { idle, sendv, sendmsg_zc } = .idle,
@@ -202,21 +204,37 @@ pub const PythonHandleTask = struct {
     conn: u16,
     py_id: u32,
     kind: PythonHandleKind,
-    response_hint: response_hint_mod.ResponseHint = .any,
+    is_async: bool = false,
     request_backing: ?snek_request.Backing = null,
     params: [8]router_mod.PathParam = undefined,
     param_count: u8 = 0,
 };
 
+const PyReadyTask = union(enum) {
+    invoke: PythonHandleTask,
+    redis_resume: RedisResumeReady,
+    pg_resume: PgResumeReady,
+};
+
+const RedisResumeReady = struct {
+    waiter: RedisWaiter,
+    result: *ffi.PyObject,
+};
+
+const PgResumeReady = struct {
+    waiter: PgWaiter,
+    result: *ffi.PyObject,
+};
+
+const SendSource = union(enum) {
+    native: response_mod.Response,
+    python: *ffi.PyObject,
+};
+
 pub const SendTask = struct {
     conn: u16,
-    // Per-response header fragment: "Content-Type: ...\r\nContent-Length: N\r\n\r\n"
-    hdr: [SEND_HDR_CAP]u8,
-    hdr_len: usize,
-    // Pointers for sendv iovecs
-    status_line: []const u8, // static string
-    body: ?[]const u8, // points into conn.body_buf or static
-    body_lease: result_lease.ResultLease = .{},
+    source: SendSource,
+    keep_alive: bool = true,
 };
 
 const RedisWaiter = struct {
@@ -246,7 +264,7 @@ pub const PgConn = struct {
     recv_queue: UringRecvQueue = .{ .max_bytes = PG_RECV_MAX_BYTES },
     recv_state: enum { idle, parsing, err } = .idle,
     recv_armed: bool = false,
-    fail_status: u16 = 500,
+    fail_status: std.http.Status = .internal_server_error,
     fail_body: ?[]const u8 = null,
     in_flight: usize = 0,
     prepared: [MAX_PG_STMTS]bool = .{false} ** MAX_PG_STMTS,
@@ -360,9 +378,10 @@ pub const Pipeline = struct {
     // Typed stage queues
     parse_q: Queue(ParseTask) = .{},
     handle_q: Queue(HandleTask) = .{},
-    py_handle_q: Queue(PythonHandleTask) = .{},
+    py_ready_q: Queue(PyReadyTask) = .{},
     send_q: Queue(SendTask) = .{},
     close_q: Queue(u16) = .{},
+    py_body_release: std.ArrayListUnmanaged(PyBodyHold) = .{},
 
     // ── Redis state (full-duplex: independent send/recv) ───────
     redis_fd: ?posix.socket_t = null,
@@ -409,22 +428,17 @@ pub const Pipeline = struct {
             HTTP_RECV_BUFFER_SIZE,
             HTTP_RECV_BUFFER_COUNT,
         );
-        errdefer {
-            var group = http_recv_group;
-            group.deinit();
-        }
-
-        const pg_recv_group = try UringRecvGroup.init(
+        const pg_recv_group = UringRecvGroup.init(
             backend.ring.fd,
             allocator,
             PG_RECV_GROUP_ID,
             PG_RECV_BUFFER_SIZE,
             PG_RECV_BUFFER_COUNT,
-        );
-        errdefer {
-            var group = pg_recv_group;
-            group.deinit();
-        }
+        ) catch |err| {
+            var group = http_recv_group;
+            try group.deinit();
+            return err;
+        };
 
         var request_pool = try ResultSlabPool.init(allocator, REQUEST_SLAB_CACHE, REQUEST_SLAB_MAX_LIVE);
         errdefer request_pool.deinit();
@@ -447,7 +461,14 @@ pub const Pipeline = struct {
         };
     }
 
-    pub fn deinit(self: *Pipeline, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Pipeline, allocator: std.mem.Allocator) !void {
+        if (self.req_ctx) |ctx| {
+            if (ctx.py_ctx) |py_ctx| {
+                py_ctx.py.acquireGil();
+                defer py_ctx.py.releaseGil();
+                self.drainPendingPyBodyReleases();
+            }
+        }
         var conn_iter = self.conns.iterator();
         while (conn_iter.next_ptr()) |conn| {
             conn.recv_queue.deinit(&self.http_recv_group);
@@ -455,11 +476,12 @@ pub const Pipeline = struct {
         for (self.pg_conns[0..self.pg_conn_count]) |*pg| {
             pg.recv_queue.deinit(&self.pg_recv_group);
         }
-        self.http_recv_group.deinit();
-        self.pg_recv_group.deinit();
+        try self.http_recv_group.deinit();
+        try self.pg_recv_group.deinit();
         self.request_pool.deinit();
         self.response_pool.deinit();
         self.pg_result_pool.deinit();
+        self.py_body_release.deinit(allocator);
         self.backend.deinit(allocator);
     }
 
@@ -499,7 +521,7 @@ pub const Pipeline = struct {
         // Reset queues
         self.parse_q.len = 0;
         self.handle_q.len = 0;
-        self.py_handle_q.len = 0;
+        self.py_ready_q.len = 0;
         self.send_q.len = 0;
         self.close_q.len = 0;
 
@@ -519,21 +541,30 @@ pub const Pipeline = struct {
 
         // GIL held across Python invoke + redis + postgres stages (one acquire for all Python work)
         const py_ctx = if (self.req_ctx) |ctx| ctx.py_ctx else null;
-        const need_gil = py_ctx != null and (self.py_handle_q.len > 0 or self.redis_recv_state == .parsing or self.redis_recv_state == .err or self.anyPgNeedsGil());
+        const need_gil = py_ctx != null and (
+            self.py_ready_q.len > 0 or
+            self.redis_recv_state == .parsing or
+            self.redis_recv_state == .err or
+            self.anyPgNeedsGil() or
+            self.py_body_release.items.len > 0
+        );
         if (need_gil) py_ctx.?.py.acquireGil();
         defer if (need_gil) py_ctx.?.py.releaseGil();
 
         try self.stageHandlePython();
         const t_handle_py = try std.time.Instant.now();
         try self.stageRedis();
+        try self.drainPythonReady();
         const t_redis = try std.time.Instant.now();
         const pg_rows_before = self.totalPgWaiters();
         try self.stagePostgres();
+        try self.drainPythonReady();
         const t_pg = try std.time.Instant.now();
 
         try self.stageSerializeAndSend();
         const t_send = try std.time.Instant.now();
         self.stageClose();
+        if (need_gil) self.drainPendingPyBodyReleases();
         try self.backend.publish();
 
         // PMU snapshot — end
@@ -561,216 +592,6 @@ pub const Pipeline = struct {
 
         return true;
     }
-
-    const Stats = struct {
-        cycles: u64 = 0,
-        completions: u64 = 0,
-        http_requests: u64 = 0,
-        ns_io: u64 = 0,
-        ns_classify: u64 = 0,
-        ns_parse: u64 = 0,
-        ns_handle_prep: u64 = 0,
-        ns_handle_py: u64 = 0,
-        ns_py_call: u64 = 0,
-        ns_py_resume: u64 = 0,
-        ns_py_convert: u64 = 0,
-        ns_py_sentinel: u64 = 0,
-        py_no_args: u64 = 0,
-        py_params_only: u64 = 0,
-        py_request: u64 = 0,
-        py_invocations: u64 = 0,
-        py_coroutines: u64 = 0,
-        py_sync_responses: u64 = 0,
-        py_async_immediate_returns: u64 = 0,
-        py_redis_yields: u64 = 0,
-        py_pg_yields: u64 = 0,
-        py_str_hint_hits: u64 = 0,
-        py_str_hint_misses: u64 = 0,
-        py_row_hint_hits: u64 = 0,
-        py_row_hint_misses: u64 = 0,
-        py_row_fast_path_hits: u64 = 0,
-        ns_redis: u64 = 0,
-        ns_pg_wire: u64 = 0,
-        ns_pg_flush: u64 = 0,
-        pg_rows: u64 = 0,
-        ns_send: u64 = 0,
-        pg_recv_ops: u64 = 0,
-        pg_recv_bytes: u64 = 0,
-        // PMU — comptime-stripped when no backend available
-        pmu: if (has_pmu) PmuState else void = if (has_pmu) .{} else {},
-
-        const has_pmu = perf.Backend != void;
-
-        const PmuState = struct {
-            backend: ?perf.Backend = null,
-            cpu_cycles: u64 = 0,
-            instructions: u64 = 0,
-            branches: u64 = 0,
-            branch_misses: u64 = 0,
-            cache_misses: u64 = 0,
-            tlb_misses: u64 = 0,
-        };
-
-        fn initPmu(self: *Stats) void {
-            if (comptime !has_pmu) return;
-            if (perf.Backend.init()) |pe| {
-                self.pmu.backend = pe;
-                log.info("PMU counters enabled", .{});
-            } else |err| {
-                log.info("PMU unavailable: {s}", .{@errorName(err)});
-            }
-        }
-
-        fn deinitPmu(self: *Stats) void {
-            if (comptime !has_pmu) return;
-            if (self.pmu.backend) |*p| perf.deinit(p);
-        }
-
-        fn pmuRead(self: *Stats) if (has_pmu) ?perf.Counters else void {
-            if (comptime !has_pmu) return {};
-            if (self.pmu.backend) |*p| return perf.read(p);
-            return null;
-        }
-
-        fn pmuAccum(self: *Stats, before: anytype, after: anytype) void {
-            if (comptime !has_pmu) return;
-            const b = before orelse return;
-            const a = after orelse return;
-            const d = perf.Counters.diff(a, b);
-            self.pmu.cpu_cycles += d.cycles;
-            self.pmu.instructions += d.instructions;
-            self.pmu.branches += d.branches;
-            self.pmu.branch_misses += d.missed_branches;
-            self.pmu.cache_misses += d.cache_misses;
-            self.pmu.tlb_misses += d.tlb_misses;
-        }
-
-        fn accumInvokeMetrics(self: *Stats, metrics: *const driver.InvokeMetrics) void {
-            self.py_invocations += metrics.invocations;
-            self.py_coroutines += metrics.coroutines;
-            self.py_sync_responses += metrics.sync_responses;
-            self.py_async_immediate_returns += metrics.async_immediate_returns;
-            self.py_redis_yields += metrics.redis_yields;
-            self.py_pg_yields += metrics.pg_yields;
-            self.py_str_hint_hits += metrics.str_hint_hits;
-            self.py_str_hint_misses += metrics.str_hint_misses;
-            self.py_row_hint_hits += metrics.row_hint_hits;
-            self.py_row_hint_misses += metrics.row_hint_misses;
-            self.py_row_fast_path_hits += metrics.row_fast_path_hits;
-            self.ns_py_call += metrics.ns_call;
-            self.ns_py_resume += metrics.ns_resume;
-            self.ns_py_convert += metrics.ns_convert;
-            self.ns_py_sentinel += metrics.ns_sentinel;
-        }
-
-        fn resetWindow(self: *Stats) void {
-            self.completions = 0;
-            self.http_requests = 0;
-            self.ns_io = 0;
-            self.ns_classify = 0;
-            self.ns_parse = 0;
-            self.ns_handle_prep = 0;
-            self.ns_handle_py = 0;
-            self.ns_py_call = 0;
-            self.ns_py_resume = 0;
-            self.ns_py_convert = 0;
-            self.ns_py_sentinel = 0;
-            self.py_no_args = 0;
-            self.py_params_only = 0;
-            self.py_request = 0;
-            self.py_invocations = 0;
-            self.py_coroutines = 0;
-            self.py_sync_responses = 0;
-            self.py_async_immediate_returns = 0;
-            self.py_redis_yields = 0;
-            self.py_pg_yields = 0;
-            self.py_str_hint_hits = 0;
-            self.py_str_hint_misses = 0;
-            self.py_row_hint_hits = 0;
-            self.py_row_hint_misses = 0;
-            self.py_row_fast_path_hits = 0;
-            self.ns_redis = 0;
-            self.ns_pg_wire = 0;
-            self.ns_pg_flush = 0;
-            self.pg_rows = 0;
-            self.ns_send = 0;
-            self.pg_recv_ops = 0;
-            self.pg_recv_bytes = 0;
-        }
-
-        fn dump(self: *Stats) void {
-            const ns_handle = self.ns_handle_prep + self.ns_handle_py;
-            const total = self.ns_io + self.ns_classify + self.ns_parse + ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_flush + self.ns_send;
-            const cqes = self.completions;
-            const us = struct {
-                fn f(ns: u64) u64 {
-                    return ns / 1000;
-                }
-            }.f;
-            log.info(
-                "PROFILE  cycles={d}  cqes={d}  http={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us(prep={d} py={d})  redis={d}us  pg={d}us({d}rows)  pg_flush={d}us  send={d}us  pg_recv={d}/{d}B",
-                .{
-                    self.cycles,
-                    cqes,
-                    self.http_requests,
-                    us(total),
-                    us(self.ns_io),
-                    us(self.ns_classify),
-                    us(self.ns_parse),
-                    us(ns_handle),
-                    us(self.ns_handle_prep),
-                    us(self.ns_handle_py),
-                    us(self.ns_redis),
-                    us(self.ns_pg_wire),
-                    self.pg_rows,
-                    us(self.ns_pg_flush),
-                    us(self.ns_send),
-                    self.pg_recv_ops,
-                    self.pg_recv_bytes,
-                },
-            );
-            if (self.py_invocations > 0) {
-                log.info(
-                    "PYPROFILE  invocations={d}  coro={d}  noargs={d}  params={d}  request={d}  sync={d}  async_return={d}  yield_redis={d}  yield_pg={d}  hint_str={d}/{d}  hint_row={d}/{d}  row_fast={d}  call={d}us  resume={d}us  convert={d}us  sentinel={d}us",
-                    .{
-                        self.py_invocations,
-                        self.py_coroutines,
-                        self.py_no_args,
-                        self.py_params_only,
-                        self.py_request,
-                        self.py_sync_responses,
-                        self.py_async_immediate_returns,
-                        self.py_redis_yields,
-                        self.py_pg_yields,
-                        self.py_str_hint_hits,
-                        self.py_str_hint_misses,
-                        self.py_row_hint_hits,
-                        self.py_row_hint_misses,
-                        self.py_row_fast_path_hits,
-                        us(self.ns_py_call),
-                        us(self.ns_py_resume),
-                        us(self.ns_py_convert),
-                        us(self.ns_py_sentinel),
-                    },
-                );
-            }
-            if (comptime has_pmu) {
-                if (self.pmu.cpu_cycles > 0) {
-                    log.info(
-                        "PMU  cycles={d}  insn={d}  IPC={d}.{d:0>2}  branches={d}  mispredict={d}  L1miss={d}  TLBmiss={d}",
-                        .{
-                            self.pmu.cpu_cycles,                               self.pmu.instructions,
-                            self.pmu.instructions / (self.pmu.cpu_cycles | 1), (self.pmu.instructions * 100 / (self.pmu.cpu_cycles | 1)) % 100,
-                            self.pmu.branches,                                 self.pmu.branch_misses,
-                            self.pmu.cache_misses,                             self.pmu.tlb_misses,
-                        },
-                    );
-                }
-                self.pmu = .{ .backend = self.pmu.backend };
-            }
-            self.resetWindow();
-        }
-    };
 
     // ── Classify ──────────────────────────────────────────────────
 
@@ -843,8 +664,7 @@ pub const Pipeline = struct {
             conn.zc_hold = null;
             conn.zc_notif_pending = false;
             if (conn.send_mode == .idle and conn.send_total_len == 0) {
-                conn.send_body_lease.release();
-                conn.send_body = null;
+                self.releaseConnSendBody(conn);
             }
             if (conn.close_after_notif and conn.send_mode == .idle) {
                 conn.close_after_notif = false;
@@ -877,9 +697,7 @@ pub const Pipeline = struct {
         conn.send_total_len = 0;
         conn.send_sent = 0;
         conn.send_iov_count = 0;
-        if (!conn.zc_notif_pending) conn.send_body_lease.release();
-        conn.send_body = null;
-        conn.send_body_from_conn = false;
+        if (!conn.zc_notif_pending) self.releaseConnSendBody(conn);
 
         conn.recv_queue.setParseOffset(conn.inflight_request_len);
         _ = conn.recv_queue.consumeParsed(&self.http_recv_group);
@@ -967,15 +785,15 @@ pub const Pipeline = struct {
                 if (conn.recv_queue.sliceIfContiguous(0, ht.header_end)) |data| {
                     if (data.len >= 6 and std.mem.eql(u8, data[1..4], "ET ")) {
                         const uri_end = std.mem.indexOfScalarPos(u8, data, 4, ' ') orelse {
-                            try self.send_q.push(makeErrorSend(ht.conn, 400));
+                            try self.send_q.push(makeErrorSend(ht.conn, .bad_request));
                             continue;
                         };
                         const uri = data[4..uri_end];
                         switch (req_ctx.router.match(.GET, uri)) {
                             .found => |found| try self.dispatchMatchedRouteNoGil(req_ctx, ht, null, found),
-                            .not_found => try self.send_q.push(makeErrorSend(ht.conn, 404)),
+                            .not_found => try self.send_q.push(makeErrorSend(ht.conn, .not_found)),
                             .method_not_allowed => {
-                                var resp = response_mod.Response.init(405);
+                                var resp = response_mod.Response.init(.method_not_allowed);
                                 resp.body = "Method Not Allowed";
                                 try self.send_q.push(makeResponseSend(ht.conn, resp));
                             },
@@ -986,7 +804,7 @@ pub const Pipeline = struct {
             }
 
             var parsed = self.parseHandleRequestQueue(conn, ht) catch {
-                try self.send_q.push(makeErrorSend(ht.conn, 400));
+                try self.send_q.push(makeErrorSend(ht.conn, .bad_request));
                 continue;
             };
             defer parsed.deinit(self.allocator);
@@ -994,9 +812,9 @@ pub const Pipeline = struct {
             const method = routerMethod(req.method orelse .GET);
             switch (req_ctx.router.match(method, req.uri orelse "/")) {
                 .found => |found| try self.dispatchMatchedRouteNoGil(req_ctx, ht, &req, found),
-                .not_found => try self.send_q.push(makeErrorSend(ht.conn, 404)),
+                .not_found => try self.send_q.push(makeErrorSend(ht.conn, .not_found)),
                 .method_not_allowed => {
-                    var resp = response_mod.Response.init(405);
+                    var resp = response_mod.Response.init(.method_not_allowed);
                     resp.body = "Method Not Allowed";
                     try self.send_q.push(makeResponseSend(ht.conn, resp));
                 },
@@ -1005,50 +823,182 @@ pub const Pipeline = struct {
     }
 
     fn stageHandlePython(self: *Pipeline) !void {
-        const req_ctx = self.req_ctx orelse return;
-        const batch = self.py_handle_q.mutableSlice();
-        if (batch.len == 0) return;
+        if (self.py_ready_q.len == 0) return;
+        try self.drainPythonReady();
+    }
 
-        const py_ctx = req_ctx.py_ctx orelse {
-            for (batch) |task| {
-                try self.send_q.push(makeErrorSend(task.conn, 503));
+    fn drainPythonReady(self: *Pipeline) !void {
+        const req_ctx = self.req_ctx orelse return;
+        const py_ctx = req_ctx.py_ctx orelse return;
+
+        while (self.py_ready_q.len > 0) {
+            const batch = self.py_ready_q.mutableSlice();
+            const batch_len = self.py_ready_q.len;
+            self.py_ready_q.len = 0;
+
+            var invoke_metrics = driver.InvokeMetrics{};
+            for (batch[0..batch_len]) |*task| {
+                switch (task.*) {
+                    .invoke => |*invoke| try self.runInvokeReadyTask(py_ctx, invoke, &invoke_metrics),
+                    .redis_resume => |ready_task| try self.runRedisResumeReadyTask(py_ctx, ready_task),
+                    .pg_resume => |ready_task| try self.runPgResumeReadyTask(py_ctx, ready_task),
+                }
             }
+            self.stats.accumInvokeMetrics(&invoke_metrics);
+        }
+    }
+
+    fn runInvokeReadyTask(
+        self: *Pipeline,
+        py_ctx: *handler_mod.PyContext,
+        task: *PythonHandleTask,
+        invoke_metrics: *driver.InvokeMetrics,
+    ) !void {
+        switch (task.kind) {
+            .no_args => self.stats.py_no_args += 1,
+            .params_only => self.stats.py_params_only += 1,
+            .request => self.stats.py_request += 1,
+        }
+        const t_request_obj = std.time.Instant.now() catch null;
+        const request_obj = self.buildPythonHandleRequestObject(task) catch {
+            self.stats.ns_py_request_obj += elapsedNs(t_request_obj);
+            try self.send_q.push(makeErrorSend(task.conn, .internal_server_error));
             return;
         };
+        self.stats.ns_py_request_obj += elapsedNs(t_request_obj);
+        defer ffi.xdecref(request_obj);
 
-        var invoke_metrics = driver.InvokeMetrics{};
-        for (batch) |*task| {
-            const conn = self.conns.get_ptr(task.conn);
-            switch (task.kind) {
-                .no_args => self.stats.py_no_args += 1,
-                .params_only => self.stats.py_params_only += 1,
-                .request => self.stats.py_request += 1,
-            }
-            const request_obj = self.buildPythonHandleRequestObject(task) catch {
-                try self.send_q.push(makeErrorSend(task.conn, 500));
-                continue;
-            };
-            defer ffi.xdecref(request_obj);
+        const t_invoke = std.time.Instant.now() catch null;
+        const result = try driver.invokePythonHandlerWithKnownFlags(
+            py_ctx.py.snek_module,
+            task.py_id,
+            task.kind == .no_args,
+            task.kind == .params_only,
+            task.is_async,
+            request_obj,
+            task.params[0..task.param_count],
+            self.redisSendSlice(),
+            self.pgSendSlice(),
+            self.pgStmtCache(),
+            self.pgConnPrepared(),
+            invoke_metrics,
+        );
+        self.stats.ns_py_invoke_total += elapsedNs(t_invoke);
+        try self.handleResult(task.conn, result);
+    }
 
-            const result = try driver.invokePythonHandlerWithKnownFlags(
-                py_ctx.py.snek_module,
-                task.py_id,
-                task.kind == .no_args,
-                task.kind == .params_only,
-                task.response_hint,
-                request_obj,
-                task.params[0..task.param_count],
-                &conn.body_buf,
-                &self.response_pool,
-                self.redisSendSlice(),
-                self.pgSendSlice(),
-                self.pgStmtCache(),
-                self.pgConnPrepared(),
-                &invoke_metrics,
-            );
-            try self.handleResult(task.conn, result);
+    fn runRedisResumeReadyTask(
+        self: *Pipeline,
+        py_ctx: *handler_mod.PyContext,
+        ready_task: RedisResumeReady,
+    ) !void {
+        defer ffi.decref(ready_task.result);
+        const waiter = ready_task.waiter;
+
+        const send = ffi.iterSend(waiter.py_coro, ready_task.result);
+        switch (send.status) {
+            .next => {
+                const sentinel = send.result.?;
+                defer ffi.decref(sentinel);
+                const yield = driver.consumeAsyncYield(
+                    py_ctx.py.snek_module,
+                    sentinel,
+                    waiter.py_coro,
+                    self.redisSendSlice(),
+                    self.pgSendSlice(),
+                    self.pgStmtCache(),
+                    self.pgConnPrepared(),
+                ) catch {
+                    ffi.coroutineClose(waiter.py_coro);
+                    ffi.decref(waiter.py_coro);
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
+                    return;
+                };
+                switch (yield) {
+                    .redis => |ry| {
+                        self.redis_send_len += ry.bytes_written;
+                        try self.pushRedisWaiter(waiter.conn_idx, ry.py_coro);
+                        self.redis_in_flight += 1;
+                    },
+                    .pg => |pg_yield| {
+                        const pg_conn = &self.pg_conns[self.pg_last_conn];
+                        pg_conn.send_len += pg_yield.bytes_written;
+                        errdefer ffi.xdecref(pg_yield.model_cls);
+                        try pg_conn.pushWaiter(waiter.conn_idx, pg_yield.py_coro, pg_yield.cmd, pg_yield.stmt_idx, pg_yield.model_cls);
+                    },
+                }
+            },
+            .@"return" => {
+                ffi.decref(waiter.py_coro);
+                const py_res = send.result orelse {
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
+                    return;
+                };
+                try self.send_q.push(makePythonSend(waiter.conn_idx, py_res));
+            },
+            .@"error" => {
+                ffi.decref(waiter.py_coro);
+                if (ffi.errOccurred()) ffi.errPrint();
+                try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
+            },
         }
-        self.stats.accumInvokeMetrics(&invoke_metrics);
+    }
+
+    fn runPgResumeReadyTask(
+        self: *Pipeline,
+        py_ctx: *handler_mod.PyContext,
+        ready_task: PgResumeReady,
+    ) !void {
+        defer ffi.decref(ready_task.result);
+        defer ffi.xdecref(ready_task.waiter.model_cls);
+        const waiter = ready_task.waiter;
+
+        const send = ffi.iterSend(waiter.py_coro, ready_task.result);
+        switch (send.status) {
+            .next => {
+                const sentinel = send.result.?;
+                defer ffi.decref(sentinel);
+                const yield = driver.consumeAsyncYield(
+                    py_ctx.py.snek_module,
+                    sentinel,
+                    waiter.py_coro,
+                    self.redisSendSlice(),
+                    self.pgSendSlice(),
+                    self.pgStmtCache(),
+                    self.pgConnPrepared(),
+                ) catch {
+                    ffi.coroutineClose(waiter.py_coro);
+                    ffi.decref(waiter.py_coro);
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
+                    return;
+                };
+                switch (yield) {
+                    .redis => |ry| {
+                        self.redis_send_len += ry.bytes_written;
+                        try self.pushRedisWaiter(waiter.conn_idx, ry.py_coro);
+                    },
+                    .pg => |pg_yield| {
+                        const pg_conn = &self.pg_conns[self.pg_last_conn];
+                        pg_conn.send_len += pg_yield.bytes_written;
+                        errdefer ffi.xdecref(pg_yield.model_cls);
+                        try pg_conn.pushWaiter(waiter.conn_idx, pg_yield.py_coro, pg_yield.cmd, pg_yield.stmt_idx, pg_yield.model_cls);
+                    },
+                }
+            },
+            .@"return" => {
+                ffi.decref(waiter.py_coro);
+                const py_res = send.result orelse {
+                    try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
+                    return;
+                };
+                try self.send_q.push(makePythonSend(waiter.conn_idx, py_res));
+            },
+            .@"error" => {
+                ffi.decref(waiter.py_coro);
+                if (ffi.errOccurred()) ffi.errPrint();
+                try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
+            },
+        }
     }
 
     fn buildPythonHandleRequestObject(_: *Pipeline, task: *PythonHandleTask) !?*ffi.PyObject {
@@ -1068,28 +1018,6 @@ pub const Pipeline = struct {
         return t1.since(t0);
     }
 
-    fn queueConvertedPythonResult(
-        self: *Pipeline,
-        conn_idx: u16,
-        py_result: *ffi.PyObject,
-        response_hint: response_hint_mod.ResponseHint,
-    ) !void {
-        const conn = self.conns.get_ptr(conn_idx);
-        var metrics = driver.InvokeMetrics{};
-        const t_convert = std.time.Instant.now() catch null;
-        var resp = driver.convertPythonResponseHinted(
-            py_result,
-            &conn.body_buf,
-            &self.response_pool,
-            response_hint,
-            &metrics,
-        );
-        metrics.ns_convert += elapsedNs(t_convert);
-        self.stats.accumInvokeMetrics(&metrics);
-        errdefer resp.deinit();
-        try self.send_q.push(makeOwnedResponseSend(conn_idx, &resp));
-    }
-
     fn dispatchMatchedRouteNoGil(
         self: *Pipeline,
         req_ctx: *const handler_mod.RequestContext,
@@ -1099,19 +1027,19 @@ pub const Pipeline = struct {
     ) !void {
         if (req_ctx.py_handler_ids[found.handler_id]) |py_id| {
             if (req_ctx.py_ctx == null) {
-                try self.send_q.push(makeErrorSend(ht.conn, 503));
+                try self.send_q.push(makeErrorSend(ht.conn, .service_unavailable));
                 return;
             }
             const flags = if (req_ctx.py_handler_flags) |table| table[found.handler_id] else handler_mod.PyHandlerFlags{};
             if (flags.no_args) {
-                try self.queuePythonHandle(ht.conn, py_id, .no_args, @enumFromInt(flags.response_hint), &.{});
+                try self.queuePythonHandle(ht.conn, py_id, .no_args, flags.is_async, &.{});
                 return;
             }
             if (flags.needs_params) {
-                try self.queuePythonHandle(ht.conn, py_id, .params_only, @enumFromInt(flags.response_hint), found.params[0..found.param_count]);
+                try self.queuePythonHandle(ht.conn, py_id, .params_only, flags.is_async, found.params[0..found.param_count]);
                 return;
             }
-            try self.queuePythonHandle(ht.conn, py_id, .request, @enumFromInt(flags.response_hint), found.params[0..found.param_count]);
+            try self.queuePythonHandle(ht.conn, py_id, .request, flags.is_async, found.params[0..found.param_count]);
             return;
         }
 
@@ -1122,7 +1050,7 @@ pub const Pipeline = struct {
                 req
             else blk: {
                 parsed_storage = self.parseHandleRequestQueue(self.conns.get_ptr(ht.conn), ht) catch {
-                    try self.send_q.push(makeErrorSend(ht.conn, 400));
+                    try self.send_q.push(makeErrorSend(ht.conn, .bad_request));
                     return;
                 };
                 break :blk &parsed_storage.?.req;
@@ -1131,7 +1059,7 @@ pub const Pipeline = struct {
             return;
         }
 
-        try self.send_q.push(makeErrorSend(ht.conn, 500));
+        try self.send_q.push(makeErrorSend(ht.conn, .internal_server_error));
     }
 
     fn queuePythonHandle(
@@ -1139,14 +1067,14 @@ pub const Pipeline = struct {
         conn_idx: u16,
         py_id: u32,
         kind: PythonHandleKind,
-        response_hint: response_hint_mod.ResponseHint,
+        is_async: bool,
         params: []const router_mod.PathParam,
     ) !void {
         var task = PythonHandleTask{
             .conn = conn_idx,
             .py_id = py_id,
             .kind = kind,
-            .response_hint = response_hint,
+            .is_async = is_async,
         };
         errdefer if (task.request_backing) |*backing| backing.deinit();
         var stable_params = params;
@@ -1170,7 +1098,7 @@ pub const Pipeline = struct {
             task.request_backing = try snek_request.Backing.fromParsed(lease, request_len, &parsed_req, stable_params);
         }
         task.param_count = copyPathParams(&task.params, stable_params);
-        try self.py_handle_q.push(task);
+        try self.py_ready_q.push(.{ .invoke = task });
     }
 
     fn parseHandleRequestQueue(self: *Pipeline, conn: *const Conn, ht: HandleTask) !ParsedHandleRequest {
@@ -1211,24 +1139,38 @@ pub const Pipeline = struct {
 
     /// Handle an InvokeResult: response goes to send_q, yields update send buffers + push waiters.
     fn handleResult(self: *Pipeline, conn: u16, result: driver.InvokeResult) !void {
+        const t_result = std.time.Instant.now() catch null;
         switch (result) {
-            .response => |owned| {
-                var resp = owned;
-                errdefer resp.deinit();
-                try self.send_q.push(makeOwnedResponseSend(conn, &resp));
+            .native_response => |resp| {
+                try self.send_q.push(makeResponseSend(conn, resp));
+                const elapsed = elapsedNs(t_result);
+                self.stats.ns_py_result += elapsed;
+                self.stats.ns_py_result_response += elapsed;
+            },
+            .py_result => |py_result| {
+                try self.send_q.push(makePythonSend(conn, py_result));
+                const elapsed = elapsedNs(t_result);
+                self.stats.ns_py_result += elapsed;
+                self.stats.ns_py_result_response += elapsed;
             },
             .redis_yield => |ry| {
                 self.redis_send_len += ry.bytes_written;
                 try self.pushRedisWaiter(conn, ry.py_coro);
+                const elapsed = elapsedNs(t_result);
+                self.stats.ns_py_result += elapsed;
+                self.stats.ns_py_result_yield += elapsed;
             },
             .pg_yield => |pg| {
                 // The round-robin PgConn was selected by pgSendSlice before
-                // classifySentinel wrote into its send buffer. pg_last_conn
+                // consumeAsyncYield wrote into its send buffer. pg_last_conn
                 // tracks which connection was selected.
                 const pg_conn = &self.pg_conns[self.pg_last_conn];
                 pg_conn.send_len += pg.bytes_written;
                 errdefer ffi.xdecref(pg.model_cls);
                 try pg_conn.pushWaiter(conn, pg.py_coro, pg.cmd, pg.stmt_idx, pg.model_cls);
+                const elapsed = elapsedNs(t_result);
+                self.stats.ns_py_result += elapsed;
+                self.stats.ns_py_result_yield += elapsed;
             },
         }
     }
@@ -1279,19 +1221,30 @@ pub const Pipeline = struct {
         for (self.send_q.mutableSlice()) |*st| {
             const conn = self.conns.get_ptr(st.conn);
             if (conn.send_mode != .idle) {
-                st.body_lease.release();
+                self.discardSendTask(st);
                 try self.close_q.push(st.conn);
                 continue;
             }
-            prepareConnSend(conn, st, common);
+
+            var prepared = switch (st.source) {
+                .native => |resp| py_send.Prepared.fromResponse(resp),
+                .python => |py_result| blk: {
+                    defer ffi.decref(py_result);
+                    break :blk py_send.prepare(py_result, &conn.body_buf, &self.response_pool) catch {
+                        if (ffi.errOccurred()) ffi.errPrint();
+                        break :blk py_send.Prepared.fromResponse(response_mod.Response.init(.internal_server_error));
+                    };
+                },
+            };
+            defer prepared.deinit();
+
+            try prepareConnSend(conn, &prepared, st.keep_alive, common);
             self.submitConnSend(conn) catch {
                 conn.send_mode = .idle;
                 conn.send_total_len = 0;
                 conn.send_sent = 0;
                 conn.send_iov_count = 0;
-                if (!conn.zc_notif_pending) conn.send_body_lease.release();
-                conn.send_body = null;
-                conn.send_body_from_conn = false;
+                if (!conn.zc_notif_pending) self.releaseConnSendBody(conn);
                 conn.zc_hold = null;
                 conn.zc_notif_pending = false;
                 try self.close_q.push(st.conn);
@@ -1299,39 +1252,48 @@ pub const Pipeline = struct {
         }
     }
 
-    fn prepareConnSend(conn: *Conn, st: *SendTask, common: []const u8) void {
-        const use_zc = shouldUseSendMsgZc(conn, st, common);
+    fn prepareConnSend(
+        conn: *Conn,
+        prepared: *py_send.Prepared,
+        keep_alive: bool,
+        common: []const u8,
+    ) error{UnsupportedStatus}!void {
+        const use_zc = shouldUseSendMsgZc(conn, &prepared.response, keep_alive, common);
 
         conn.send_mode = if (use_zc) .sendmsg_zc else .sendv;
         conn.send_sent = 0;
-        conn.send_body = st.body;
-        conn.send_body_from_conn = if (st.body) |body| bodyPointsIntoConn(conn, body) else false;
+        conn.send_body = prepared.response.body;
+        conn.send_body_from_conn = if (prepared.response.body) |body| bodyPointsIntoConn(conn, body) else false;
         conn.send_body_lease.release();
-        conn.send_body_lease = st.body_lease;
-        st.body_lease = .{};
+        conn.send_body_py.deinit();
+        conn.send_body_lease = prepared.body_lease;
+        conn.send_body_py = prepared.py_body;
+        prepared.body_lease = .{};
+        prepared.py_body = .{};
         conn.send_iov_count = 0;
 
-        var hdr_storage: []u8 = conn.send_hdr[0..];
         if (use_zc) {
             var hold = ZcHold{};
-            @memcpy(hold.hdr[0..st.hdr_len], st.hdr[0..st.hdr_len]);
-            hold.hdr_len = st.hdr_len;
+            hold.hdr_len = writeResponseHeaders(hold.hdr[0..], &prepared.response, keep_alive);
             conn.zc_hold = hold;
             conn.zc_notif_pending = true;
-            hdr_storage = conn.zc_hold.?.hdr[0..];
         } else {
-            @memcpy(conn.send_hdr[0..st.hdr_len], st.hdr[0..st.hdr_len]);
+            const hdr_len = writeResponseHeaders(conn.send_hdr[0..], &prepared.response, keep_alive);
+            conn.send_iovecs[2] = .{ .base = conn.send_hdr[0..].ptr, .len = hdr_len };
             if (!conn.zc_notif_pending) conn.zc_hold = null;
         }
-        conn.send_hdr_len = st.hdr_len;
 
-        conn.send_iovecs[0] = .{ .base = st.status_line.ptr, .len = st.status_line.len };
+        const status_line = try statusLine(prepared.response.status);
+        conn.send_iovecs[0] = .{ .base = status_line.ptr, .len = status_line.len };
         conn.send_iov_count += 1;
         conn.send_iovecs[1] = .{ .base = common.ptr, .len = common.len };
         conn.send_iov_count += 1;
-        conn.send_iovecs[2] = .{ .base = hdr_storage.ptr, .len = st.hdr_len };
+        if (use_zc) {
+            const hdr = conn.zc_hold.?.hdr[0..conn.zc_hold.?.hdr_len];
+            conn.send_iovecs[2] = .{ .base = hdr.ptr, .len = hdr.len };
+        }
         conn.send_iov_count += 1;
-        if (st.body) |body| {
+        if (prepared.response.body) |body| {
             conn.send_iovecs[3] = .{ .base = body.ptr, .len = body.len };
             conn.send_iov_count += 1;
         }
@@ -1348,12 +1310,52 @@ pub const Pipeline = struct {
         };
     }
 
-    fn shouldUseSendMsgZc(conn: *const Conn, st: *const SendTask, common: []const u8) bool {
+    fn shouldUseSendMsgZc(
+        conn: *const Conn,
+        response: *const response_mod.Response,
+        keep_alive: bool,
+        common: []const u8,
+    ) bool {
         if (conn.zc_notif_pending) return false;
-        const body = st.body orelse return false;
+        const body = response.body orelse return false;
         if (bodyPointsIntoConn(conn, body)) return false;
-        const total_len = st.status_line.len + common.len + st.hdr_len + body.len;
+        const status_line_len = (statusLine(response.status) catch return false).len;
+        const total_len = status_line_len + common.len + estimateResponseHeaderLen(response, keep_alive) + body.len;
         return total_len >= HTTP_SEND_ZC_MIN_BYTES;
+    }
+
+    fn discardSendTask(_: *Pipeline, st: *SendTask) void {
+        switch (st.source) {
+            .native => {},
+            .python => |py_result| ffi.decref(py_result),
+        }
+    }
+
+    fn releaseConnSendBody(self: *Pipeline, conn: *Conn) void {
+        conn.send_body_lease.release();
+        self.queuePyBodyRelease(&conn.send_body_py);
+        conn.send_body = null;
+        conn.send_body_from_conn = false;
+    }
+
+    fn queuePyBodyRelease(self: *Pipeline, hold: *PyBodyHold) void {
+        if (hold.owner == null and hold.buffer == null) return;
+        self.py_body_release.append(self.allocator, hold.*) catch {
+            if (self.req_ctx) |ctx| {
+                if (ctx.py_ctx) |py_ctx| {
+                    py_ctx.py.acquireGil();
+                    defer py_ctx.py.releaseGil();
+                }
+            }
+            hold.deinit();
+            return;
+        };
+        hold.* = .{};
+    }
+
+    fn drainPendingPyBodyReleases(self: *Pipeline) void {
+        for (self.py_body_release.items) |*hold| hold.deinit();
+        self.py_body_release.clearRetainingCapacity();
     }
 
     fn bodyPointsIntoConn(conn: *const Conn, body: []const u8) bool {
@@ -1524,73 +1526,27 @@ pub const Pipeline = struct {
             else => return false,
         };
 
-        // Resume head waiter's coroutine with the parsed result
-        try self.resumeRedisWaiter(py_result);
+        // Queue head waiter for Python resumption under the shared ready drain.
+        const waiter = self.popRedisWaiter() orelse {
+            ffi.decref(py_result);
+            return true;
+        };
+        errdefer ffi.decref(py_result);
+        try self.py_ready_q.push(.{
+            .redis_resume = .{
+                .waiter = waiter,
+                .result = py_result,
+            },
+        });
         self.redis_in_flight -= 1;
         return true;
-    }
-
-    /// Resume the head waiter's Python coroutine with a redis result.
-    /// Uses PyIter_Send — no method lookup, no StopIteration exception overhead.
-    fn resumeRedisWaiter(self: *Pipeline, result: *ffi.PyObject) !void {
-        defer ffi.decref(result); // iterSend increfs internally; we own the creation ref
-        const waiter = self.popRedisWaiter() orelse return;
-
-        const send = ffi.iterSend(waiter.py_coro, result);
-        switch (send.status) {
-            .next => {
-                // Coroutine yielded again — classify sentinel
-                const sentinel = send.result.?;
-                defer ffi.decref(sentinel);
-                const yield = driver.classifySentinel(
-                    sentinel,
-                    waiter.py_coro,
-                    self.redisSendSlice(),
-                    self.pgSendSlice(),
-                    self.pgStmtCache(),
-                    self.pgConnPrepared(),
-                ) catch {
-                    ffi.coroutineClose(waiter.py_coro);
-                    ffi.decref(waiter.py_coro);
-                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
-                    return;
-                };
-                switch (yield) {
-                    .redis => |ry| {
-                        self.redis_send_len += ry.bytes_written;
-                        try self.pushRedisWaiter(waiter.conn_idx, ry.py_coro);
-                        self.redis_in_flight += 1;
-                    },
-                    .pg => |pg_yield| {
-                        const pg_conn = &self.pg_conns[self.pg_last_conn];
-                        pg_conn.send_len += pg_yield.bytes_written;
-                        errdefer ffi.xdecref(pg_yield.model_cls);
-                        try pg_conn.pushWaiter(waiter.conn_idx, pg_yield.py_coro, pg_yield.cmd, pg_yield.stmt_idx, pg_yield.model_cls);
-                    },
-                }
-            },
-            .@"return" => {
-                ffi.decref(waiter.py_coro);
-                const py_res = send.result orelse {
-                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
-                    return;
-                };
-                defer ffi.decref(py_res);
-                try self.queueConvertedPythonResult(waiter.conn_idx, py_res, .any);
-            },
-            .@"error" => {
-                ffi.decref(waiter.py_coro);
-                if (ffi.errOccurred()) ffi.errPrint();
-                try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
-            },
-        }
     }
 
     fn failHeadWaiter(self: *Pipeline) !void {
         const waiter = self.popRedisWaiter() orelse return;
         ffi.coroutineClose(waiter.py_coro);
         ffi.decref(waiter.py_coro);
-        try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+        try self.send_q.push(makeErrorSend(waiter.conn_idx, .internal_server_error));
     }
 
     fn failRedisWaiters(self: *Pipeline) !void {
@@ -1644,7 +1600,7 @@ pub const Pipeline = struct {
         return @enumFromInt(@as(u16, @intCast(-result)));
     }
 
-    fn markPgFatal(pg: *PgConn, status: u16, body: ?[]const u8) void {
+    fn markPgFatal(pg: *PgConn, status: std.http.Status, body: ?[]const u8) void {
         pg.recv_state = .err;
         pg.recv_armed = false;
         pg.fail_status = status;
@@ -1653,7 +1609,7 @@ pub const Pipeline = struct {
 
     pub fn onPgSendIO(_: *Pipeline, pg: *PgConn, completion: Completion) !void {
         if (completion.result <= 0) {
-            markPgFatal(pg, 500, null);
+            markPgFatal(pg, .internal_server_error, null);
             return;
         }
         const sent: usize = @intCast(completion.result);
@@ -1668,7 +1624,7 @@ pub const Pipeline = struct {
 
     pub fn onPgRecvIO(self: *Pipeline, pg: *PgConn, completion: Completion) !void {
         if (completion.result == 0) {
-            markPgFatal(pg, 500, null);
+            markPgFatal(pg, .internal_server_error, null);
             return;
         }
         if (completion.result < 0) {
@@ -1677,18 +1633,18 @@ pub const Pipeline = struct {
                 pg.recv_state = if (pg.recv_queue.queuedBytes() > 0) .parsing else .idle;
                 return;
             }
-            markPgFatal(pg, 500, null);
+            markPgFatal(pg, .internal_server_error, null);
             return;
         }
 
         const lease = self.pg_recv_group.take(completion) catch {
-            markPgFatal(pg, 500, "Postgres recv completion missing or corrupt buffer metadata");
+            markPgFatal(pg, .internal_server_error, "Postgres recv completion missing or corrupt buffer metadata");
             return;
         };
         pg.recv_queue.append(&self.pg_recv_group, lease) catch |err| {
             switch (err) {
                 error.TransportQueueFull, error.TransportSegmentQueueFull => {
-                    markPgFatal(pg, 500, "Postgres receive queue exhausted");
+                    markPgFatal(pg, .internal_server_error, "Postgres receive queue exhausted");
                     return;
                 },
             }
@@ -1732,7 +1688,7 @@ pub const Pipeline = struct {
             // 3. Flush pending sends — append single Sync for entire batch
             const new_queries = pg.waiter_count - pg.in_flight;
             if (new_queries > 0 and pg.send_state == .idle and pg.send_len > 0) {
-                const wire_mod = @import("db/wire.zig");
+                const wire_mod = @import("../db/wire.zig");
                 const sync = wire_mod.encodeSync(pg.send_buf[pg.send_len..]);
                 pg.send_len += sync.len;
                 pg.in_flight += new_queries;
@@ -1768,7 +1724,7 @@ pub const Pipeline = struct {
     }
 
     fn parsePgConnResponses(self: *Pipeline, pg: *PgConn) !void {
-        const wire = @import("db/wire.zig");
+        const wire = @import("../db/wire.zig");
 
         // Collected completed query results — resumed after parse loop
         const CompletedQuery = struct { waiter: PgWaiter, result: *ffi.PyObject };
@@ -1786,7 +1742,7 @@ pub const Pipeline = struct {
                 error.MessageTooLarge => {
                     if (py_result) |r| ffi.decref(r);
                     if (py_list) |l| ffi.decref(l);
-                    try self.failPgConnWaitersWithStatus(pg, 500, "Postgres message exceeds receive queue capacity");
+                    try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres message exceeds receive queue capacity");
                     return;
                 },
                 else => return err,
@@ -1825,7 +1781,7 @@ pub const Pipeline = struct {
                         error.ProtocolViolation => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres protocol violation");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres protocol violation");
                             return;
                         },
                         else => return err,
@@ -1846,13 +1802,13 @@ pub const Pipeline = struct {
                         error.ProtocolViolation => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres protocol violation");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres protocol violation");
                             return;
                         },
                         error.MessageTooLarge, error.RowTooLarge => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres row exceeds receive/result capacity");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres row exceeds receive/result capacity");
                             return;
                         },
                         else => return err,
@@ -1903,9 +1859,9 @@ pub const Pipeline = struct {
                             ffi.xdecref(cq.waiter.model_cls);
                             ffi.coroutineClose(cq.waiter.py_coro);
                             ffi.decref(cq.waiter.py_coro);
-                            try self.send_q.push(makeErrorSend(cq.waiter.conn_idx, 500));
+                            try self.send_q.push(makeErrorSend(cq.waiter.conn_idx, .internal_server_error));
                         }
-                        try self.failPgConnWaitersWithStatus(pg, 500, "Postgres batch accounting mismatch");
+                        try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres batch accounting mismatch");
                         return;
                     }
 
@@ -1916,22 +1872,29 @@ pub const Pipeline = struct {
                                 ffi.xdecref(cq.waiter.model_cls);
                                 ffi.coroutineClose(cq.waiter.py_coro);
                                 ffi.decref(cq.waiter.py_coro);
-                                try self.send_q.push(makeErrorSend(cq.waiter.conn_idx, 500));
+                                try self.send_q.push(makeErrorSend(cq.waiter.conn_idx, .internal_server_error));
                             }
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres batch accounting mismatch");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres batch accounting mismatch");
                             return;
                         };
                         ffi.xdecref(failed_waiter.model_cls);
                         ffi.coroutineClose(failed_waiter.py_coro);
                         ffi.decref(failed_waiter.py_coro);
-                        try self.send_q.push(makeErrorSend(failed_waiter.conn_idx, 500));
+                        try self.send_q.push(makeErrorSend(failed_waiter.conn_idx, .internal_server_error));
                         pg.in_flight -= 1;
                     }
 
                     query_save_pos = pg.recv_queue.parseOffset();
 
                     for (completed[0..completed_count]) |cq| {
-                        try self.resumePgWaiter(cq.waiter, cq.result);
+                        errdefer ffi.decref(cq.result);
+                        errdefer ffi.xdecref(cq.waiter.model_cls);
+                        try self.py_ready_q.push(.{
+                            .pg_resume = .{
+                                .waiter = cq.waiter,
+                                .result = cq.result,
+                            },
+                        });
                     }
                     completed_count = 0;
                 },
@@ -1939,70 +1902,24 @@ pub const Pipeline = struct {
             }
         }
 
-        // Resume completed queries after parsing to keep completion batching cheap.
+        // Queue completed queries after parsing to keep completion batching cheap.
         for (completed[0..completed_count]) |cq| {
-            try self.resumePgWaiter(cq.waiter, cq.result);
-        }
-    }
-
-    fn resumePgWaiter(self: *Pipeline, waiter: PgWaiter, result: *ffi.PyObject) !void {
-        defer ffi.decref(result); // iterSend increfs internally; we own the creation ref
-        defer ffi.xdecref(waiter.model_cls);
-        const send = ffi.iterSend(waiter.py_coro, result);
-        switch (send.status) {
-            .next => {
-                // Coroutine yielded again — classify sentinel
-                const sentinel = send.result.?;
-                defer ffi.decref(sentinel);
-                const yield = driver.classifySentinel(
-                    sentinel,
-                    waiter.py_coro,
-                    self.redisSendSlice(),
-                    self.pgSendSlice(),
-                    self.pgStmtCache(),
-                    self.pgConnPrepared(),
-                ) catch {
-                    ffi.coroutineClose(waiter.py_coro);
-                    ffi.decref(waiter.py_coro);
-                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
-                    return;
-                };
-                switch (yield) {
-                    .redis => |ry| {
-                        self.redis_send_len += ry.bytes_written;
-                        try self.pushRedisWaiter(waiter.conn_idx, ry.py_coro);
-                    },
-                    .pg => |pg_yield| {
-                        const pg_conn = &self.pg_conns[self.pg_last_conn];
-                        pg_conn.send_len += pg_yield.bytes_written;
-                        errdefer ffi.xdecref(pg_yield.model_cls);
-                        try pg_conn.pushWaiter(waiter.conn_idx, pg_yield.py_coro, pg_yield.cmd, pg_yield.stmt_idx, pg_yield.model_cls);
-                    },
-                }
-            },
-            .@"return" => {
-                ffi.decref(waiter.py_coro);
-                const py_res = send.result orelse return error.PythonError;
-                defer ffi.decref(py_res);
-                const response_hint: response_hint_mod.ResponseHint = switch (waiter.cmd) {
-                    .FETCH_ONE, .FETCH_ONE_MODEL => .row_json,
-                    else => .any,
-                };
-                try self.queueConvertedPythonResult(waiter.conn_idx, py_res, response_hint);
-            },
-            .@"error" => {
-                ffi.decref(waiter.py_coro);
-                if (ffi.errOccurred()) ffi.errPrint();
-                try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
-            },
+            errdefer ffi.decref(cq.result);
+            errdefer ffi.xdecref(cq.waiter.model_cls);
+            try self.py_ready_q.push(.{
+                .pg_resume = .{
+                    .waiter = cq.waiter,
+                    .result = cq.result,
+                },
+            });
         }
     }
 
     fn failPgConnWaiters(self: *Pipeline, pg: *PgConn) !void {
-        try self.failPgConnWaitersWithStatus(pg, 500, null);
+        try self.failPgConnWaitersWithStatus(pg, .internal_server_error, null);
     }
 
-    fn failPgConnWaitersWithStatus(self: *Pipeline, pg: *PgConn, status: u16, body: ?[]const u8) !void {
+    fn failPgConnWaitersWithStatus(self: *Pipeline, pg: *PgConn, status: std.http.Status, body: ?[]const u8) !void {
         while (pg.waiter_count > 0) {
             const waiter = pg.popWaiter() orelse break;
             ffi.xdecref(waiter.model_cls);
@@ -2021,7 +1938,7 @@ pub const Pipeline = struct {
         pg.recv_armed = false;
         pg.send_state = .idle;
         pg.in_flight = 0;
-        pg.fail_status = 500;
+        pg.fail_status = .internal_server_error;
         pg.fail_body = null;
         pg.recv_queue.clear(&self.pg_recv_group);
         pg.clearBatches();
@@ -2163,9 +2080,7 @@ pub const Pipeline = struct {
                 conn.send_total_len = 0;
                 conn.send_sent = 0;
                 conn.send_iov_count = 0;
-                if (!conn.zc_notif_pending) conn.send_body_lease.release();
-                conn.send_body = null;
-                conn.send_body_from_conn = false;
+                if (!conn.zc_notif_pending) self.releaseConnSendBody(conn);
                 if (conn.fd >= 0) posix.close(conn.fd);
                 conn.fd = -1;
                 conn.close_after_notif = true;
@@ -2177,7 +2092,7 @@ pub const Pipeline = struct {
             conn.inflight_request_len = 0;
             conn.head_parser = .{};
             conn.head_fed = 0;
-            conn.send_body_lease.release();
+            self.releaseConnSendBody(conn);
             posix.close(conn.fd);
             self.conns.release(index);
         }
@@ -2253,90 +2168,81 @@ const ParsedHandleRequest = struct {
 
 // ── Send Constructors ─────────────────────────────────────────────
 
-fn statusLine(code: u16) []const u8 {
-    return switch (code) {
-        200 => "HTTP/1.1 200 OK\r\n",
-        201 => "HTTP/1.1 201 Created\r\n",
-        204 => "HTTP/1.1 204 No Content\r\n",
-        301 => "HTTP/1.1 301 Moved Permanently\r\n",
-        302 => "HTTP/1.1 302 Found\r\n",
-        400 => "HTTP/1.1 400 Bad Request\r\n",
-        404 => "HTTP/1.1 404 Not Found\r\n",
-        405 => "HTTP/1.1 405 Method Not Allowed\r\n",
-        500 => "HTTP/1.1 500 Internal Server Error\r\n",
-        503 => "HTTP/1.1 503 Service Unavailable\r\n",
-        else => "HTTP/1.1 200 OK\r\n",
+fn statusLine(status: std.http.Status) error{UnsupportedStatus}![]const u8 {
+    return switch (status) {
+        .ok => "HTTP/1.1 200 OK\r\n",
+        .created => "HTTP/1.1 201 Created\r\n",
+        .no_content => "HTTP/1.1 204 No Content\r\n",
+        .moved_permanently => "HTTP/1.1 301 Moved Permanently\r\n",
+        .found => "HTTP/1.1 302 Found\r\n",
+        .not_modified => "HTTP/1.1 304 Not Modified\r\n",
+        .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+        .unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
+        .forbidden => "HTTP/1.1 403 Forbidden\r\n",
+        .not_found => "HTTP/1.1 404 Not Found\r\n",
+        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
+        .payload_too_large => "HTTP/1.1 413 Content Too Large\r\n",
+        .teapot => "HTTP/1.1 418 I'm a Teapot\r\n",
+        .too_many_requests => "HTTP/1.1 429 Too Many Requests\r\n",
+        .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
+        .bad_gateway => "HTTP/1.1 502 Bad Gateway\r\n",
+        .service_unavailable => "HTTP/1.1 503 Service Unavailable\r\n",
+        .gateway_timeout => "HTTP/1.1 504 Gateway Timeout\r\n",
+        else => return error.UnsupportedStatus,
     };
 }
 
 /// Build a SendTask from a Response object.
-/// Per-response headers go into st.hdr. Body pointer set from resp.body.
 fn makeResponseSend(conn_idx: u16, resp: response_mod.Response) SendTask {
-    var st = SendTask{
+    return .{
         .conn = conn_idx,
-        .hdr = undefined,
-        .hdr_len = 0,
-        .status_line = statusLine(resp.status),
-        .body = resp.body,
-        .body_lease = .{},
+        .source = .{ .native = resp },
+        .keep_alive = true,
     };
-    writePerResponseHeaders(&st, &resp);
-    return st;
 }
 
-fn makeOwnedResponseSend(conn_idx: u16, owned: *driver.OwnedResponse) SendTask {
-    var st = SendTask{
+fn makeErrorSend(conn_idx: u16, status: std.http.Status) SendTask {
+    return .{
         .conn = conn_idx,
-        .hdr = undefined,
-        .hdr_len = 0,
-        .status_line = statusLine(owned.response.status),
-        .body = owned.response.body,
-        .body_lease = owned.takeBodyLease(),
+        .source = .{ .native = response_mod.Response.init(status) },
+        .keep_alive = false,
     };
-    writePerResponseHeaders(&st, &owned.response);
-    return st;
 }
 
-fn makeErrorSend(conn_idx: u16, status: u16) SendTask {
-    var st = SendTask{
+fn makePythonSend(conn_idx: u16, py_result: *ffi.PyObject) SendTask {
+    return .{
         .conn = conn_idx,
-        .hdr = undefined,
-        .hdr_len = 0,
-        .status_line = statusLine(status),
-        .body = null,
-        .body_lease = .{},
+        .source = .{ .python = py_result },
+        .keep_alive = true,
     };
-    const suffix = "Connection: close\r\nContent-Length: 0\r\n\r\n";
-    @memcpy(st.hdr[0..suffix.len], suffix);
-    st.hdr_len = suffix.len;
-    return st;
 }
 
-/// Format per-response headers into SendTask.hdr:
+/// Format per-response headers directly into the provided connection-owned
+/// header buffer:
 ///   Connection: keep-alive\r\n
 ///   Content-Type: ...\r\n    (from handler)
 ///   Content-Length: N\r\n
 ///   \r\n
-fn writePerResponseHeaders(st: *SendTask, resp: *const response_mod.Response) void {
+fn writeResponseHeaders(dst: []u8, resp: *const response_mod.Response, keep_alive: bool) usize {
     var pos: usize = 0;
 
-    const ka = "Connection: keep-alive\r\n";
-    @memcpy(st.hdr[pos..][0..ka.len], ka);
-    pos += ka.len;
+    const conn_hdr = if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n";
+    @memcpy(dst[pos..][0..conn_hdr.len], conn_hdr);
+    pos += conn_hdr.len;
 
     // User headers from the Response
     for (resp.headers[0..resp.header_count]) |h| {
         const needed = h.name.len + 2 + h.value.len + 2;
-        if (pos + needed > st.hdr.len) break;
-        @memcpy(st.hdr[pos..][0..h.name.len], h.name);
+        if (pos + needed > dst.len) break;
+        @memcpy(dst[pos..][0..h.name.len], h.name);
         pos += h.name.len;
-        st.hdr[pos] = ':';
-        st.hdr[pos + 1] = ' ';
+        dst[pos] = ':';
+        dst[pos + 1] = ' ';
         pos += 2;
-        @memcpy(st.hdr[pos..][0..h.value.len], h.value);
+        @memcpy(dst[pos..][0..h.value.len], h.value);
         pos += h.value.len;
-        st.hdr[pos] = '\r';
-        st.hdr[pos + 1] = '\n';
+        dst[pos] = '\r';
+        dst[pos + 1] = '\n';
         pos += 2;
     }
 
@@ -2344,21 +2250,32 @@ fn writePerResponseHeaders(st: *SendTask, resp: *const response_mod.Response) vo
     const body_len = if (resp.body) |b| b.len else 0;
     {
         const cl = "Content-Length: ";
-        @memcpy(st.hdr[pos..][0..cl.len], cl);
+        @memcpy(dst[pos..][0..cl.len], cl);
         pos += cl.len;
-        const len_str = std.fmt.bufPrint(st.hdr[pos..], "{d}", .{body_len}) catch return;
+        const len_str = std.fmt.bufPrint(dst[pos..], "{d}", .{body_len}) catch return pos;
         pos += len_str.len;
-        st.hdr[pos] = '\r';
-        st.hdr[pos + 1] = '\n';
+        dst[pos] = '\r';
+        dst[pos + 1] = '\n';
         pos += 2;
     }
 
     // End of headers
-    st.hdr[pos] = '\r';
-    st.hdr[pos + 1] = '\n';
+    dst[pos] = '\r';
+    dst[pos + 1] = '\n';
     pos += 2;
+    return pos;
+}
 
-    st.hdr_len = pos;
+fn estimateResponseHeaderLen(resp: *const response_mod.Response, keep_alive: bool) usize {
+    var total: usize = if (keep_alive) "Connection: keep-alive\r\n".len else "Connection: close\r\n".len;
+    for (resp.headers[0..resp.header_count]) |h| {
+        total += h.name.len + 2 + h.value.len + 2;
+    }
+    const body_len = if (resp.body) |b| b.len else 0;
+    var len_buf: [20]u8 = undefined;
+    const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body_len}) catch "";
+    total += "Content-Length: ".len + len_str.len + 4;
+    return total;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -2385,20 +2302,26 @@ test "makeResponseSend 200 text" {
     const resp = response_mod.Response.text("hello");
     const st = makeResponseSend(5, resp);
     try std.testing.expectEqual(@as(u16, 5), st.conn);
-    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", st.status_line);
-    try std.testing.expectEqualStrings("hello", st.body.?);
-    // Per-response headers should contain Content-Type and Content-Length
-    const hdr = st.hdr[0..st.hdr_len];
+    try std.testing.expectEqualStrings("hello", st.response.body.?);
+    try std.testing.expect(st.keep_alive);
+
+    var hdr_buf: [SEND_HDR_CAP]u8 = undefined;
+    const hdr_len = writeResponseHeaders(&hdr_buf, &st.response, st.keep_alive);
+    const hdr = hdr_buf[0..hdr_len];
     try std.testing.expect(std.mem.indexOf(u8, hdr, "Content-Type: text/plain") != null);
     try std.testing.expect(std.mem.indexOf(u8, hdr, "Content-Length: 5") != null);
     try std.testing.expect(std.mem.endsWith(u8, hdr, "\r\n\r\n"));
 }
 
 test "makeErrorSend" {
-    const st = makeErrorSend(3, 400);
-    try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\n", st.status_line);
-    try std.testing.expect(st.body == null);
-    try std.testing.expect(std.mem.indexOf(u8, st.hdr[0..st.hdr_len], "Connection: close") != null);
+    const st = makeErrorSend(3, .bad_request);
+    try std.testing.expectEqual(std.http.Status.bad_request, st.response.status);
+    try std.testing.expect(st.response.body == null);
+    try std.testing.expect(!st.keep_alive);
+
+    var hdr_buf: [SEND_HDR_CAP]u8 = undefined;
+    const hdr_len = writeResponseHeaders(&hdr_buf, &st.response, st.keep_alive);
+    try std.testing.expect(std.mem.indexOf(u8, hdr_buf[0..hdr_len], "Connection: close") != null);
 }
 
 test "HeadParser finds header end" {

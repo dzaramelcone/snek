@@ -601,7 +601,11 @@ pub const Pipeline = struct {
         };
         conn.resetRecv();
 
-        dispatch.submitConnRecv(self, conn);
+        dispatch.submitConnRecv(self, conn) catch {
+            posix.close(client_fd);
+            self.conns.release(idx);
+            return;
+        };
     }
 
     pub fn onConnCompletion(self: *Pipeline, token: *Token, completion: Completion) !void {
@@ -624,7 +628,7 @@ pub const Pipeline = struct {
                 }
                 // Send complete — keepalive
                 conn.resetRecv();
-                dispatch.submitConnRecv(self, conn);
+                try dispatch.submitConnRecv(self, conn);
             },
             else => {},
         }
@@ -646,7 +650,10 @@ pub const Pipeline = struct {
                     try self.close_q.push(pt.conn);
                     continue;
                 };
-                dispatch.submitConnRecv(self, conn);
+                dispatch.submitConnRecv(self, conn) catch {
+                    try self.close_q.push(pt.conn);
+                    continue;
+                };
                 continue;
             }
 
@@ -661,7 +668,10 @@ pub const Pipeline = struct {
                         try self.close_q.push(pt.conn);
                         continue;
                     };
-                    dispatch.submitConnRecv(self, conn);
+                    dispatch.submitConnRecv(self, conn) catch {
+                        try self.close_q.push(pt.conn);
+                        continue;
+                    };
                     continue;
                 }
             }
@@ -730,7 +740,7 @@ pub const Pipeline = struct {
                                     continue;
                                 }
                                 const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                                    try self.send_q.push(makeErrorSend(ht.conn, 400));
+                                    try self.send_q.push(try makeErrorSend(ht.conn, .bad_request));
                                     continue;
                                 };
                                 const result = driver.invokePythonHandler(
@@ -746,32 +756,32 @@ pub const Pipeline = struct {
                                     self.pgConnPrepared(),
                                     null,
                                 ) catch {
-                                    try self.send_q.push(makeErrorSend(ht.conn, 500));
+                                    try self.send_q.push(try makeErrorSend(ht.conn, .internal_server_error));
                                     continue;
                                 };
                                 try self.handleResult(ht.conn, result);
                                 continue;
                             }
-                            try self.send_q.push(makeErrorSend(ht.conn, 503));
+                            try self.send_q.push(try makeErrorSend(ht.conn, .service_unavailable));
                         } else if (req_ctx.handlers[found.handler_id]) |h| {
                             const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                                try self.send_q.push(makeErrorSend(ht.conn, 400));
+                                try self.send_q.push(try makeErrorSend(ht.conn, .bad_request));
                                 continue;
                             };
-                            try self.send_q.push(makeResponseSend(ht.conn, h(&req)));
+                            try self.send_q.push(try makeResponseSend(ht.conn, h(&req)));
                         } else {
-                            try self.send_q.push(makeErrorSend(ht.conn, 500));
+                            try self.send_q.push(try makeErrorSend(ht.conn, .internal_server_error));
                         }
                         continue;
                     },
                     .not_found => {
-                        try self.send_q.push(makeErrorSend(ht.conn, 404));
+                        try self.send_q.push(try makeErrorSend(ht.conn, .not_found));
                         continue;
                     },
                     .method_not_allowed => {
-                        var r = response_mod.Response.init(405);
+                        var r = response_mod.Response.init(.method_not_allowed);
                         r.body = "Method Not Allowed";
-                        try self.send_q.push(makeResponseSend(ht.conn, r));
+                        try self.send_q.push(try makeResponseSend(ht.conn, r));
                         continue;
                     },
                 }
@@ -779,7 +789,7 @@ pub const Pipeline = struct {
 
             // Slow path: non-GET or SIMD screen missed — full parse
             const req = http1.Request.parse(data[0..ht.header_end]) catch {
-                try self.send_q.push(makeErrorSend(ht.conn, 400));
+                try self.send_q.push(try makeErrorSend(ht.conn, .bad_request));
                 continue;
             };
             const method_str = if (req.method) |m| @tagName(m) else "GET";
@@ -804,19 +814,19 @@ pub const Pipeline = struct {
                             );
                             try self.handleResult(ht.conn, result);
                         } else {
-                            try self.send_q.push(makeErrorSend(ht.conn, 503));
+                            try self.send_q.push(try makeErrorSend(ht.conn, .service_unavailable));
                         }
                     } else if (req_ctx.handlers[found.handler_id]) |h| {
-                        try self.send_q.push(makeResponseSend(ht.conn, h(&req)));
+                        try self.send_q.push(try makeResponseSend(ht.conn, h(&req)));
                     } else {
-                        try self.send_q.push(makeErrorSend(ht.conn, 500));
+                        try self.send_q.push(try makeErrorSend(ht.conn, .internal_server_error));
                     }
                 },
-                .not_found => try self.send_q.push(makeErrorSend(ht.conn, 404)),
+                .not_found => try self.send_q.push(try makeErrorSend(ht.conn, .not_found)),
                 .method_not_allowed => {
-                    var r = response_mod.Response.init(405);
+                    var r = response_mod.Response.init(.method_not_allowed);
                     r.body = "Method Not Allowed";
-                    try self.send_q.push(makeResponseSend(ht.conn, r));
+                    try self.send_q.push(try makeResponseSend(ht.conn, r));
                 },
             }
         }
@@ -828,7 +838,7 @@ pub const Pipeline = struct {
             .response => |owned| {
                 var resp = owned;
                 defer resp.deinit();
-                try self.send_q.push(makeResponseSend(conn, resp.response));
+                try self.send_q.push(try makeResponseSend(conn, resp.response));
             },
             .redis_yield => |ry| {
                 self.redis_send_len += ry.bytes_written;
@@ -1073,7 +1083,7 @@ pub const Pipeline = struct {
                 ) catch {
                     ffi.coroutineClose(waiter.py_coro);
                     ffi.decref(waiter.py_coro);
-                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                    try self.send_q.push(try makeErrorSend(waiter.conn_idx, .internal_server_error));
                     return;
                 };
                 switch (yield) {
@@ -1093,18 +1103,18 @@ pub const Pipeline = struct {
             .@"return" => {
                 ffi.decref(waiter.py_coro);
                 const py_res = send.result orelse {
-                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                    try self.send_q.push(try makeErrorSend(waiter.conn_idx, .internal_server_error));
                     return;
                 };
                 defer ffi.decref(py_res);
                 const resp = driver.convertPythonResponse(py_res, &conn.body_buf) catch
-                    response_mod.Response.init(500);
-                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+                    response_mod.Response.init(.internal_server_error);
+                try self.send_q.push(try makeResponseSend(waiter.conn_idx, resp));
             },
             .@"error" => {
                 ffi.decref(waiter.py_coro);
                 if (ffi.errOccurred()) ffi.errPrint();
-                try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                try self.send_q.push(try makeErrorSend(waiter.conn_idx, .internal_server_error));
             },
         }
     }
@@ -1113,7 +1123,7 @@ pub const Pipeline = struct {
         const waiter = self.popRedisWaiter() orelse return;
         ffi.coroutineClose(waiter.py_coro);
         ffi.decref(waiter.py_coro);
-        try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+        try self.send_q.push(try makeErrorSend(waiter.conn_idx, .internal_server_error));
     }
 
     fn failRedisWaiters(self: *Pipeline) !void {
@@ -1216,7 +1226,7 @@ pub const Pipeline = struct {
                             continue;
                         },
                         error.TransportRingFull => {
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres transport ring full");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres transport ring full");
                             continue;
                         },
                         else => return err,
@@ -1244,7 +1254,7 @@ pub const Pipeline = struct {
                             continue;
                         },
                         error.TransportRingFull => {
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres transport ring full");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres transport ring full");
                             continue;
                         },
                         else => return err,
@@ -1296,7 +1306,7 @@ pub const Pipeline = struct {
                 error.MessageTooLarge => {
                     if (py_result) |r| ffi.decref(r);
                     if (py_list) |l| ffi.decref(l);
-                    try self.failPgConnWaitersWithStatus(pg, 500, "Postgres message exceeds transport ring capacity");
+                    try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres message exceeds transport ring capacity");
                     return;
                 },
                 else => return err,
@@ -1335,7 +1345,7 @@ pub const Pipeline = struct {
                         error.ProtocolViolation => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres protocol violation");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres protocol violation");
                             return;
                         },
                         else => return err,
@@ -1356,13 +1366,13 @@ pub const Pipeline = struct {
                         error.ProtocolViolation => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres protocol violation");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres protocol violation");
                             return;
                         },
                         error.MessageTooLarge, error.RowTooLarge => {
                             if (py_result) |r| ffi.decref(r);
                             if (py_list) |l| ffi.decref(l);
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres row exceeds transport/result capacity");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres row exceeds transport/result capacity");
                             return;
                         },
                         else => return err,
@@ -1413,9 +1423,9 @@ pub const Pipeline = struct {
                             ffi.xdecref(cq.waiter.model_cls);
                             ffi.coroutineClose(cq.waiter.py_coro);
                             ffi.decref(cq.waiter.py_coro);
-                            try self.send_q.push(makeErrorSend(cq.waiter.conn_idx, 500));
+                            try self.send_q.push(try makeErrorSend(cq.waiter.conn_idx, .internal_server_error));
                         }
-                        try self.failPgConnWaitersWithStatus(pg, 500, "Postgres batch accounting mismatch");
+                        try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres batch accounting mismatch");
                         return;
                     }
 
@@ -1426,15 +1436,15 @@ pub const Pipeline = struct {
                                 ffi.xdecref(cq.waiter.model_cls);
                                 ffi.coroutineClose(cq.waiter.py_coro);
                                 ffi.decref(cq.waiter.py_coro);
-                                try self.send_q.push(makeErrorSend(cq.waiter.conn_idx, 500));
+                                try self.send_q.push(try makeErrorSend(cq.waiter.conn_idx, .internal_server_error));
                             }
-                            try self.failPgConnWaitersWithStatus(pg, 500, "Postgres batch accounting mismatch");
+                            try self.failPgConnWaitersWithStatus(pg, .internal_server_error, "Postgres batch accounting mismatch");
                             return;
                         };
                         ffi.xdecref(failed_waiter.model_cls);
                         ffi.coroutineClose(failed_waiter.py_coro);
                         ffi.decref(failed_waiter.py_coro);
-                        try self.send_q.push(makeErrorSend(failed_waiter.conn_idx, 500));
+                        try self.send_q.push(try makeErrorSend(failed_waiter.conn_idx, .internal_server_error));
                         pg.in_flight -= 1;
                     }
 
@@ -1475,7 +1485,7 @@ pub const Pipeline = struct {
                 ) catch {
                     ffi.coroutineClose(waiter.py_coro);
                     ffi.decref(waiter.py_coro);
-                    try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                    try self.send_q.push(try makeErrorSend(waiter.conn_idx, .internal_server_error));
                     return;
                 };
                 switch (yield) {
@@ -1496,13 +1506,13 @@ pub const Pipeline = struct {
                 const py_res = send.result orelse return error.PythonError;
                 defer ffi.decref(py_res);
                 const resp = driver.convertPythonResponse(py_res, &conn.body_buf) catch
-                    response_mod.Response.init(500);
-                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+                    response_mod.Response.init(.internal_server_error);
+                try self.send_q.push(try makeResponseSend(waiter.conn_idx, resp));
             },
             .@"error" => {
                 ffi.decref(waiter.py_coro);
                 if (ffi.errOccurred()) ffi.errPrint();
-                try self.send_q.push(makeErrorSend(waiter.conn_idx, 500));
+                try self.send_q.push(try makeErrorSend(waiter.conn_idx, .internal_server_error));
             },
         }
     }
@@ -1512,14 +1522,14 @@ pub const Pipeline = struct {
             "postgres transport pool exhausted: fd={d} waiters={d} in_use={d}/{d} free={d}",
             .{ pg.fd, pg.waiter_count, self.pg_transport_pool.inUseCount(), self.pg_transport_pool.bufferCount(), self.pg_transport_pool.freeCount() },
         );
-        try self.failPgConnWaitersWithStatus(pg, 503, "Postgres transport pool exhausted");
+        try self.failPgConnWaitersWithStatus(pg, .service_unavailable, "Postgres transport pool exhausted");
     }
 
     fn failPgConnWaiters(self: *Pipeline, pg: *PgConn) !void {
-        try self.failPgConnWaitersWithStatus(pg, 500, null);
+        try self.failPgConnWaitersWithStatus(pg, .internal_server_error, null);
     }
 
-    fn failPgConnWaitersWithStatus(self: *Pipeline, pg: *PgConn, status: u16, body: ?[]const u8) !void {
+    fn failPgConnWaitersWithStatus(self: *Pipeline, pg: *PgConn, status: std.http.Status, body: ?[]const u8) !void {
         while (pg.waiter_count > 0) {
             const waiter = pg.popWaiter() orelse break;
             ffi.xdecref(waiter.model_cls);
@@ -1529,9 +1539,9 @@ pub const Pipeline = struct {
                 var resp = response_mod.Response.init(status);
                 _ = resp.setContentType("text/plain");
                 _ = resp.setBody(msg);
-                try self.send_q.push(makeResponseSend(waiter.conn_idx, resp));
+                try self.send_q.push(try makeResponseSend(waiter.conn_idx, resp));
             } else {
-                try self.send_q.push(makeErrorSend(waiter.conn_idx, status));
+                try self.send_q.push(try makeErrorSend(waiter.conn_idx, status));
             }
         }
         pg.recv_state = .idle;
@@ -1633,42 +1643,50 @@ fn quickContentLength(data: []const u8) usize {
 
 // ── Send Constructors ─────────────────────────────────────────────
 
-fn statusLine(code: u16) []const u8 {
-    return switch (code) {
-        200 => "HTTP/1.1 200 OK\r\n",
-        201 => "HTTP/1.1 201 Created\r\n",
-        204 => "HTTP/1.1 204 No Content\r\n",
-        301 => "HTTP/1.1 301 Moved Permanently\r\n",
-        302 => "HTTP/1.1 302 Found\r\n",
-        400 => "HTTP/1.1 400 Bad Request\r\n",
-        404 => "HTTP/1.1 404 Not Found\r\n",
-        405 => "HTTP/1.1 405 Method Not Allowed\r\n",
-        500 => "HTTP/1.1 500 Internal Server Error\r\n",
-        503 => "HTTP/1.1 503 Service Unavailable\r\n",
-        else => "HTTP/1.1 200 OK\r\n",
+fn statusLine(status: std.http.Status) error{UnsupportedStatus}![]const u8 {
+    return switch (status) {
+        .ok => "HTTP/1.1 200 OK\r\n",
+        .created => "HTTP/1.1 201 Created\r\n",
+        .no_content => "HTTP/1.1 204 No Content\r\n",
+        .moved_permanently => "HTTP/1.1 301 Moved Permanently\r\n",
+        .found => "HTTP/1.1 302 Found\r\n",
+        .not_modified => "HTTP/1.1 304 Not Modified\r\n",
+        .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+        .unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
+        .forbidden => "HTTP/1.1 403 Forbidden\r\n",
+        .not_found => "HTTP/1.1 404 Not Found\r\n",
+        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
+        .payload_too_large => "HTTP/1.1 413 Content Too Large\r\n",
+        .teapot => "HTTP/1.1 418 I'm a Teapot\r\n",
+        .too_many_requests => "HTTP/1.1 429 Too Many Requests\r\n",
+        .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
+        .bad_gateway => "HTTP/1.1 502 Bad Gateway\r\n",
+        .service_unavailable => "HTTP/1.1 503 Service Unavailable\r\n",
+        .gateway_timeout => "HTTP/1.1 504 Gateway Timeout\r\n",
+        else => return error.UnsupportedStatus,
     };
 }
 
 /// Build a SendTask from a Response object.
 /// Per-response headers go into st.hdr. Body pointer set from resp.body.
-fn makeResponseSend(conn_idx: u16, resp: response_mod.Response) SendTask {
+fn makeResponseSend(conn_idx: u16, resp: response_mod.Response) error{UnsupportedStatus}!SendTask {
     var st = SendTask{
         .conn = conn_idx,
         .hdr = undefined,
         .hdr_len = 0,
-        .status_line = statusLine(resp.status),
+        .status_line = try statusLine(resp.status),
         .body = resp.body,
     };
     writePerResponseHeaders(&st, &resp);
     return st;
 }
 
-fn makeErrorSend(conn_idx: u16, status: u16) SendTask {
+fn makeErrorSend(conn_idx: u16, status: std.http.Status) error{UnsupportedStatus}!SendTask {
     var st = SendTask{
         .conn = conn_idx,
         .hdr = undefined,
         .hdr_len = 0,
-        .status_line = statusLine(status),
+        .status_line = try statusLine(status),
         .body = null,
     };
     const suffix = "Connection: close\r\nContent-Length: 0\r\n\r\n";
@@ -1748,7 +1766,7 @@ test "cached headers stable within same second" {
 test "makeResponseSend 200 text" {
     refreshCommonHeaders();
     const resp = response_mod.Response.text("hello");
-    const st = makeResponseSend(5, resp);
+    const st = try makeResponseSend(5, resp);
     try std.testing.expectEqual(@as(u16, 5), st.conn);
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", st.status_line);
     try std.testing.expectEqualStrings("hello", st.body.?);
@@ -1760,7 +1778,7 @@ test "makeResponseSend 200 text" {
 }
 
 test "makeErrorSend" {
-    const st = makeErrorSend(3, 400);
+    const st = try makeErrorSend(3, .bad_request);
     try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\n", st.status_line);
     try std.testing.expect(st.body == null);
     try std.testing.expect(std.mem.indexOf(u8, st.hdr[0..st.hdr_len], "Connection: close") != null);

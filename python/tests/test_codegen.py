@@ -510,7 +510,7 @@ class TestEmitQueries:
             returns_table="users",
         )]
         code = emit_queries(queries, tables, "models")
-        assert "return (yield (_DbCmd.FETCH_ONE_MODEL, GET_USER, User, id))" in code
+        assert "return (yield _snek.pg_fetch_one_model(GET_USER, (id,), User))" in code
 
     def test_row_models_are_imported_for_typed_queries(self):
         query = Query(
@@ -523,7 +523,7 @@ class TestEmitQueries:
         )
         code = emit_queries([query], {}, "models")
         assert "from models import GetStatsRow" in code
-        assert "return (yield (_DbCmd.FETCH_ONE_MODEL, GET_STATS, GetStatsRow))" in code
+        assert "return (yield _snek.pg_fetch_one_model(GET_STATS, (), GetStatsRow))" in code
 
     def test_exec_method(self):
         tables = {"t": Table("t", [Column("id", "text", "str")])}

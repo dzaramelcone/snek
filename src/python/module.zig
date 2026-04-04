@@ -228,6 +228,7 @@ fn resolvedReturnAnnotationFromDict(handler_obj: *PyObject) ?*PyObject {
 
 fn classifyResponseHint(return_obj: *PyObject) ResponseHint {
     if (isStrAnnotation(return_obj)) return .str;
+    if (isBytesAnnotation(return_obj)) return .bytes;
     if (isRowBackedAnnotation(return_obj)) return .row_json;
     return .any;
 }
@@ -258,6 +259,22 @@ fn isStrAnnotation(return_obj: *PyObject) bool {
     return return_obj == str_type;
 }
 
+fn isBytesAnnotation(return_obj: *PyObject) bool {
+    if (normalizedAnnotationString(return_obj)) |span| {
+        return std.mem.eql(u8, span, "bytes") or std.mem.eql(u8, span, "memoryview");
+    }
+
+    const builtins = ffi.importModuleRaw("builtins") catch return false;
+    defer ffi.decref(builtins);
+    const bytes_type = ffi.getAttrRaw(builtins, "bytes") catch return false;
+    defer ffi.decref(bytes_type);
+    if (return_obj == bytes_type) return true;
+
+    const memoryview_type = ffi.getAttrRaw(builtins, "memoryview") catch return false;
+    defer ffi.decref(memoryview_type);
+    return return_obj == memoryview_type;
+}
+
 fn isRowBackedAnnotation(return_obj: *PyObject) bool {
     if (normalizedAnnotationString(return_obj)) |span| {
         return std.mem.eql(u8, span, "snek.Row");
@@ -273,22 +290,19 @@ fn isRowBackedAnnotation(return_obj: *PyObject) bool {
 
 /// Check if a callable is an async def (coroutine function).
 fn isCoroutineFunction(obj: *PyObject) bool {
-    // Use inspect.iscoroutinefunction via CO_COROUTINE flag on __code__.co_flags
-    const code = c.PyObject_GetAttrString(obj, "__code__") orelse {
+    const inspect_mod = ffi.importModuleRaw("inspect") catch return false;
+    defer ffi.decref(inspect_mod);
+
+    const is_coro_fn = ffi.getAttrRaw(inspect_mod, "iscoroutinefunction") catch return false;
+    defer ffi.decref(is_coro_fn);
+
+    const result = ffi.callOneArg(is_coro_fn, obj) catch {
         ffi.errClear();
         return false;
     };
-    defer ffi.decref(code);
+    defer ffi.decref(result);
 
-    const co_flags_obj = c.PyObject_GetAttrString(code, "co_flags") orelse {
-        ffi.errClear();
-        return false;
-    };
-    defer ffi.decref(co_flags_obj);
-    const co_flags = ffi.longAsLong(co_flags_obj) catch return false;
-
-    // CO_COROUTINE = 0x100 in CPython
-    return (co_flags & 0x100) != 0;
+    return ffi.objectIsTrue(result) catch false;
 }
 
 // ── Module methods ──────────────────────────────────────────────────
@@ -733,6 +747,27 @@ test "add_route stores stringified str response hint from annotation" {
     const state = getState(mod).?;
     try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
     try std.testing.expectEqual(@intFromEnum(ResponseHint.str), state.handler_flags[0].response_hint);
+}
+
+test "add_route stores bytes response hint from annotation" {
+    registerBuiltin();
+    ffi.init();
+    defer ffi.deinit();
+
+    const mod = try ffi.importModule("_snek");
+    defer ffi.decref(mod);
+    defer releaseHandlers(mod);
+
+    try ffi.runString(
+        \\import _snek
+        \\def hello() -> bytes:
+        \\    return b"ok"
+        \\_snek.add_route("GET", "/bytes", hello)
+    );
+
+    const state = getState(mod).?;
+    try std.testing.expectEqual(@as(u32, 1), state.py_handler_count);
+    try std.testing.expectEqual(@intFromEnum(ResponseHint.bytes), state.handler_flags[0].response_hint);
 }
 
 test "add_route stores row_json response hint from model annotation" {

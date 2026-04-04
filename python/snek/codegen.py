@@ -995,7 +995,8 @@ def emit_queries(queries: list[Query], tables: dict[str, Table], models_module: 
         lines.append(f"from {models_module} import {imports}")
         lines.append("")
 
-    lines.append("from snek.app import Db as _BaseDb, _DbCmd")
+    lines.append("from snek import _snek")
+    lines.append("from snek.app import Db as _BaseDb")
     lines.append("")
 
     # SQL constants
@@ -1032,44 +1033,52 @@ def _emit_single_method(query: Query, tables: dict[str, Table]) -> list[str]:
             param_parts.append(f"{p.name}: {py_type}")
         params_sig = ", *, " + ", ".join(param_parts)
 
-    if query.kind == "one":
-        model_name = _return_type_name(query, tables)
-        ret_type = f"{model_name} | None"
-    elif query.kind == "many":
-        model_name = _return_type_name(query, tables)
-        ret_type = f"list[{model_name}]"
-    elif query.kind == "execrows":
-        ret_type = "int"
-    else:
-        ret_type = "None"
+    model_name = _return_type_name(query, tables)
+    match query.kind:
+        case "one":
+            ret_type = f"{model_name} | None"
+        case "many":
+            ret_type = f"list[{model_name}]"
+        case "execrows":
+            ret_type = "int"
+        case _:
+            ret_type = "None"
 
-    cmd_map = {"one": "FETCH_ONE", "many": "FETCH_ALL", "exec": "EXECUTE", "execrows": "EXECUTE"}
-    cmd = cmd_map[query.kind]
     const_name = query.func_name.upper()
-    typed_cmd = None
-    if query.kind == "one" and model_name != "dict":
-        typed_cmd = "FETCH_ONE_MODEL"
-    elif query.kind == "many" and model_name != "dict":
-        typed_cmd = "FETCH_ALL_MODEL"
-
     lines = [
         "",
         "    @types.coroutine",
         f"    def {query.func_name}(self{params_sig}) -> {ret_type}:",
     ]
+    match (query.kind, model_name != "dict"):
+        case ("one", True):
+            op = "pg_fetch_one_model"
+            include_model = True
+        case ("one", False):
+            op = "pg_fetch_one"
+            include_model = False
+        case ("many", True):
+            op = "pg_fetch_all_model"
+            include_model = True
+        case ("many", False):
+            op = "pg_fetch_all"
+            include_model = False
+        case _:
+            op = "pg_execute"
+            include_model = False
 
-    emitted_cmd = typed_cmd or cmd
     if query.params:
         param_args = ", ".join(p.name for p in query.params)
-        if typed_cmd:
-            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}, {model_name}, {param_args}))")
+        tuple_args = f"({param_args},)"
+        if include_model:
+            lines.append(f"        return (yield _snek.{op}({const_name}, {tuple_args}, {model_name}))")
         else:
-            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}, {param_args}))")
+            lines.append(f"        return (yield _snek.{op}({const_name}, {tuple_args}))")
     else:
-        if typed_cmd:
-            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}, {model_name}))")
+        if include_model:
+            lines.append(f"        return (yield _snek.{op}({const_name}, (), {model_name}))")
         else:
-            lines.append(f"        return (yield (_DbCmd.{emitted_cmd}, {const_name}))")
+            lines.append(f"        return (yield _snek.{op}({const_name}, ()))")
 
     lines.append("")
     return lines
@@ -1080,7 +1089,13 @@ def _emit_batch_method(query: Query, tables: dict[str, Table]) -> list[str]:
     params_class = query.name + "Params"
     model_name = _return_type_name(query, tables)
     const_name = query.func_name.upper()
-    cmd = "FETCH_ALL_MODEL" if model_name != "dict" else "FETCH_ALL"
+    match model_name != "dict":
+        case True:
+            op = "pg_fetch_all_model"
+            include_model = True
+        case False:
+            op = "pg_fetch_all"
+            include_model = False
 
     lines = [
         "",
@@ -1092,10 +1107,10 @@ def _emit_batch_method(query: Query, tables: dict[str, Table]) -> list[str]:
         lines.append(f"        _{p.name} = [r.{p.name} for r in rows]")
 
     param_args = ", ".join(f"_{p.name}" for p in query.params)
-    if model_name != "dict":
-        lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}, {model_name}, {param_args}))")
+    if include_model:
+        lines.append(f"        return (yield _snek.{op}({const_name}, ({param_args},), {model_name}))")
     else:
-        lines.append(f"        return (yield (_DbCmd.{cmd}, {const_name}, {param_args}))")
+        lines.append(f"        return (yield _snek.{op}({const_name}, ({param_args},)))")
     lines.append("")
     return lines
 

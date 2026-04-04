@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const http = std.http;
 
 pub const MAX_HEADERS: usize = 64;
 pub const MAX_RESP_HEADERS: usize = 64;
@@ -128,31 +129,31 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 // --- Response ---
 
 pub const Response = struct {
-    status: u16,
+    status: http.Status,
     headers: [MAX_RESP_HEADERS]Header,
     header_count: usize,
     body: ?[]const u8,
 
-    pub fn init(status: u16) Response {
+    pub fn init(status: http.Status) Response {
         return .{ .status = status, .headers = undefined, .header_count = 0, .body = null };
     }
 
     pub fn json(body_str: []const u8) Response {
-        var r = init(200);
+        var r = init(.ok);
         r.setContentType("application/json");
         r.body = body_str;
         return r;
     }
 
     pub fn text(body_str: []const u8) Response {
-        var r = init(200);
+        var r = init(.ok);
         r.setContentType("text/plain");
         r.body = body_str;
         return r;
     }
 
     pub fn notFound() Response {
-        return init(404);
+        return init(.not_found);
     }
 
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
@@ -169,10 +170,10 @@ pub const Response = struct {
         self.body = b;
     }
 
-    pub fn serialize(self: *const Response, out: []u8) error{BufferTooSmall}!usize {
+    pub fn serialize(self: *const Response, out: []u8) error{ BufferTooSmall, UnsupportedStatus }!usize {
         var pos: usize = 0;
 
-        const sl = statusLine(self.status);
+        const sl = try statusLine(self.status);
         if (pos + sl.len > out.len) return error.BufferTooSmall;
         @memcpy(out[pos..][0..sl.len], sl);
         pos += sl.len;
@@ -221,24 +222,27 @@ pub const Response = struct {
     }
 };
 
-pub fn statusLine(code: u16) []const u8 {
-    return switch (code) {
-        200 => "HTTP/1.1 200 OK\r\n",
-        201 => "HTTP/1.1 201 Created\r\n",
-        204 => "HTTP/1.1 204 No Content\r\n",
-        301 => "HTTP/1.1 301 Moved Permanently\r\n",
-        302 => "HTTP/1.1 302 Found\r\n",
-        304 => "HTTP/1.1 304 Not Modified\r\n",
-        400 => "HTTP/1.1 400 Bad Request\r\n",
-        401 => "HTTP/1.1 401 Unauthorized\r\n",
-        403 => "HTTP/1.1 403 Forbidden\r\n",
-        404 => "HTTP/1.1 404 Not Found\r\n",
-        405 => "HTTP/1.1 405 Method Not Allowed\r\n",
-        413 => "HTTP/1.1 413 Content Too Large\r\n",
-        500 => "HTTP/1.1 500 Internal Server Error\r\n",
-        502 => "HTTP/1.1 502 Bad Gateway\r\n",
-        503 => "HTTP/1.1 503 Service Unavailable\r\n",
-        else => "HTTP/1.1 200 OK\r\n",
+pub fn statusLine(status: http.Status) error{UnsupportedStatus}![]const u8 {
+    return switch (status) {
+        .ok => "HTTP/1.1 200 OK\r\n",
+        .created => "HTTP/1.1 201 Created\r\n",
+        .no_content => "HTTP/1.1 204 No Content\r\n",
+        .moved_permanently => "HTTP/1.1 301 Moved Permanently\r\n",
+        .found => "HTTP/1.1 302 Found\r\n",
+        .not_modified => "HTTP/1.1 304 Not Modified\r\n",
+        .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+        .unauthorized => "HTTP/1.1 401 Unauthorized\r\n",
+        .forbidden => "HTTP/1.1 403 Forbidden\r\n",
+        .not_found => "HTTP/1.1 404 Not Found\r\n",
+        .method_not_allowed => "HTTP/1.1 405 Method Not Allowed\r\n",
+        .payload_too_large => "HTTP/1.1 413 Content Too Large\r\n",
+        .teapot => "HTTP/1.1 418 I'm a Teapot\r\n",
+        .too_many_requests => "HTTP/1.1 429 Too Many Requests\r\n",
+        .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
+        .bad_gateway => "HTTP/1.1 502 Bad Gateway\r\n",
+        .service_unavailable => "HTTP/1.1 503 Service Unavailable\r\n",
+        .gateway_timeout => "HTTP/1.1 504 Gateway Timeout\r\n",
+        else => return error.UnsupportedStatus,
     };
 }
 
@@ -297,7 +301,7 @@ test "keepalive detection" {
 }
 
 test "serialize response" {
-    var resp = Response.init(200);
+    var resp = Response.init(.ok);
     resp.setContentType("text/plain");
     resp.body = "hello";
 

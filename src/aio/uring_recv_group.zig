@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const io_uring = @import("io_uring.zig");
 const uring_ring = @import("uring_ring.zig");
+const log = std.log.scoped(.@"snek/uring_recv_group");
 
 pub const DEFAULT_BUFFER_SIZE: u32 = 64 * 1024;
 pub const DEFAULT_BUFFER_COUNT: u16 = 64;
@@ -49,7 +50,9 @@ pub const Group = struct {
         @memset(checked_out, false);
 
         const br = try uring_ring.setupBufRing(fd, buffer_count, group_id, .{ .inc = false });
-        errdefer uring_ring.freeBufRing(fd, br, buffer_count, group_id);
+        errdefer uring_ring.freeBufRing(fd, br, buffer_count, group_id) catch |e| {
+            log.err("freeBufRing failed during init rollback: {}", .{e});
+        };
 
         uring_ring.bufRingInit(br);
         const mask = uring_ring.bufRingMask(buffer_count);
@@ -74,8 +77,8 @@ pub const Group = struct {
         };
     }
 
-    pub fn deinit(self: *Group) void {
-        uring_ring.freeBufRing(self.fd, self.br, self.buffer_count, self.group_id);
+    pub fn deinit(self: *Group) !void {
+        try uring_ring.freeBufRing(self.fd, self.br, self.buffer_count, self.group_id);
         std.heap.page_allocator.free(self.storage);
         self.allocator.free(self.checked_out);
         self.* = undefined;

@@ -8,7 +8,9 @@ const std = @import("std");
 const posix = std.posix;
 const Socket = @import("socket.zig").Socket;
 const handler = @import("handler.zig");
+const ffi = @import("python/ffi.zig");
 const subinterp = @import("python/subinterp.zig");
+const py_module = @import("python/module.zig");
 const router_mod = @import("http/router.zig");
 const Pool = @import("pool.zig").Pool;
 
@@ -79,31 +81,12 @@ pub const Server = struct {
     }
 };
 
-// ── Per-thread state ────────────────────────────────────────────────
-
-pub const ThreadContext = struct {
-    py: subinterp.WorkerPyContext,
-};
-
-threadlocal var tl_ctx: ?ThreadContext = null;
-threadlocal var tl_req_ctx: ?handler.RequestContext = null;
-threadlocal var tl_py: ?subinterp.WorkerPyContext = null;
-threadlocal var tl_py_ctx: ?handler.PyContext = null;
-
 /// Sub-interpreter creation must be serialized — PyGILState_Ensure is not
 /// thread-safe when called from threads without a Python thread state.
 var interp_mutex: std.Thread.Mutex = .{};
 
-pub fn getThreadContext() ?*ThreadContext {
-    return if (tl_ctx) |*ctx| ctx else null;
-}
-
-pub fn getRequestContext() ?*const handler.RequestContext {
-    return if (tl_req_ctx) |*ctx| ctx else null;
-}
-
 const pipeline_mod = switch (builtin.os.tag) {
-    .linux => @import("pipeline_uring.zig"),
+    .linux => @import("uring/pipeline.zig"),
     else => @import("pipeline_kq.zig"),
 };
 
@@ -159,28 +142,41 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
         break :blk s;
     };
 
+    var worker_py: ?subinterp.WorkerPyContext = null;
+    var worker_py_ctx: ?handler.PyContext = null;
+
     // Each thread gets its own sub-interpreter with its own GIL (PEP 734)
     if (server.module_ref_len > 0) {
         interp_mutex.lock();
         defer interp_mutex.unlock();
         const ref = server.module_ref[0..server.module_ref_len];
-        tl_py = try subinterp.WorkerPyContext.init(ref);
-        tl_py.?.acquireGil();
+        worker_py = try subinterp.WorkerPyContext.init(ref);
+        worker_py.?.acquireGil();
         const snek_row = @import("python/snek_row.zig");
         const snek_request = @import("python/snek_request.zig");
         try snek_row.initType();
         try snek_request.initType();
-        tl_py.?.releaseGil();
-        tl_py_ctx = .{ .py = &tl_py.? };
-        tl_ctx = .{ .py = tl_py.? };
+        worker_py.?.releaseGil();
+        worker_py_ctx = .{ .py = &worker_py.? };
     }
 
-    tl_req_ctx = .{
+    defer {
+        if (worker_py) |*py| {
+            py.deinit();
+        }
+    }
+
+    var worker_py_handler_flags = server.py_handler_flags;
+    if (worker_py) |*py| {
+        refreshWorkerPyHandlerFlags(server, py.snek_module, &worker_py_handler_flags);
+    }
+
+    var req_ctx: handler.RequestContext = .{
         .router = &server.router,
         .handlers = &server.handlers,
         .py_handler_ids = &server.py_handler_ids,
-        .py_handler_flags = &server.py_handler_flags,
-        .py_ctx = if (tl_py_ctx) |*p| p else null,
+        .py_handler_flags = &worker_py_handler_flags,
+        .py_ctx = if (worker_py_ctx) |*p| p else null,
     };
 
     // Each thread gets its own pipeline + conn pool + io backend
@@ -191,10 +187,10 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
     defer allocator.destroy(pl);
     try pl.init(allocator, &conns, 1024);
 
-    pl.req_ctx = if (tl_req_ctx) |*ctx| ctx else null;
+    pl.req_ctx = &req_ctx;
 
     // Redis connection (optional, one pipelined connection per thread)
-    if (tl_py != null) {
+    if (worker_py != null) {
         const redis_host = std.posix.getenv("REDIS_HOST") orelse "127.0.0.1";
         const redis_fd = connectTcpNonBlocking(redis_host, 6379) catch |err| blk: {
             log.info("redis not available at {s}: {}, redis commands will fail", .{ redis_host, err });
@@ -206,7 +202,7 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
     }
 
     // Postgres connection pool (optional, N pipelined connections per thread)
-    if (tl_py != null) {
+    if (worker_py != null) {
         const pg_host = posix.getenv("PG_HOST") orelse "127.0.0.1";
         const pg_port_str = posix.getenv("PG_PORT") orelse "5432";
         const pg_port = std.fmt.parseInt(u16, pg_port_str, 10) catch 5432;
@@ -229,6 +225,20 @@ fn pipelineThreadMain(allocator: std.mem.Allocator, server: *const Server, exist
     log.info("pipeline: thread ready", .{});
 
     try pl.run();
+}
+
+fn refreshWorkerPyHandlerFlags(server: *const Server, mod: *ffi.PyObject, dst: *[64]handler.PyHandlerFlags) void {
+    for (0..server.handler_count) |idx| {
+        if (server.py_handler_ids[idx]) |py_id| {
+            const flags = py_module.getHandlerFlags(mod, py_id);
+            dst[idx] = .{
+                .needs_request = flags.needs_request,
+                .needs_params = flags.needs_params,
+                .no_args = flags.no_args,
+                .is_async = flags.is_async,
+            };
+        }
+    }
 }
 
 fn connectTcpNonBlocking(host: []const u8, port: u16) !std.posix.socket_t {
