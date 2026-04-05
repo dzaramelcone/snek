@@ -1,11 +1,13 @@
 //! Staged event-driven pipeline.
+//! Each stage defines its own typed task.
 //!
-//! Connections are pure data (fd + leased recv queue). Each stage defines its own
-//! typed task. The stage processor IS the state machine.
+//! Connections are pure data (fd + leased recv queue).
 //!
 //! DAG:
-//!   [kernel recv] → ParseTask → HandleTask ─┬→ SendTask → [kernel send/sendmsg_zc] → recv
-//!                                            └→ RedisTask ··· → SendTask
+//!   [kernel recv]
+//!     └→ ParseTask
+//!        └→ HandleTask (Python) ─┬→ SendTask → [kernel send/sendmsg_zc] → recv
+//!                                └→ RedisTask ··· → SendTask
 //!
 //! The uring path uses connection-owned send state so response buffers stay
 //! valid across partial sends and zerocopy notifications.
@@ -26,7 +28,8 @@ const py_send = @import("py_send.zig");
 const c = ffi.c;
 const router_mod = @import("../http/router.zig");
 const response_mod = @import("../http/response.zig");
-const Stats = @import("metrics.zig").Stats;
+const metrics_mod = @import("metrics.zig");
+const Stats = metrics_mod.Stats;
 const stmt_cache_mod = @import("../db/stmt_cache.zig");
 const StmtCache = stmt_cache_mod.StmtCache;
 const MAX_PG_STMTS = stmt_cache_mod.MAX_STMTS;
@@ -453,13 +456,14 @@ pub const Pipeline = struct {
     }
 
     fn cycle(self: *Pipeline, wait_nr: u32) !bool {
-        const t0 = try std.time.Instant.now();
+        const m = comptime metrics_mod.enabled;
+        const t0 = if (m) instant() else {};
         try self.backend.publish();
         const completions = try self.backend.reap(wait_nr);
         if (completions.tokens.len == 0) return false;
-        const t_io = try std.time.Instant.now();
+        const t_io = if (m) instant() else {};
 
-        // PMU — comptime-stripped when no backend; sample near dump boundaries
+        // PMU — comptime-stripped when no backend
         const pmu_before = if (comptime Stats.has_pmu)
             (if (self.stats.pmu.backend != null and self.stats.cycles % 10000 >= 9990) self.stats.pmuRead() else null)
         else {};
@@ -480,40 +484,38 @@ pub const Pipeline = struct {
         for (completions.tokens, completions.completions) |token, completion| {
             try self.handleCompletion(token, completion);
         }
-        const t_classify = try std.time.Instant.now();
+        const t_classify = if (m) instant() else {};
 
         // DAG
         try self.stageParse();
-        const t_parse = try std.time.Instant.now();
+        const t_parse = if (m) instant() else {};
 
-        const http_requests = self.handle_q.len;
+        const http_requests = if (m) self.handle_q.len else 0;
         try self.stageHandlePrep();
-        const t_handle_prep = try std.time.Instant.now();
+        const t_handle_prep = if (m) instant() else {};
 
         // GIL held across Python invoke + redis + postgres stages (one acquire for all Python work)
         const py_ctx = if (self.req_ctx) |ctx| ctx.py_ctx else null;
-        const need_gil = py_ctx != null and (
-            self.py_ready_q.len > 0 or
+        const need_gil = py_ctx != null and (self.py_ready_q.len > 0 or
             self.redis_recv_state == .parsing or
             self.redis_recv_state == .err or
             self.anyPgNeedsGil() or
-            self.py_body_release.items.len > 0
-        );
+            self.py_body_release.items.len > 0);
         if (need_gil) py_ctx.?.py.acquireGil();
         defer if (need_gil) py_ctx.?.py.releaseGil();
 
         try self.stageHandlePython();
-        const t_handle_py = try std.time.Instant.now();
+        const t_handle_py = if (m) instant() else {};
         try self.stageRedis();
         try self.drainPythonReady();
-        const t_redis = try std.time.Instant.now();
-        const pg_rows_before = self.totalPgWaiters();
+        const t_redis = if (m) instant() else {};
+        const pg_rows_before = if (m) self.totalPgWaiters() else 0;
         try self.stagePostgres();
         try self.drainPythonReady();
-        const t_pg = try std.time.Instant.now();
+        const t_pg = if (m) instant() else {};
 
         try self.stageSerializeAndSend();
-        const t_send = try std.time.Instant.now();
+        const t_send = if (m) instant() else {};
         self.stageClose();
         if (need_gil) self.drainPendingPyBodyReleases();
         try self.backend.publish();
@@ -523,23 +525,22 @@ pub const Pipeline = struct {
             self.stats.pmuAccum(pmu_before, self.stats.pmuRead());
         }
 
-        // Accumulate timing stats
         self.stats.cycles += 1;
         self.stats.completions += completions.tokens.len;
-        self.stats.http_requests += http_requests;
-        self.stats.ns_io += t_io.since(t0);
-        self.stats.ns_classify += t_classify.since(t_io);
-        self.stats.ns_parse += t_parse.since(t_classify);
-        self.stats.ns_handle_prep += t_handle_prep.since(t_parse);
-        self.stats.ns_handle_py += t_handle_py.since(t_handle_prep);
-        self.stats.ns_redis += t_redis.since(t_handle_py);
-        self.stats.ns_pg_wire += self.pg_wire_ns;
-        self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_wire_ns;
-        self.stats.pg_rows += pg_rows_before -| self.totalPgWaiters();
-        self.stats.ns_send += t_send.since(t_pg);
-
-        // Print every 10000 cycles
-        if (self.stats.cycles % 10000 == 0) self.stats.dump();
+        if (comptime m) {
+            self.stats.http_requests += http_requests;
+            self.stats.ns_io += t_io.since(t0);
+            self.stats.ns_classify += t_classify.since(t_io);
+            self.stats.ns_parse += t_parse.since(t_classify);
+            self.stats.ns_handle_prep += t_handle_prep.since(t_parse);
+            self.stats.ns_handle_py += t_handle_py.since(t_handle_prep);
+            self.stats.ns_redis += t_redis.since(t_handle_py);
+            self.stats.ns_pg_wire += self.pg_wire_ns;
+            self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_wire_ns;
+            self.stats.pg_rows += pg_rows_before -| self.totalPgWaiters();
+            self.stats.ns_send += t_send.since(t_pg);
+            if (self.stats.cycles % 10000 == 0) self.stats.dump();
+        }
 
         return true;
     }
@@ -804,21 +805,26 @@ pub const Pipeline = struct {
         task: *PythonHandleTask,
         invoke_metrics: *driver.InvokeMetrics,
     ) !void {
-        switch (task.kind) {
+        const m = comptime metrics_mod.enabled;
+        if (m) switch (task.kind) {
             .no_args => self.stats.py_no_args += 1,
             .params_only => self.stats.py_params_only += 1,
             .request => self.stats.py_request += 1,
-        }
-        const t_request_obj = std.time.Instant.now() catch null;
+        };
+        const t_request_obj = if (m) instant() else {};
         const request_obj = self.buildPythonHandleRequestObject(task) catch {
-            self.stats.ns_py_request_obj += elapsedNs(t_request_obj);
+            if (m) {
+                self.stats.ns_py_request_obj += elapsedNs(t_request_obj);
+            }
             try self.send_q.push(makeErrorSend(task.conn, .internal_server_error));
             return;
         };
-        self.stats.ns_py_request_obj += elapsedNs(t_request_obj);
+        if (m) {
+            self.stats.ns_py_request_obj += elapsedNs(t_request_obj);
+        }
         defer ffi.xdecref(request_obj);
 
-        const t_invoke = std.time.Instant.now() catch null;
+        const t_invoke = if (m) instant() else {};
         const result = try driver.invokePythonHandlerWithKnownFlags(
             py_ctx.py.snek_module,
             task.py_id,
@@ -831,9 +837,11 @@ pub const Pipeline = struct {
             self.pgSendSlice(),
             self.pgStmtCache(),
             self.pgConnPrepared(),
-            invoke_metrics,
+            if (m) invoke_metrics else null,
         );
-        self.stats.ns_py_invoke_total += elapsedNs(t_invoke);
+        if (m) {
+            self.stats.ns_py_invoke_total += elapsedNs(t_invoke);
+        }
         try self.handleResult(task.conn, result);
     }
 
@@ -990,10 +998,14 @@ pub const Pipeline = struct {
         };
     }
 
-    fn elapsedNs(start_at: ?std.time.Instant) u64 {
-        const t0 = start_at orelse return 0;
-        const t1 = std.time.Instant.now() catch return 0;
-        return t1.since(t0);
+    fn instant() std.time.Instant {
+        return std.time.Instant.now() catch |e| switch (e) {
+            error.Unsupported => unreachable,
+        };
+    }
+
+    fn elapsedNs(start_at: std.time.Instant) u64 {
+        return instant().since(start_at);
     }
 
     fn dispatchMatchedRouteNoGil(
@@ -1100,41 +1112,46 @@ pub const Pipeline = struct {
         return @intCast(src.len);
     }
 
-
     /// Handle an InvokeResult: response goes to send_q, yields update send buffers + push waiters.
     fn handleResult(self: *Pipeline, conn: u16, result: driver.InvokeResult) !void {
-        const t_result = std.time.Instant.now() catch null;
+        const m = comptime metrics_mod.enabled;
+        const t_result = if (m) instant() else {};
         switch (result) {
             .native_response => |resp| {
                 try self.send_q.push(makeResponseSend(conn, resp));
-                const elapsed = elapsedNs(t_result);
-                self.stats.ns_py_result += elapsed;
-                self.stats.ns_py_result_response += elapsed;
+                if (m) {
+                    const elapsed = elapsedNs(t_result);
+                    self.stats.ns_py_result += elapsed;
+                    self.stats.ns_py_result_response += elapsed;
+                }
             },
             .py_result => |py_result| {
                 try self.send_q.push(makePythonSend(conn, py_result));
-                const elapsed = elapsedNs(t_result);
-                self.stats.ns_py_result += elapsed;
-                self.stats.ns_py_result_response += elapsed;
+                if (m) {
+                    const elapsed = elapsedNs(t_result);
+                    self.stats.ns_py_result += elapsed;
+                    self.stats.ns_py_result_response += elapsed;
+                }
             },
             .redis_yield => |ry| {
                 self.redis_send_len += ry.bytes_written;
                 try self.pushRedisWaiter(conn, ry.py_coro, ry.py_future);
-                const elapsed = elapsedNs(t_result);
-                self.stats.ns_py_result += elapsed;
-                self.stats.ns_py_result_yield += elapsed;
+                if (m) {
+                    const elapsed = elapsedNs(t_result);
+                    self.stats.ns_py_result += elapsed;
+                    self.stats.ns_py_result_yield += elapsed;
+                }
             },
             .pg_yield => |pg| {
-                // The round-robin PgConn was selected by pgSendSlice before
-                // the yielded native future submitted its PG bytes. pg_last_conn
-                // tracks which connection was selected.
                 const pg_conn = &self.pg_conns[self.pg_last_conn];
                 pg_conn.send_len += pg.bytes_written;
                 errdefer ffi.xdecref(pg.model_cls);
                 try pg_conn.pushWaiter(conn, pg.py_coro, pg.py_future, pg.mode, pg.stmt_idx, pg.model_cls);
-                const elapsed = elapsedNs(t_result);
-                self.stats.ns_py_result += elapsed;
-                self.stats.ns_py_result_yield += elapsed;
+                if (m) {
+                    const elapsed = elapsedNs(t_result);
+                    self.stats.ns_py_result += elapsed;
+                    self.stats.ns_py_result_yield += elapsed;
+                }
             },
         }
     }
@@ -1634,9 +1651,11 @@ pub const Pipeline = struct {
 
             // 2. Parse responses
             if (pg.recv_state == .parsing) {
-                const t0 = try std.time.Instant.now();
+                const t0 = if (comptime metrics_mod.enabled) instant() else {};
                 try self.parsePgConnResponses(pg);
-                self.pg_wire_ns += (try std.time.Instant.now()).since(t0);
+                if (comptime metrics_mod.enabled) {
+                    self.pg_wire_ns += instant().since(t0);
+                }
                 _ = pg.recv_queue.consumeParsed(&self.pg_recv_group);
 
                 if (pg.recv_state == .err) {

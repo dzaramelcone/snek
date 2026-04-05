@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_cross = target.result.os.tag != builtin.os.tag or target.result.cpu.arch != builtin.cpu.arch;
+    const metrics = b.option(bool, "metrics", "Enable pipeline metrics (default: false)") orelse false;
 
     // ── Python extension (_snek.so / .dylib) — the main artifact ────
     const pyext = b.addLibrary(.{
@@ -33,6 +34,9 @@ pub fn build(b: *std.Build) void {
             .strip = true,
         }),
     });
+    const options = b.addOptions();
+    options.addOption(bool, "metrics", metrics);
+    pyext.root_module.addOptions("build_options", options);
     pyext.want_lto = true;
     pyext.link_gc_sections = true;
     linkPython(pyext.root_module);

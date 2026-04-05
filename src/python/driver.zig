@@ -49,12 +49,16 @@ pub const InvokeMetrics = struct {
 };
 
 fn nowInstant() ?std.time.Instant {
-    return std.time.Instant.now() catch null;
+    return std.time.Instant.now() catch |e| switch (e) {
+        error.Unsupported => unreachable,
+    };
 }
 
 fn accumElapsed(total: *u64, start: ?std.time.Instant) void {
     const t0 = start orelse return;
-    const t1 = std.time.Instant.now() catch return;
+    const t1 = std.time.Instant.now() catch |e| switch (e) {
+        error.Unsupported => unreachable,
+    };
     total.* += t1.since(t0);
 }
 
@@ -74,13 +78,13 @@ pub fn invokePythonHandlerWithKnownFlags(
 ) !InvokeResult {
     if (metrics) |m| m.invocations += 1;
 
-    const t_lookup = nowInstant();
+    const t_lookup = if (metrics != null) nowInstant() else null;
     const handler = module.getHandler(mod, handler_id) orelse {
         return .{ .native_response = response_mod.Response.init(.internal_server_error) };
     };
     if (metrics) |m| accumElapsed(&m.ns_lookup, t_lookup);
 
-    const t_call = nowInstant();
+    const t_call = if (metrics != null) nowInstant() else null;
     const call_result = if (no_args) blk: {
         break :blk ffi.vectorcallNoArgs(handler) catch {
             if (ffi.errOccurred()) ffi.errPrint();
@@ -94,7 +98,7 @@ pub fn invokePythonHandlerWithKnownFlags(
             };
         }
 
-        const t_args = nowInstant();
+        const t_args = if (metrics != null) nowInstant() else null;
         const kwargs = buildParamsKwargs(params) catch {
             return .{ .native_response = response_mod.Response.init(.internal_server_error) };
         };
@@ -123,7 +127,7 @@ pub fn invokePythonHandlerWithKnownFlags(
     if (is_async) {
         if (metrics) |m| m.coroutines += 1;
 
-        const t_resume = nowInstant();
+        const t_resume = if (metrics != null) nowInstant() else null;
         const send = ffi.iterSend(call_result, ffi.none());
         if (metrics) |m| accumElapsed(&m.ns_resume, t_resume);
 
@@ -132,7 +136,7 @@ pub fn invokePythonHandlerWithKnownFlags(
                 const yielded = send.result.?;
                 defer ffi.decref(yielded);
 
-                const t_yield_consume = nowInstant();
+                const t_yield_consume = if (metrics != null) nowInstant() else null;
                 const state = module.getState(mod) orelse {
                     ffi.coroutineClose(call_result);
                     ffi.decref(call_result);

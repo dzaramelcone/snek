@@ -1,8 +1,11 @@
 const std = @import("std");
 const driver = @import("../python/driver.zig");
 const perf = @import("../observe/perf.zig");
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.@"snek/pipeline");
+
+pub const enabled = build_options.metrics;
 
 pub const Stats = struct {
     cycles: u64 = 0,
@@ -90,11 +93,13 @@ pub const Stats = struct {
     }
 
     pub fn recordBatchSize(self: *Stats, n: usize) void {
+        if (comptime !enabled) return;
         const bucket: usize = if (n < 32) 0 else if (n < 64) 1 else if (n < 128) 2 else if (n < 256) 3 else if (n < 512) 4 else 5;
         self.cqe_batch_hist[bucket] += 1;
     }
 
     pub fn accumInvokeMetrics(self: *Stats, metrics: *const driver.InvokeMetrics) void {
+        if (comptime !enabled) return;
         self.py_invocations += metrics.invocations;
         self.py_coroutines += metrics.coroutines;
         self.py_sync_responses += metrics.sync_responses;
@@ -109,6 +114,7 @@ pub const Stats = struct {
     }
 
     pub fn resetWindow(self: *Stats) void {
+        if (comptime !enabled) return;
         self.completions = 0;
         self.http_requests = 0;
         self.ns_io = 0;
@@ -146,6 +152,7 @@ pub const Stats = struct {
     }
 
     pub fn dump(self: *Stats) void {
+        if (comptime !enabled) return;
         const ns_handle = self.ns_handle_prep + self.ns_handle_py;
         const total = self.ns_io + self.ns_classify + self.ns_parse + ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_flush + self.ns_send;
         const cqes = self.completions;
