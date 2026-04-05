@@ -447,8 +447,6 @@ pub const Pipeline = struct {
 
     pub fn run(self: *Pipeline) !void {
         _ = http1.commonResponseHeaders();
-        self.stats.initPmu();
-        defer self.stats.deinitPmu();
         while (self.running) {
             _ = try self.cycle(1);
             while (try self.cycle(0)) {}
@@ -462,11 +460,6 @@ pub const Pipeline = struct {
         const completions = try self.backend.reap(wait_nr);
         if (completions.tokens.len == 0) return false;
         const t_io = if (m) instant() else {};
-
-        // PMU — comptime-stripped when no backend
-        const pmu_before = if (comptime Stats.has_pmu)
-            (if (self.stats.pmu.backend != null and self.stats.cycles % 10000 >= 9990) self.stats.pmuRead() else null)
-        else {};
 
         // Refresh cached response prefix (once per second)
         _ = http1.commonResponseHeaders();
@@ -519,11 +512,6 @@ pub const Pipeline = struct {
         self.stageClose();
         if (need_gil) self.drainPendingPyBodyReleases();
         try self.backend.publish();
-
-        // PMU snapshot — end
-        if (comptime Stats.has_pmu) {
-            self.stats.pmuAccum(pmu_before, self.stats.pmuRead());
-        }
 
         self.stats.cycles += 1;
         self.stats.completions += completions.tokens.len;

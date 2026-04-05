@@ -35,7 +35,6 @@ const transport_ring = @import("aio/transport_ring.zig");
 const TransportRing = transport_ring.Ring;
 const dispatch = @import("pipeline_kq_dispatch.zig");
 const snek_row = @import("python/snek_row.zig");
-const perf = @import("observe/perf.zig");
 
 const log = std.log.scoped(.@"snek/pipeline");
 
@@ -286,9 +285,6 @@ pub const Pipeline = struct {
     pg_transport_pool: TransportPool,
     pg_result_pool: ResultSlabPool,
 
-    // Stage timing stats
-    stats: Stats = .{},
-
     pub fn init(self: *Pipeline, allocator: std.mem.Allocator, conns: *Pool(Conn), entries: u16) !void {
         var backend = try kqueue.Kqueue.init(allocator, entries);
         errdefer backend.deinit(allocator);
@@ -325,8 +321,6 @@ pub const Pipeline = struct {
 
     pub fn run(self: *Pipeline) !void {
         _ = http1.commonResponseHeaders();
-        self.stats.initPmu();
-        defer self.stats.deinitPmu();
         while (self.running) {
             _ = try self.cycle(1);
             while (try self.cycle(0)) {}
@@ -334,15 +328,8 @@ pub const Pipeline = struct {
     }
 
     fn cycle(self: *Pipeline, wait_nr: u32) !bool {
-        const t0 = try std.time.Instant.now();
         const completions = try self.backend.submitAndWait(wait_nr);
         if (completions.tokens.len == 0) return false;
-        const t_io = try std.time.Instant.now();
-
-        // PMU — comptime-stripped when no backend; sample near dump boundaries
-        const pmu_before = if (comptime Stats.has_pmu)
-            (if (self.stats.pmu.backend != null and self.stats.cycles % 10000 >= 9990) self.stats.pmuRead() else null)
-        else {};
 
         // Refresh cached response prefix (once per second)
         _ = http1.commonResponseHeaders();
@@ -357,11 +344,9 @@ pub const Pipeline = struct {
         for (completions.tokens, completions.completions) |token, completion| {
             try dispatch.classifyCompletion(self, token, completion);
         }
-        const t_classify = try std.time.Instant.now();
 
         // DAG
         try self.stageParse();
-        const t_parse = try std.time.Instant.now();
 
         // GIL held across handle + redis + postgres stages (one acquire for all Python work)
         const py_ctx = if (self.req_ctx) |ctx| ctx.py_ctx else null;
@@ -370,159 +355,14 @@ pub const Pipeline = struct {
         defer if (need_gil) py_ctx.?.py.releaseGil();
 
         try self.stageHandle();
-        const t_handle = try std.time.Instant.now();
         try self.stageRedis();
-        const t_redis = try std.time.Instant.now();
-        const pg_rows_before = self.totalPgWaiters();
         try self.stagePostgres();
-        const t_pg = try std.time.Instant.now();
 
         try self.stageSerializeAndSend();
-        const t_send = try std.time.Instant.now();
         self.stageClose();
-
-        // PMU snapshot — end
-        if (comptime Stats.has_pmu) {
-            self.stats.pmuAccum(pmu_before, self.stats.pmuRead());
-        }
-
-        // Accumulate timing stats
-        self.stats.cycles += 1;
-        self.stats.completions += completions.tokens.len;
-        self.stats.ns_io += t_io.since(t0);
-        self.stats.ns_classify += t_classify.since(t_io);
-        self.stats.ns_parse += t_parse.since(t_classify);
-        self.stats.ns_handle += t_handle.since(t_parse);
-        self.stats.ns_redis += t_redis.since(t_handle);
-        self.stats.ns_pg_wire += self.pg_wire_ns;
-        self.stats.ns_pg_flush += t_pg.since(t_redis) -| self.pg_wire_ns;
-        self.stats.pg_rows += pg_rows_before -| self.totalPgWaiters();
-        self.stats.ns_send += t_send.since(t_pg);
-
-        // Print every 10000 cycles
-        if (self.stats.cycles % 10000 == 0) self.stats.dump();
 
         return true;
     }
-
-    const Stats = struct {
-        cycles: u64 = 0,
-        completions: u64 = 0,
-        ns_io: u64 = 0,
-        ns_classify: u64 = 0,
-        ns_parse: u64 = 0,
-        ns_handle: u64 = 0,
-        ns_redis: u64 = 0,
-        ns_pg_wire: u64 = 0,
-        ns_pg_flush: u64 = 0,
-        pg_rows: u64 = 0,
-        ns_send: u64 = 0,
-        pg_recv_ops: u64 = 0,
-        pg_recv_bytes: u64 = 0,
-        // PMU — comptime-stripped when no backend available
-        pmu: if (has_pmu) PmuState else void = if (has_pmu) .{} else {},
-
-        const has_pmu = perf.Backend != void;
-
-        const PmuState = struct {
-            backend: ?perf.Backend = null,
-            cpu_cycles: u64 = 0,
-            instructions: u64 = 0,
-            branches: u64 = 0,
-            branch_misses: u64 = 0,
-            cache_misses: u64 = 0,
-            tlb_misses: u64 = 0,
-        };
-
-        fn initPmu(self: *Stats) void {
-            if (comptime !has_pmu) return;
-            if (perf.Backend.init()) |pe| {
-                self.pmu.backend = pe;
-                log.info("PMU counters enabled", .{});
-            } else |err| {
-                log.info("PMU unavailable: {s}", .{@errorName(err)});
-            }
-        }
-
-        fn deinitPmu(self: *Stats) void {
-            if (comptime !has_pmu) return;
-            if (self.pmu.backend) |*p| perf.deinit(p);
-        }
-
-        fn pmuRead(self: *Stats) if (has_pmu) ?perf.Counters else void {
-            if (comptime !has_pmu) return {};
-            if (self.pmu.backend) |*p| return perf.read(p);
-            return null;
-        }
-
-        fn pmuAccum(self: *Stats, before: anytype, after: anytype) void {
-            if (comptime !has_pmu) return;
-            const b = before orelse return;
-            const a = after orelse return;
-            const d = perf.Counters.diff(a, b);
-            self.pmu.cpu_cycles += d.cycles;
-            self.pmu.instructions += d.instructions;
-            self.pmu.branches += d.branches;
-            self.pmu.branch_misses += d.missed_branches;
-            self.pmu.cache_misses += d.cache_misses;
-            self.pmu.tlb_misses += d.tlb_misses;
-        }
-
-        fn dump(self: *Stats) void {
-            const total = self.ns_io + self.ns_classify + self.ns_parse + self.ns_handle + self.ns_redis + self.ns_pg_wire + self.ns_pg_flush + self.ns_send;
-            const reqs = self.completions;
-            const us = struct {
-                fn f(ns: u64) u64 {
-                    return ns / 1000;
-                }
-            }.f;
-            log.info(
-                "PROFILE  cycles={d}  reqs={d}  total={d}us  io={d}us  classify={d}us  parse={d}us  handle={d}us  redis={d}us  pg={d}us({d}rows)  pg_flush={d}us  send={d}us  pg_recv={d}/{d}B",
-                .{
-                    self.cycles,
-                    reqs,
-                    us(total),
-                    us(self.ns_io),
-                    us(self.ns_classify),
-                    us(self.ns_parse),
-                    us(self.ns_handle),
-                    us(self.ns_redis),
-                    us(self.ns_pg_wire),
-                    self.pg_rows,
-                    us(self.ns_pg_flush),
-                    us(self.ns_send),
-                    self.pg_recv_ops,
-                    self.pg_recv_bytes,
-                },
-            );
-            if (comptime has_pmu) {
-                if (self.pmu.cpu_cycles > 0) {
-                    log.info(
-                        "PMU  cycles={d}  insn={d}  IPC={d}.{d:0>2}  branches={d}  mispredict={d}  L1miss={d}  TLBmiss={d}",
-                        .{
-                            self.pmu.cpu_cycles,                               self.pmu.instructions,
-                            self.pmu.instructions / (self.pmu.cpu_cycles | 1), (self.pmu.instructions * 100 / (self.pmu.cpu_cycles | 1)) % 100,
-                            self.pmu.branches,                                 self.pmu.branch_misses,
-                            self.pmu.cache_misses,                             self.pmu.tlb_misses,
-                        },
-                    );
-                }
-                self.pmu = .{ .backend = self.pmu.backend };
-            }
-            self.completions = 0;
-            self.ns_io = 0;
-            self.ns_classify = 0;
-            self.ns_parse = 0;
-            self.ns_handle = 0;
-            self.ns_redis = 0;
-            self.ns_pg_wire = 0;
-            self.ns_pg_flush = 0;
-            self.pg_rows = 0;
-            self.ns_send = 0;
-            self.pg_recv_ops = 0;
-            self.pg_recv_bytes = 0;
-        }
-    };
 
     // ── Classify ──────────────────────────────────────────────────
 
@@ -1128,7 +968,7 @@ pub const Pipeline = struct {
         pg.send_state = .idle;
     }
 
-    pub fn onPgRecvIO(self: *Pipeline, pg: *PgConn, result: i32) !void {
+    pub fn onPgRecvIO(_: *Pipeline, pg: *PgConn, result: i32) !void {
         if (result <= 0) {
             pg.recv_state = .err;
             return;
@@ -1136,8 +976,6 @@ pub const Pipeline = struct {
         const received: usize = @intCast(result);
         pg.transport.noteReceived(received);
         pg.recv_state = .parsing;
-        self.stats.pg_recv_ops += 1;
-        self.stats.pg_recv_bytes += received;
     }
 
     /// Process postgres: parse responses + flush pending sends for all connections.

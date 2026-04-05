@@ -1,6 +1,5 @@
 const std = @import("std");
 const driver = @import("../python/driver.zig");
-const perf = @import("../observe/perf.zig");
 const build_options = @import("build_options");
 
 const log = std.log.scoped(.@"snek/pipeline");
@@ -44,53 +43,6 @@ pub const Stats = struct {
     pg_recv_bytes: u64 = 0,
     /// CQE batch size histogram: <32, 32-63, 64-127, 128-255, 256-511, 512+
     cqe_batch_hist: [6]u64 = .{0} ** 6,
-    pmu: if (has_pmu) PmuState else void = if (has_pmu) .{} else {},
-
-    pub const has_pmu = perf.Backend != void;
-
-    const PmuState = struct {
-        backend: ?perf.Backend = null,
-        cpu_cycles: u64 = 0,
-        instructions: u64 = 0,
-        branches: u64 = 0,
-        branch_misses: u64 = 0,
-        cache_misses: u64 = 0,
-        tlb_misses: u64 = 0,
-    };
-
-    pub fn initPmu(self: *Stats) void {
-        if (comptime !has_pmu) return;
-        if (perf.Backend.init()) |pe| {
-            self.pmu.backend = pe;
-            log.info("PMU counters enabled", .{});
-        } else |err| {
-            log.info("PMU unavailable: {s}", .{@errorName(err)});
-        }
-    }
-
-    pub fn deinitPmu(self: *Stats) void {
-        if (comptime !has_pmu) return;
-        if (self.pmu.backend) |*p| perf.deinit(p);
-    }
-
-    pub fn pmuRead(self: *Stats) if (has_pmu) ?perf.Counters else void {
-        if (comptime !has_pmu) return {};
-        if (self.pmu.backend) |*p| return perf.read(p);
-        return null;
-    }
-
-    pub fn pmuAccum(self: *Stats, before: anytype, after: anytype) void {
-        if (comptime !has_pmu) return;
-        const b = before orelse return;
-        const a = after orelse return;
-        const d = perf.Counters.diff(a, b);
-        self.pmu.cpu_cycles += d.cycles;
-        self.pmu.instructions += d.instructions;
-        self.pmu.branches += d.branches;
-        self.pmu.branch_misses += d.missed_branches;
-        self.pmu.cache_misses += d.cache_misses;
-        self.pmu.tlb_misses += d.tlb_misses;
-    }
 
     pub fn recordBatchSize(self: *Stats, n: usize) void {
         if (comptime !enabled) return;
@@ -198,24 +150,6 @@ pub const Stats = struct {
             const invoke_known = self.ns_py_lookup + self.ns_py_arg_build + self.ns_py_call + self.ns_py_resume + self.ns_py_yield_consume;
             const invoke_other = self.ns_py_invoke_total -| invoke_known;
             self.dumpPyProfile(invoke_other, us);
-        }
-        if (comptime has_pmu) {
-            if (self.pmu.cpu_cycles > 0) {
-                log.info(
-                    "PMU  cycles={d}  insn={d}  IPC={d}.{d:0>2}  branches={d}  mispredict={d}  L1miss={d}  TLBmiss={d}",
-                    .{
-                        self.pmu.cpu_cycles,
-                        self.pmu.instructions,
-                        self.pmu.instructions / (self.pmu.cpu_cycles | 1),
-                        (self.pmu.instructions * 100 / (self.pmu.cpu_cycles | 1)) % 100,
-                        self.pmu.branches,
-                        self.pmu.branch_misses,
-                        self.pmu.cache_misses,
-                        self.pmu.tlb_misses,
-                    },
-                );
-            }
-            self.pmu = .{ .backend = self.pmu.backend };
         }
         self.resetWindow();
     }
